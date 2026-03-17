@@ -1,0 +1,31 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root { color-scheme: dark; }
+
+html, body {
+  @apply bg-zinc-950 text-zinc-100;
+  width: 100%;
+  min-height: 100%;
+}
+
+body {
+  background:
+    radial-gradient(80% 120% at 20% 0%, rgba(28, 78, 216, 0.45) 0%, transparent 60%),
+    radial-gradient(100% 120% at 100% 20%, rgba(8, 47, 73, 0.45) 0%, transparent 60%),
+    #09090b;
+}
+
+.desktop-shell {
+  min-width: 1440px;
+  min-height: 100vh;
+}
+
+.neon-border {
+  border: 1px solid rgba(52, 211, 153, 0.25);
+}
+
+.neon-glow {
+  box-shadow: 0 0 18px rgba(0, 255, 157, 0.25);
+}
