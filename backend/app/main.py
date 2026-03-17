@@ -8,6 +8,7 @@ from sqlalchemy import text
 from app.api.security import rate_limit_key_from_websocket, rate_limiter, require_ws_token
 from app.api.v1.live_routes import router as live_router
 from app.api.v1.routes import router as v1_router
+from app.api.v1.wallet_routes import router as wallet_router
 from app.core.logging import configure_logging
 from app.core.settings import get_settings
 from app.db.session import SessionLocal
@@ -19,6 +20,7 @@ configure_logging(settings.log_level)
 app = FastAPI(title=settings.app_name, version="0.2.0-mvp", default_response_class=ORJSONResponse)
 app.include_router(v1_router, prefix=settings.api_prefix)
 app.include_router(live_router, prefix=settings.api_prefix)
+app.include_router(wallet_router, prefix=settings.api_prefix)
 
 
 @app.middleware("http")
