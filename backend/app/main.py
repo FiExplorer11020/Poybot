@@ -1,10 +1,11 @@
 import asyncio
 from contextlib import suppress
 
-from fastapi import FastAPI, WebSocket
+from fastapi import FastAPI, HTTPException, Request, WebSocket
 from fastapi.responses import ORJSONResponse
 from sqlalchemy import text
 
+from app.api.security import rate_limit_key_from_websocket, rate_limiter, require_ws_token
 from app.api.v1.live_routes import router as live_router
 from app.api.v1.routes import router as v1_router
 from app.core.logging import configure_logging
@@ -18,6 +19,15 @@ configure_logging(settings.log_level)
 app = FastAPI(title=settings.app_name, version="0.2.0-mvp", default_response_class=ORJSONResponse)
 app.include_router(v1_router, prefix=settings.api_prefix)
 app.include_router(live_router, prefix=settings.api_prefix)
+
+
+@app.middleware("http")
+async def rate_limit_middleware(request: Request, call_next):
+    if settings.enable_rate_limit:
+        key = request.client.host if request.client else "unknown"
+        if not rate_limiter.allow(key):
+            return ORJSONResponse(status_code=429, content={"detail": "rate limit exceeded"})
+    return await call_next(request)
 
 
 async def _tick_loop() -> None:
@@ -53,6 +63,16 @@ async def ready() -> dict:
 
 @app.websocket("/ws/live")
 async def ws_live(websocket: WebSocket) -> None:
+    if settings.enable_rate_limit and not rate_limiter.allow(rate_limit_key_from_websocket(websocket)):
+        await websocket.close(code=1013)
+        return
+
+    try:
+        require_ws_token(websocket)
+    except HTTPException:
+        await websocket.close(code=1008)
+        return
+
     await live_hub.connect(websocket)
     try:
         while True:

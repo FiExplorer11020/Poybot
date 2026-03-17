@@ -202,6 +202,9 @@ npm run dev
 Backend (`backend/.env`):
 - `POSTGRES_DSN`
 - `REDIS_URL`
+- `API_AUTH_TOKEN` (optional, protects sensitive control endpoints)
+- `LIVE_WS_TOKEN` (optional, protects `/ws/live`)
+- `ENABLE_RATE_LIMIT` / `RATE_LIMIT_REQUESTS` / `RATE_LIMIT_WINDOW_SECONDS`
 - `POLYMARKET_GAMMA_BASE_URL`
 - `POLYMARKET_CLOB_REST_BASE_URL`
 - `POLYMARKET_CLOB_WS_URL`
@@ -210,6 +213,7 @@ Backend (`backend/.env`):
 
 Frontend (`frontend/.env.local` when not using docker compose env):
 - `NEXT_PUBLIC_API_BASE`
+- `NEXT_PUBLIC_LIVE_WS_TOKEN` (must match `LIVE_WS_TOKEN` when WS auth is enabled)
 
 ## Migrations
 

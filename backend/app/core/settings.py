@@ -13,6 +13,11 @@ class Settings(BaseSettings):
     log_level: str = "INFO"
 
     api_prefix: str = "/api/v1"
+    api_auth_token: str | None = None
+    live_ws_token: str | None = None
+    enable_rate_limit: bool = True
+    rate_limit_requests: int = 120
+    rate_limit_window_seconds: int = 60
 
     postgres_dsn: str = Field(
         default="postgresql+asyncpg://postgres:postgres@localhost:5432/poybot",
