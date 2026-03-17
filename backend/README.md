@@ -54,6 +54,111 @@ Added new ingestion architecture modules:
 These modules create the foundation to ingest and trade across all active Polymarket tickers.
 
 ## Local quick start (Docker)
+# Poybot — Guide unique d'installation et d'exploitation (MVP complet)
+
+> **Objectif de ce README**
+>
+> Ce document est conçu pour être **la seule documentation à lire** pour :
+> 1) comprendre ce que fait le projet,
+> 2) installer tout depuis un repository brut,
+> 3) lancer le backend + frontend en local,
+> 4) vérifier que le bot MVP fonctionne,
+> 5) diagnostiquer les erreurs courantes.
+>
+> Si vous ne connaissez pas le code, vous devez quand même pouvoir suivre ce guide pas à pas.
+
+---
+
+## 1) Vue d'ensemble (ce que vous lancez exactement)
+
+Le projet est un **MVP de bot d'intelligence Polymarket** avec deux parties :
+
+- **Backend (FastAPI, Python)** :
+  - ingestion et normalisation de données marché,
+  - endpoints API pour le frontend,
+  - endpoint WebSocket live pour pousser des updates en temps réel,
+  - jobs worker (ARQ) pour synchroniser des données.
+- **Frontend (Next.js)** :
+  - dashboard unique (dark/neon) qui affiche :
+    - statut bot (RUNNING/PAUSED/STOPPED),
+    - uptime / latence,
+    - cartes de markets scanner avec badge `DETECTED`,
+    - graphe live,
+    - table des dernières simulations d'exécution.
+
+### Important sur l'état MVP
+
+Le MVP privilégie la fiabilité de démo et le flux end-to-end.
+Certaines données live scanner sont simulées côté hub mémoire pour garantir une démo stable même en cas de problème réseau externe.
+
+---
+
+## 2) Architecture rapide (sans entrer dans le code)
+
+### Backend
+
+- `app/main.py` : application FastAPI + route WebSocket `/ws/live`.
+- `app/api/v1/` : routes REST (events, markets, summary, live-summary, control bot, simulate exec).
+- `app/live/state.py` : hub mémoire temps réel (état bot, ticks live, broadcast WS).
+- `app/ingestion/ws_ingestor.py` : ingestion websocket CLOB (batch + orjson).
+- `app/models/` + Alembic : schéma PostgreSQL.
+- `app/workers/tasks.py` : jobs ARQ (sync metadata, refresh trades).
+
+### Frontend
+
+- `frontend/app/page.tsx` : page unique.
+- `frontend/components/Dashboard.tsx` : logique UI + WebSocket.
+- `frontend/lib/types.ts` : types TS de payload live.
+
+### Infra locale
+
+- PostgreSQL (stockage principal)
+- Redis (queue/jobs)
+- ClickHouse (préparé pour analytics)
+- API backend
+- Worker backend
+- Frontend Next.js
+
+Le tout peut démarrer via Docker Compose.
+
+---
+
+## 3) Prérequis (obligatoires)
+
+## Option recommandée (Docker)
+
+- Docker installé
+- Docker Compose installé
+- Ports libres :
+  - `3000` (frontend)
+  - `8000` (backend)
+  - `5432` (PostgreSQL)
+  - `6379` (Redis)
+  - `8123`/`9000` (ClickHouse)
+
+## Option manuelle (sans Docker)
+
+- Python 3.12
+- Node.js 20+
+- PostgreSQL local
+- Redis local
+
+> Si vous débutez : utilisez **Docker** (beaucoup plus simple).
+
+---
+
+## 4) Installation depuis repository brut (méthode Docker, recommandée)
+
+Supposons que vous êtes au tout début, repo fraîchement cloné.
+
+### Étape 1 — Cloner
+
+```bash
+git clone <URL_DU_REPO>
+cd Poybot
+```
+
+### Étape 2 — Créer les variables backend
 
 ```bash
 cd backend
