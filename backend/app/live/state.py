@@ -10,6 +10,7 @@ from datetime import datetime, timezone
 from fastapi import WebSocket
 
 from app.services.adaptive_strategy import AdaptiveStrategyEngine, PortfolioState, RiskConfig
+from app.services.trade_executor import ExecutionRequest, TradeExecutor
 
 
 @dataclass
@@ -28,6 +29,7 @@ class LiveHub:
         self._history: deque[dict] = deque(maxlen=1200)
         self._trades: deque[dict] = deque(maxlen=300)
         self.strategy = AdaptiveStrategyEngine(RiskConfig())
+        self.executor = TradeExecutor()
 
     async def connect(self, ws: WebSocket) -> None:
         await ws.accept()
@@ -85,7 +87,7 @@ class LiveHub:
         await self.broadcast({"type": "control", "payload": payload})
         return payload
 
-    async def simulate_execution(self, market_id: str, market_title: str) -> dict:
+    async def execute_trade(self, market_id: str, market_title: str) -> dict:
         market = next((x for x in self._latest_tick["markets"] if x["market_id"] == market_id), None)
         if not market:
             raise ValueError("market not found")
@@ -108,11 +110,29 @@ class LiveHub:
             volatility=float(market["volatility"]),
             expected_edge=float(market["expected_edge"]),
         )
+        execution = await self.executor.execute(
+            ExecutionRequest(
+                market_id=market_id,
+                market_title=market_title,
+                token_id=market["token_id_yes"] if side == "BUY_YES" else market["token_id_no"],
+                side=side,
+                price=price,
+                size=size,
+                notional=notional,
+                risk_pct=risk_pct,
+                expected_edge=float(market["expected_edge"]),
+            )
+        )
 
         trade = {
-            "id": f"sim-{int(time.time()*1000)}",
+            "id": f"ord-{int(time.time()*1000)}",
+            "order_id": execution["order_id"],
+            "tx_hash": execution["tx_hash"],
+            "execution_mode": execution["execution_mode"],
+            "exchange_status": execution["exchange_status"],
             "market_id": market_id,
             "market_title": market_title,
+            "token_id": market["token_id_yes"] if side == "BUY_YES" else market["token_id_no"],
             "side": side,
             "price": round(price, 4),
             "size": size,
@@ -202,6 +222,8 @@ class LiveHub:
             {
                 "market_id": f"MKT-{idx+1}",
                 "title": title,
+                "token_id_yes": f"TOKEN-YES-{idx+1}",
+                "token_id_no": f"TOKEN-NO-{idx+1}",
                 "best_bid": round(0.42 + idx * 0.05, 4),
                 "best_ask": round(0.45 + idx * 0.05, 4),
                 "mid_price": round(0.435 + idx * 0.05, 4),
