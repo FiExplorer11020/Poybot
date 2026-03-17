@@ -46,10 +46,10 @@ async def bot_control(payload: BotControlIn) -> dict:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
-@router.post("/markets/{market_id}/simulate-exec", dependencies=[Depends(require_api_token)])
+@router.post("/markets/{market_id}/execute", dependencies=[Depends(require_api_token)])
 async def simulate_exec(market_id: str, payload: SimulateTradeIn) -> dict:
     try:
-        return {"data": await live_hub.simulate_execution(market_id, payload.market_title)}
+        return {"data": await live_hub.execute_trade(market_id, payload.market_title)}
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 

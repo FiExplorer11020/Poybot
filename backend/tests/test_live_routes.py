@@ -3,33 +3,27 @@ from fastapi.testclient import TestClient
 from app.main import app
 
 
-def test_live_summary_contains_risk_controls() -> None:
+def test_live_summary_contains_risk_config() -> None:
     with TestClient(app) as client:
         resp = client.get("/api/v1/live-summary")
     assert resp.status_code == 200
     payload = resp.json()["data"]
-    assert "risk" in payload
-    assert "config" in payload["risk"]
-    assert "gauges" in payload["risk"]
+    assert "risk_config" in payload
+    assert "stats" in payload
+    assert "markets" in payload
 
 
-def test_risk_config_update_clamps_values() -> None:
+def test_execute_trade_returns_polymarket_shaped_fields() -> None:
     with TestClient(app) as client:
+        before = client.get("/api/v1/live-summary").json()["data"]
+        market = before["markets"][0]
         resp = client.post(
-            "/api/v1/risk/config",
-            json={
-                "config": {
-                    "risk_per_trade_pct": 9,
-                    "max_total_exposure_pct": 40,
-                    "kelly_fraction_multiplier": 2,
-                    "max_drawdown_auto_stop_pct": 1,
-                },
-                "toggles": {"pause_on_high_latency": False},
-            },
+            f"/api/v1/markets/{market['market_id']}/execute",
+            json={"market_title": market["title"]},
         )
     assert resp.status_code == 200
-    config = resp.json()["data"]["risk"]["config"]
-    assert config["risk_per_trade_pct"] == 5.0
-    assert config["max_total_exposure_pct"] == 20.0
-    assert config["kelly_fraction_multiplier"] == 1.0
-    assert config["max_drawdown_auto_stop_pct"] == 3.0
+    trade = resp.json()["data"]
+    assert trade["execution_mode"] == "dry_run"
+    assert trade["order_id"]
+    assert trade["token_id"]
+    assert trade["exchange_status"]

@@ -28,5 +28,17 @@ class ClobClient:
 
         return await request_with_retry(_op)
 
+
+    async def place_order(self, payload: dict[str, Any], headers: dict[str, str] | None = None, endpoint: str = "/order") -> dict[str, Any]:
+        async def _op() -> dict[str, Any]:
+            resp = await self._client.post(endpoint, json=payload, headers=headers or {})
+            resp.raise_for_status()
+            data = resp.json()
+            if isinstance(data, dict):
+                return data
+            return {"data": data}
+
+        return await request_with_retry(_op)
+
     async def close(self) -> None:
         await self._client.aclose()

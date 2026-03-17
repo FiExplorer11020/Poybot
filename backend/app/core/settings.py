@@ -28,6 +28,12 @@ class Settings(BaseSettings):
     polymarket_gamma_base_url: str = "https://gamma-api.polymarket.com"
     polymarket_clob_rest_base_url: str = "https://clob.polymarket.com"
     polymarket_clob_ws_url: str = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
+    polymarket_trading_enabled: bool = False
+    polymarket_trading_mode: str = "dry_run"
+    polymarket_order_endpoint: str = "/order"
+    polymarket_api_key: str | None = None
+    polymarket_api_secret: str | None = None
+    polymarket_api_passphrase: str | None = None
 
     default_page_size: int = 25
     max_page_size: int = 100
