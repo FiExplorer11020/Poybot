@@ -1,6 +1,3 @@
-@tailwind base;
-@tailwind components;
-@tailwind utilities;
 
 :root { color-scheme: dark; }
 
@@ -17,10 +14,6 @@ body {
     #09090b;
 }
 
-.desktop-shell {
-  min-width: 1440px;
-  min-height: 100vh;
-}
 
 .neon-border {
   border: 1px solid rgba(52, 211, 153, 0.25);
