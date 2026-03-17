@@ -21,7 +21,7 @@ class FakeGammaClient:
         ]
 
 
-@pytest.mark.asyncio
+@pytest.mark.anyio
 async def test_market_sync_service(session_factory) -> None:
     async with session_factory() as session:
         service = MarketSyncService(session, FakeGammaClient())

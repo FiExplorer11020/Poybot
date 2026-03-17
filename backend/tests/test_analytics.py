@@ -7,7 +7,7 @@ from app.analytics.market_analytics import MarketAnalyticsService
 from app.models import Event, Market, MarketStatus, TopOfBook, Trade
 
 
-@pytest.mark.asyncio
+@pytest.mark.anyio
 async def test_market_summary(session_factory) -> None:
     async with session_factory() as session:
         session.add(Event(id="e1", title="Event", active=True, resolved=False))

@@ -1,32 +1,31 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
 :root { color-scheme: dark; }
-* { box-sizing: border-box; }
-body {
-  margin: 0;
-  background: #09090b;
-  color: #d4d4d8;
-  font-family: "Space Grotesk", system-ui, sans-serif;
+
+html, body {
+  @apply bg-zinc-950 text-zinc-100;
+  width: 100%;
+  min-height: 100%;
 }
-.container { padding: 20px; max-width: 1300px; margin: 0 auto; }
-.header, .card, .table-wrap, .chart-wrap { background: #111827; border: 1px solid #1f2937; border-radius: 12px; }
-.header { padding: 14px 18px; display: flex; justify-content: space-between; align-items: center; gap: 10px; }
-.badge { padding: 4px 10px; border-radius: 999px; font-size: 12px; font-weight: 700; }
-.run { background: rgba(16,185,129,.15); color: #34d399; }
-.pause { background: rgba(245,158,11,.2); color: #fbbf24; }
-.stop { background: rgba(239,68,68,.2); color: #f87171; }
-.grid { margin-top: 16px; display: grid; grid-template-columns: 280px 1fr; gap: 16px; }
-.stats { display: grid; gap: 10px; }
-.card { padding: 12px; }
-.stat-value { color: #34d399; font-family: ui-monospace, monospace; font-size: 22px; }
-.chart-wrap { padding: 16px; margin-bottom: 12px; }
-.market-grid { display: grid; grid-template-columns: repeat(3, minmax(0,1fr)); gap: 10px; }
-.market-title { font-size: 14px; margin-bottom: 8px; }
-.row { display: flex; justify-content: space-between; font-size: 13px; margin-bottom: 4px; }
-.btn { background: #10b981; border: none; padding: 8px 12px; border-radius: 8px; color: #022c22; font-weight: 700; cursor: pointer; }
-.btn.secondary { background: #1f2937; color: #e5e7eb; border: 1px solid #374151; }
-.table-wrap { margin-top: 14px; padding: 12px; }
-table { width: 100%; border-collapse: collapse; font-family: ui-monospace, monospace; font-size: 12px; }
-th, td { text-align: left; padding: 8px; border-bottom: 1px solid #1f2937; }
-@media (max-width: 1100px){ .grid{grid-template-columns:1fr;} .market-grid{grid-template-columns:repeat(2,minmax(0,1fr));} }
-.controls { display: grid; gap: 10px; margin-bottom: 12px; }
-.slider { display: grid; gap: 6px; font-size: 12px; }
-.slider input { width: 100%; }
+
+body {
+  background:
+    radial-gradient(80% 120% at 20% 0%, rgba(28, 78, 216, 0.45) 0%, transparent 60%),
+    radial-gradient(100% 120% at 100% 20%, rgba(8, 47, 73, 0.45) 0%, transparent 60%),
+    #09090b;
+}
+
+.desktop-shell {
+  min-width: 1440px;
+  min-height: 100vh;
+}
+
+.neon-border {
+  border: 1px solid rgba(52, 211, 153, 0.25);
+}
+
+.neon-glow {
+  box-shadow: 0 0 18px rgba(0, 255, 157, 0.25);
+}

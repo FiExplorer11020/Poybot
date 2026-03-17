@@ -13,7 +13,7 @@ settings = get_settings()
 
 @router.get("/events")
 async def list_events(
-    page: int = 1,
+    page: int = Query(default=1, ge=1),
     page_size: int = Query(default=settings.default_page_size, le=settings.max_page_size),
     active: bool | None = None,
     session: AsyncSession = Depends(get_db_session),
@@ -37,7 +37,7 @@ async def get_event(event_id: str, session: AsyncSession = Depends(get_db_sessio
 
 @router.get("/markets")
 async def list_markets(
-    page: int = 1,
+    page: int = Query(default=1, ge=1),
     page_size: int = Query(default=settings.default_page_size, le=settings.max_page_size),
     status: str | None = None,
     tag: str | None = None,
@@ -87,7 +87,7 @@ async def market_summary(market_id: str, session: AsyncSession = Depends(get_db_
 @router.get("/tags")
 async def list_tags(session: AsyncSession = Depends(get_db_session)) -> dict:
     repo = MarketRepository(session)
-    markets, _ = await repo.list_markets(page=1, page_size=1000, status=None, tag=None)
+    markets, _ = await repo.list_markets(page=1, page_size=settings.max_page_size, status=None, tag=None)
     tags = sorted({tag for market in markets for tag in market.tags})
     return {"data": tags}
 

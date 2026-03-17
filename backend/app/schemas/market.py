@@ -66,3 +66,26 @@ class SyncStatusOut(BaseModel):
     last_success_at: datetime | None
     last_error: str | None
     meta_info: dict | None
+
+
+class BotTradeOut(BaseModel):
+    id: str
+    market_id: str
+    market_title: str
+    outcome: str
+    side: str
+    price: Decimal
+    size: Decimal
+    notional: Decimal
+    pnl_abs: Decimal
+    pnl_pct: Decimal
+    status: str
+    executed_at: datetime
+
+
+class PortfolioSnapshotOut(BaseModel):
+    total_equity: Decimal
+    capital_in_trade: Decimal
+    pnl_abs: Decimal
+    pnl_pct: Decimal
+    observed_at: datetime

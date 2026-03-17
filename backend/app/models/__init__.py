@@ -1,7 +1,9 @@
 from app.models.market_data import (
+    BotTrade,
     Event,
     Market,
     MarketStatus,
+    PortfolioSnapshot,
     RawMetadataSnapshot,
     RawWebsocketMessage,
     SyncJobStatus,
@@ -20,4 +22,6 @@ __all__ = [
     "RawMetadataSnapshot",
     "RawWebsocketMessage",
     "SyncJobStatus",
+    "BotTrade",
+    "PortfolioSnapshot",
 ]

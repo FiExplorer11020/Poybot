@@ -4,11 +4,12 @@ import asyncio
 import random
 import time
 from collections import deque
-from dataclasses import asdict, dataclass, field
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from decimal import Decimal
 
 from fastapi import WebSocket
+
+from app.services.adaptive_strategy import AdaptiveStrategyEngine, PortfolioState, RiskConfig
 
 
 @dataclass
@@ -18,39 +19,15 @@ class BotState:
     started_at: float = field(default_factory=time.time)
 
 
-@dataclass
-class RiskConfig:
-    risk_per_trade_pct: float = 0.8
-    max_total_exposure_pct: float = 15.0
-    kelly_fraction_multiplier: float = 0.65
-    max_drawdown_auto_stop_pct: float = 8.0
-    max_risk_per_trade_usdc: float = 500.0
-    min_trade_size_usdc: float = 50.0
-
-
-@dataclass
-class RiskToggles:
-    risk_managed_sizing: bool = True
-    use_kelly_on_sum_positions: bool = True
-    auto_close_on_resolution: bool = True
-    pause_on_high_latency: bool = True
-
-
 class LiveHub:
     def __init__(self) -> None:
         self._connections: set[WebSocket] = set()
         self._lock = asyncio.Lock()
         self.bot_state = BotState()
-        self.risk_config = RiskConfig()
-        self.risk_toggles = RiskToggles()
-        self.wallet_balance = 10_000.0
-        self.current_total_exposure = 0.0
-        self.current_drawdown_pct = 1.2
-        self._high_latency_streak = 0
-        self._open_positions_by_condition: dict[str, dict] = {}
         self._latest_tick: dict = self._seed_snapshot()
-        self._history: deque[dict] = deque(maxlen=120)
-        self._trades: deque[dict] = deque(maxlen=10)
+        self._history: deque[dict] = deque(maxlen=1200)
+        self._trades: deque[dict] = deque(maxlen=300)
+        self.strategy = AdaptiveStrategyEngine(RiskConfig())
 
     async def connect(self, ws: WebSocket) -> None:
         await ws.accept()
@@ -65,22 +42,29 @@ class LiveHub:
     def snapshot(self) -> dict:
         now = time.time()
         uptime = int(now - self.bot_state.started_at)
+        pnl_pct = self._calculate_pnl_pct()
         return {
             "bot": {
                 "status": "PAUSED" if self.bot_state.paused else ("RUNNING" if self.bot_state.running else "STOPPED"),
                 "uptime_seconds": uptime,
                 "latency_ms": self._latest_tick["latency_ms"],
             },
-            "stats": self._latest_tick["stats"],
+            "risk_config": {
+                "risk_per_trade_pct": self.strategy.cfg.risk_per_trade_pct,
+                "max_total_exposure_pct": self.strategy.cfg.max_total_exposure_pct,
+                "kelly_fraction": self.strategy.cfg.kelly_fraction,
+                "max_drawdown_stop_pct": self.strategy.cfg.max_drawdown_stop_pct,
+                "fee_bps": self.strategy.cfg.fee_bps,
+            },
+            "stats": {
+                **self._latest_tick["stats"],
+                "portfolio_total": self._latest_tick["portfolio_total"],
+                "capital_in_trade": self._latest_tick["capital_in_trade"],
+                "pnl_percent": pnl_pct,
+            },
             "markets": self._latest_tick["markets"],
             "price_history": list(self._history),
-            "recent_simulations": list(self._trades),
-            "risk": {
-                "config": asdict(self.risk_config),
-                "toggles": asdict(self.risk_toggles),
-                "gauges": self._build_gauges(),
-                "preview": self._latest_tick.get("preview", "No active opportunity"),
-            },
+            "recent_trades": list(self._trades),
             "timestamp": datetime.now(timezone.utc).isoformat(),
         }
 
@@ -95,208 +79,102 @@ class LiveHub:
         elif cmd == "stop":
             self.bot_state.running = False
             self.bot_state.paused = False
-        elif cmd == "close_all":
-            self._open_positions_by_condition.clear()
-            self.current_total_exposure = 0.0
-        elif cmd == "emergency_stop":
-            self.bot_state.running = False
-            self.bot_state.paused = True
-            self._open_positions_by_condition.clear()
-            self.current_total_exposure = 0.0
+        else:
+            raise ValueError(f"unsupported command: {command}")
         payload = self.snapshot()
         await self.broadcast({"type": "control", "payload": payload})
         return payload
 
-    async def update_risk_config(self, payload: dict) -> dict:
-        cfg = payload.get("config", {})
-        toggles = payload.get("toggles", {})
-        self.risk_config.risk_per_trade_pct = min(5.0, max(0.1, float(cfg.get("risk_per_trade_pct", self.risk_config.risk_per_trade_pct))))
-        self.risk_config.max_total_exposure_pct = min(20.0, max(5.0, float(cfg.get("max_total_exposure_pct", self.risk_config.max_total_exposure_pct))))
-        self.risk_config.kelly_fraction_multiplier = min(1.0, max(0.1, float(cfg.get("kelly_fraction_multiplier", self.risk_config.kelly_fraction_multiplier))))
-        self.risk_config.max_drawdown_auto_stop_pct = min(20.0, max(3.0, float(cfg.get("max_drawdown_auto_stop_pct", self.risk_config.max_drawdown_auto_stop_pct))))
-        self.risk_toggles.risk_managed_sizing = bool(toggles.get("risk_managed_sizing", self.risk_toggles.risk_managed_sizing))
-        self.risk_toggles.use_kelly_on_sum_positions = bool(toggles.get("use_kelly_on_sum_positions", self.risk_toggles.use_kelly_on_sum_positions))
-        self.risk_toggles.auto_close_on_resolution = bool(toggles.get("auto_close_on_resolution", self.risk_toggles.auto_close_on_resolution))
-        self.risk_toggles.pause_on_high_latency = bool(toggles.get("pause_on_high_latency", self.risk_toggles.pause_on_high_latency))
+    async def simulate_execution(self, market_id: str, market_title: str) -> dict:
+        market = next((x for x in self._latest_tick["markets"] if x["market_id"] == market_id), None)
+        if not market:
+            raise ValueError("market not found")
 
-        snapshot = self.snapshot()
-        await self.broadcast({"type": "risk_config", "payload": snapshot})
-        return snapshot
+        portfolio = PortfolioState(
+            equity=float(self._latest_tick["portfolio_total"]),
+            capital_in_trade=float(self._latest_tick["capital_in_trade"]),
+            total_pnl=float(self._latest_tick["stats"]["total_pnl"]),
+        )
+        notional, risk_pct = self.strategy.size_position(portfolio, expected_edge=float(market["expected_edge"]))
+        if notional <= 0:
+            raise ValueError("risk limits block new trade")
 
-    async def simulate_execution(self, market_id: str) -> dict:
-        sim = {
+        side = market["direction"]
+        price = market["best_ask"]
+        size = round(notional / max(price, 0.01), 4)
+        outcome = self.strategy.estimate_trade_outcome(
+            notional=notional,
+            spread=float(market["spread"]),
+            volatility=float(market["volatility"]),
+            expected_edge=float(market["expected_edge"]),
+        )
+
+        trade = {
             "id": f"sim-{int(time.time()*1000)}",
             "market_id": market_id,
-            "side": random.choice(["BUY_YES", "BUY_NO"]),
-            "price": round(random.uniform(0.35, 0.68), 4),
-            "size": random.randint(5, 30),
-            "pnl": round(random.uniform(-1.2, 4.5), 2),
-            "decision": "EXECUTED",
-            "reason": "manual simulation",
+            "market_title": market_title,
+            "side": side,
+            "price": round(price, 4),
+            "size": size,
+            "notional": notional,
+            "risk_pct": risk_pct,
+            "kelly": round(self.strategy.cfg.kelly_fraction, 3),
+            "slippage": outcome["slippage"],
+            "fees": outcome["fees"],
+            "pnl_abs": outcome["pnl_abs"],
+            "pnl_pct": outcome["pnl_pct"],
+            "status": "FILLED" if outcome["pnl_abs"] >= -notional * 0.05 else "RISK_REJECT",
             "timestamp": datetime.now(timezone.utc).isoformat(),
         }
-        self._trades.appendleft(sim)
-        await self.broadcast({"type": "simulation", "payload": sim})
-        return sim
+
+        self._trades.appendleft(trade)
+        self._latest_tick["stats"]["total_pnl"] = round(self._latest_tick["stats"]["total_pnl"] + outcome["pnl_abs"], 4)
+        self._latest_tick["capital_in_trade"] = round(self._latest_tick["capital_in_trade"] + notional, 2)
+        await self.broadcast({"type": "trade", "payload": trade})
+        return trade
 
     async def tick(self) -> None:
         if not self.bot_state.running or self.bot_state.paused:
             return
-
-        latency = max(18, min(220, int(random.gauss(65, 20))))
-        self._latest_tick["latency_ms"] = latency
-        if latency > 80:
-            self._high_latency_streak += 1
-        else:
-            self._high_latency_streak = 0
+        latency = max(15, min(190, int(random.gauss(58, 18))))
 
         for market in self._latest_tick["markets"]:
-            yes_mid_shift = random.uniform(-0.01, 0.01)
-            yes_mid = float(max(0.05, min(0.95, market["yes_mid"] + yes_mid_shift)))
-            no_mid = float(max(0.05, min(0.95, 1 - yes_mid + random.uniform(-0.01, 0.01))))
-            market["best_bid_yes"] = round(max(0.01, yes_mid - random.uniform(0.001, 0.008)), 4)
-            market["best_ask_yes"] = round(min(0.99, yes_mid + random.uniform(0.001, 0.008)), 4)
-            market["best_bid_no"] = round(max(0.01, no_mid - random.uniform(0.001, 0.008)), 4)
-            market["best_ask_no"] = round(min(0.99, no_mid + random.uniform(0.001, 0.008)), 4)
-            market["bid_size"] = round(max(20, market["bid_size"] + random.uniform(-15, 25)), 2)
-            market["ask_size"] = round(max(20, market["ask_size"] + random.uniform(-15, 25)), 2)
-            market["average_size_24h"] = round(max(30, market["average_size_24h"] + random.uniform(-5, 5)), 2)
-            market["yes_mid"] = yes_mid
-            market["no_mid"] = no_mid
-
-            decision = self._evaluate_market(market)
-            market["detected"] = decision["decision"] == "EXECUTED"
-            market["est_profit"] = round(max(0.0, decision["edge"] * 100), 2)
-            market["spread"] = round(decision["spread"], 4)
-            market["decision"] = decision["decision"]
-            market["decision_reason"] = decision["reason"]
-            self._latest_tick["preview"] = decision["preview"]
-            if decision["decision"] == "EXECUTED":
-                self._trades.appendleft(decision)
+            mid = market["mid_price"] + random.uniform(-0.018, 0.018)
+            bid = max(0.01, min(0.99, mid - random.uniform(0.004, 0.015)))
+            ask = max(bid, min(0.99, mid + random.uniform(0.004, 0.015)))
+            eval_out = self.strategy.evaluate_market(market["market_id"], bid, ask)
+            market.update(eval_out)
+            market["est_profit"] = round(max(0.0, eval_out["expected_edge"] * 100), 3)
 
         detected = sum(1 for x in self._latest_tick["markets"] if x["detected"])
-        pnl = round(self._latest_tick["stats"]["total_pnl"] + random.uniform(-1.5, 2.2), 2)
-        self.current_drawdown_pct = max(0.0, min(25.0, self.current_drawdown_pct + random.uniform(-0.2, 0.4)))
-        if self.current_drawdown_pct >= self.risk_config.max_drawdown_auto_stop_pct:
-            self.bot_state.paused = True
-            self._open_positions_by_condition.clear()
-            self.current_total_exposure = 0.0
-        if self.risk_toggles.pause_on_high_latency and self._high_latency_streak >= 10:
-            self.bot_state.paused = True
-
+        self._latest_tick["latency_ms"] = latency
         self._latest_tick["stats"].update(
             {
-                "total_pnl": pnl,
-                "win_rate": round(max(20, min(95, self._latest_tick["stats"]["win_rate"] + random.uniform(-0.4, 0.6))), 2),
-                "avg_profit": round(max(0.1, min(12.0, self._latest_tick["stats"]["avg_profit"] + random.uniform(-0.2, 0.3))), 2),
+                "win_rate": round(max(20, min(95, self._latest_tick["stats"]["win_rate"] + random.uniform(-0.2, 0.3))), 2),
+                "avg_profit": round(max(0.1, min(15.0, self._latest_tick["stats"]["avg_profit"] + random.uniform(-0.1, 0.15))), 2),
                 "active_markets": len(self._latest_tick["markets"]),
-                "detected_arbs_today": self._latest_tick["stats"]["detected_arbs_today"] + detected,
+                "detected_arbs_today": self._latest_tick["stats"]["detected_arbs_today"] + max(0, detected - 2),
             }
         )
-        self._history.append(
-            {
-                "timestamp": datetime.now(timezone.utc).isoformat(),
-                "value": self._latest_tick["markets"][0]["yes_mid"],
-            }
-        )
+
+        point = {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "portfolio": self._latest_tick["portfolio_total"] + self._latest_tick["stats"]["total_pnl"],
+            "pnl_pct": self._calculate_pnl_pct(),
+        }
+        self._history.append(point)
+
         await self.broadcast(
             {
                 "type": "tick",
                 "payload": {
                     "latency_ms": latency,
-                    "stats": self._latest_tick["stats"],
+                    "stats": self.snapshot()["stats"],
                     "markets": self._latest_tick["markets"],
-                    "price_point": self._history[-1],
-                    "risk": {
-                        "gauges": self._build_gauges(),
-                        "preview": self._latest_tick.get("preview", "No active opportunity"),
-                    },
+                    "point": point,
                 },
             }
         )
-
-    def _evaluate_market(self, market: dict) -> dict:
-        yes_price = market["best_ask_yes"]
-        no_price = market["best_ask_no"]
-        edge = 1 - (yes_price + no_price)
-        mid_price = max((market["best_ask_yes"] + market["best_bid_yes"]) / 2, 0.01)
-        spread = (market["best_ask_yes"] - market["best_bid_yes"]) / mid_price
-        depth_score = min(market["bid_size"], market["ask_size"]) / max(market["average_size_24h"], 1)
-
-        implied_prob = yes_price
-        prob_true = market["estimated_true_prob_yes"]
-        kelly_edge = prob_true - implied_prob
-        odds = implied_prob / max(1 - implied_prob, 0.0001)
-        kelly_fraction = max(0.0, kelly_edge / max(odds, 0.0001))
-        kelly_fraction = min(kelly_fraction, 0.65) * self.risk_config.kelly_fraction_multiplier
-
-        risk_multiplier = self.risk_config.risk_per_trade_pct / 100 if self.risk_toggles.risk_managed_sizing else 1.0
-        size_usdc = self.wallet_balance * kelly_fraction * risk_multiplier
-        size_usdc = min(size_usdc, self.risk_config.max_risk_per_trade_usdc)
-
-        max_exposure = self.wallet_balance * (self.risk_config.max_total_exposure_pct / 100)
-        new_exposure = self.current_total_exposure + size_usdc
-        expected_latency = self._latest_tick["latency_ms"] + 8
-        expected_slippage = spread * 0.3
-        risk_score = (new_exposure / max(max_exposure, 1)) * (spread / 0.01) * (1 - min(depth_score, 1))
-
-        condition_id = market["condition_id"]
-        decision = "EXECUTED"
-        reason = "all rules satisfied"
-        checks = [
-            (edge >= 0.005, "edge < 0.5%"),
-            (risk_score <= 1.0, "risk_score > 1.0"),
-            (new_exposure <= max_exposure, "max_total_exposure exceeded"),
-            (size_usdc >= self.risk_config.min_trade_size_usdc, "size below min_trade_size"),
-            (spread <= 0.015, "spread > 1.5%"),
-            (depth_score >= 0.4, "depth_score < 0.4"),
-            (self.bot_state.running and not self.bot_state.paused, "bot not RUNNING"),
-            (condition_id not in self._open_positions_by_condition, "position already open on condition_id"),
-            (kelly_fraction >= 0.15, "kelly_fraction < 0.15"),
-            (self.current_total_exposure <= self.wallet_balance * 0.18, "total exposure > 18%"),
-            (expected_latency <= 80 or not self.risk_toggles.pause_on_high_latency, "latency guardrail"),
-        ]
-        for ok, fail_reason in checks:
-            if not ok:
-                decision = "REJECTED"
-                reason = fail_reason
-                break
-
-        if decision == "EXECUTED":
-            self.current_total_exposure = new_exposure
-            self._open_positions_by_condition[condition_id] = {
-                "size_usdc": size_usdc,
-                "opened_at": datetime.now(timezone.utc).isoformat(),
-            }
-
-        preview = f"Si je prends cet arb → new total exposure = {(new_exposure / self.wallet_balance) * 100:.1f}%"
-        preview += " (safe)" if new_exposure <= max_exposure else " (DANGER)"
-
-        return {
-            "id": f"sim-{int(time.time()*1000)}",
-            "market_id": market["market_id"],
-            "side": "BUY_YES+NO",
-            "price": round(yes_price, 4),
-            "size": round(size_usdc, 2),
-            "pnl": round((edge - expected_slippage) * size_usdc, 2),
-            "decision": decision,
-            "reason": reason,
-            "edge": edge,
-            "spread": spread,
-            "risk_score": risk_score,
-            "expected_latency": expected_latency,
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-            "preview": preview,
-        }
-
-    def _build_gauges(self) -> dict:
-        exposure_pct = (self.current_total_exposure / self.wallet_balance) * 100
-        risk_taken_pct = exposure_pct * 0.12
-        return {
-            "total_portfolio_exposure_pct": round(exposure_pct, 2),
-            "total_risk_taken_pct": round(risk_taken_pct, 2),
-            "current_drawdown_pct": round(self.current_drawdown_pct, 2),
-        }
 
     async def broadcast(self, payload: dict) -> None:
         async with self._lock:
@@ -307,42 +185,58 @@ class LiveHub:
             except Exception:
                 await self.disconnect(ws)
 
+    def pnl_series(self, timeframe: str) -> list[dict]:
+        counts = {"24h": 96, "7d": 336, "30d": 720, "90d": 1200}
+        n = counts.get(timeframe, 336)
+        return list(self._history)[-n:]
+
+    def _calculate_pnl_pct(self) -> float:
+        base = self._latest_tick["portfolio_total"]
+        if base <= 0:
+            return 0.0
+        return round((self._latest_tick["stats"]["total_pnl"] / base) * 100, 3)
+
     @staticmethod
     def _seed_snapshot() -> dict:
-        base_markets = [
+        markets = [
             {
                 "market_id": f"MKT-{idx+1}",
-                "condition_id": f"COND-{idx+1}",
-                "title": f"Polymarket Signal #{idx+1}",
-                "best_bid_yes": 0.48,
-                "best_ask_yes": 0.50,
-                "best_bid_no": 0.48,
-                "best_ask_no": 0.50,
-                "yes_mid": 0.5,
-                "no_mid": 0.5,
-                "bid_size": 180.0,
-                "ask_size": 175.0,
-                "average_size_24h": 220.0,
-                "estimated_true_prob_yes": 0.57,
-                "spread": 0.02,
-                "est_profit": 0.0,
+                "title": title,
+                "best_bid": round(0.42 + idx * 0.05, 4),
+                "best_ask": round(0.45 + idx * 0.05, 4),
+                "mid_price": round(0.435 + idx * 0.05, 4),
+                "spread": 0.03,
+                "volatility": 0.002,
+                "liquidity_score": 0.6,
+                "expected_edge": 0.01,
+                "entry_threshold": 0.007,
+                "direction": "BUY_YES",
+                "est_profit": 1.0,
                 "detected": False,
-                "decision": "REJECTED",
-                "decision_reason": "pending",
             }
-            for idx in range(6)
+            for idx, title in enumerate(
+                [
+                    "US Election 2028: Democrat wins?",
+                    "BTC above 100k by year-end?",
+                    "Fed cuts rates before Q4?",
+                    "ETH ETF net inflow positive this week?",
+                    "US recession announced in 2026?",
+                    "Trump vs Biden rematch confirmed?",
+                ]
+            )
         ]
         return {
-            "latency_ms": 52,
+            "latency_ms": 64,
+            "portfolio_total": 25000.00,
+            "capital_in_trade": 6200.00,
             "stats": {
-                "total_pnl": 125.45,
-                "win_rate": 62.2,
-                "avg_profit": 2.7,
-                "active_markets": 6,
-                "detected_arbs_today": 3,
+                "total_pnl": 845.25,
+                "win_rate": 62.4,
+                "avg_profit": 2.9,
+                "active_markets": len(markets),
+                "detected_arbs_today": 4,
             },
-            "markets": base_markets,
-            "preview": "No active opportunity",
+            "markets": markets,
         }
 
 

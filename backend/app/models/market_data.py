@@ -111,6 +111,34 @@ class TopOfBook(Base):
     observed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
 
 
+class BotTrade(Base):
+    __tablename__ = "bot_trades"
+
+    id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    market_id: Mapped[str] = mapped_column(String(128), index=True)
+    market_title: Mapped[str] = mapped_column(String(512), index=True)
+    outcome: Mapped[str] = mapped_column(String(64))
+    side: Mapped[str] = mapped_column(String(16))
+    price: Mapped[Decimal] = mapped_column(Numeric(18, 8))
+    size: Mapped[Decimal] = mapped_column(Numeric(18, 8))
+    notional: Mapped[Decimal] = mapped_column(Numeric(18, 8))
+    pnl_abs: Mapped[Decimal] = mapped_column(Numeric(18, 8), default=0)
+    pnl_pct: Mapped[Decimal] = mapped_column(Numeric(10, 4), default=0)
+    status: Mapped[str] = mapped_column(String(16), default="open", index=True)
+    executed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=datetime.utcnow, index=True)
+
+
+class PortfolioSnapshot(Base):
+    __tablename__ = "portfolio_snapshots"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    total_equity: Mapped[Decimal] = mapped_column(Numeric(18, 8))
+    capital_in_trade: Mapped[Decimal] = mapped_column(Numeric(18, 8))
+    pnl_abs: Mapped[Decimal] = mapped_column(Numeric(18, 8))
+    pnl_pct: Mapped[Decimal] = mapped_column(Numeric(10, 4))
+    observed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=datetime.utcnow, index=True)
+
+
 class SyncJobStatus(Base):
     __tablename__ = "sync_job_status"
 
@@ -124,3 +152,5 @@ class SyncJobStatus(Base):
 
 Index("ix_top_of_book_market_time", TopOfBook.market_id, TopOfBook.observed_at)
 Index("ix_trades_market_time", Trade.market_id, Trade.traded_at)
+Index("ix_bot_trades_market_time", BotTrade.market_id, BotTrade.executed_at)
+Index("ix_portfolio_snapshots_time", PortfolioSnapshot.observed_at)

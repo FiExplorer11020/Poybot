@@ -5,7 +5,7 @@ from app.models import Event, Market, MarketStatus, Trade
 from app.repositories.ingestion_repository import IngestionRepository
 
 
-@pytest.mark.asyncio
+@pytest.mark.anyio
 async def test_trade_upsert_idempotent(session_factory) -> None:
     payload = {
         "id": "tr1",
