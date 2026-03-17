@@ -1,6 +1,7 @@
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
 
+from app.api.security import require_api_token
 from app.live.state import live_hub
 
 router = APIRouter()
@@ -37,7 +38,7 @@ async def strategy_spec() -> dict:
     }
 
 
-@router.post("/bot/control")
+@router.post("/bot/control", dependencies=[Depends(require_api_token)])
 async def bot_control(payload: BotControlIn) -> dict:
     try:
         return {"data": await live_hub.set_command(payload.command)}
@@ -45,7 +46,7 @@ async def bot_control(payload: BotControlIn) -> dict:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
-@router.post("/markets/{market_id}/simulate-exec")
+@router.post("/markets/{market_id}/simulate-exec", dependencies=[Depends(require_api_token)])
 async def simulate_exec(market_id: str, payload: SimulateTradeIn) -> dict:
     try:
         return {"data": await live_hub.simulate_execution(market_id, payload.market_title)}

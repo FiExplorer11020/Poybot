@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import random
 from decimal import Decimal
 
 import orjson
@@ -18,9 +19,11 @@ class PolymarketWsIngestor:
         self.token_ids = token_ids
 
     async def run(self) -> None:
+        attempt = 0
         while True:
             try:
                 async with websockets.connect(self.ws_url, ping_interval=15, ping_timeout=10) as ws:
+                    attempt = 0
                     await ws.send(
                         orjson.dumps(
                             {
@@ -33,7 +36,10 @@ class PolymarketWsIngestor:
                     await self._consume(ws)
             except Exception as exc:
                 logger.warning("ws reconnecting due to error: %s", exc)
-                await asyncio.sleep(2)
+                backoff = min(30.0, 1.0 * (2**attempt))
+                jitter = random.uniform(0, min(1.0, backoff * 0.2))
+                await asyncio.sleep(backoff + jitter)
+                attempt = min(attempt + 1, 6)
 
     async def _consume(self, ws: websockets.WebSocketClientProtocol) -> None:
         buffer: list[dict] = []
