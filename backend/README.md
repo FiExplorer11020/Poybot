@@ -30,6 +30,18 @@ Bottom table now shows bot entries with **Polymarket bet names** (`market_title`
 - pnl %
 - timestamp
 
+
+## Wallet integration scaffold (backend + frontend)
+
+A wallet auth flow is now available for frontend integration:
+- `POST /api/v1/wallet/nonce` → creates a nonce + sign-in message for an address
+- `POST /api/v1/wallet/verify` → verifies signed payload format + creates an app session token
+- `GET /api/v1/wallet/session` → validates current bearer session
+- `POST /api/v1/wallet/disconnect` → revokes bearer session
+
+> MVP note: this is an integration scaffold for wallet plug-in and app session wiring.
+> Use a production-grade on-chain signature verification library and persistent session store before live trading.
+
 ## API additions
 
 - `GET /api/v1/live-summary`

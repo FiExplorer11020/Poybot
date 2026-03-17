@@ -11,7 +11,10 @@ type BotState = {
   capitalInTrade: number;
   walletAddress?: string;
   walletBalance: number;
-  setWallet: (address?: string, balance?: number) => void;
+  walletToken?: string;
+  walletConnecting: boolean;
+  setWallet: (address?: string, balance?: number, token?: string) => void;
+  setWalletConnecting: (value: boolean) => void;
   setRuntime: (latency: number) => void;
 };
 
@@ -28,7 +31,10 @@ const state: BotState = {
   capitalInTrade: 9321.11,
   walletAddress: undefined,
   walletBalance: 0,
-  setWallet: (walletAddress, walletBalance = 0) => setState({ walletAddress, walletBalance }),
+  walletToken: undefined,
+  walletConnecting: false,
+  setWallet: (walletAddress, walletBalance = 0, walletToken) => setState({ walletAddress, walletBalance, walletToken }),
+  setWalletConnecting: (walletConnecting) => setState({ walletConnecting }),
   setRuntime: (latencyMs) => setState({ latencyMs })
 };
 
