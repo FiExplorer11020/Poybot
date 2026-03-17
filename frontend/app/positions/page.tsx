@@ -1,3 +1,5 @@
+"use client";
+
 import { Area, AreaChart, CartesianGrid, ResponsiveContainer, Tooltip, XAxis, YAxis } from "recharts";
 
 import { PositionsTable } from "@/components/trading/PositionsTable";
@@ -7,7 +9,7 @@ import { pnlSeries } from "@/lib/mock-data";
 
 export default function PositionsPage() {
   return (
-    <div className="grid grid-cols-[20%_55%_25%] gap-4">
+    <div className="grid gap-4 2xl:grid-cols-[300px_minmax(0,1fr)_360px]">
       <Card className="space-y-3">
         <p className="text-sm text-zinc-300">Total Portfolio Exposure</p>
         <Gauge value={37.4} label="Exposure" />
@@ -15,10 +17,12 @@ export default function PositionsPage() {
         <Gauge value={18.9} label="Risk" />
       </Card>
 
-      <div className="space-y-4">
+      <div className="space-y-4 min-w-0">
         <Card>
           <p className="mb-2 text-sm text-zinc-300">Open Positions</p>
-          <PositionsTable />
+          <div className="overflow-x-auto">
+            <PositionsTable />
+          </div>
         </Card>
         <Card className="h-[270px]">
           <p className="mb-2 text-sm">Live PnL + Drawdown</p>

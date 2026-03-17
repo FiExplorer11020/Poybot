@@ -1,4 +1,3 @@
-import "@rainbow-me/rainbowkit/styles.css";
 import "./globals.css";
 
 import { ReactNode } from "react";
@@ -13,14 +12,14 @@ export default function RootLayout({ children }: { children: ReactNode }) {
     <html lang="en" className="dark">
       <body className="font-sans">
         <Providers>
-          <div className="desktop-shell px-6 py-4">
+          <div className="mx-auto w-full max-w-[1680px] px-3 py-3 sm:px-4 lg:px-6">
             <LiveSocketBridge />
             <AppHeader />
-            <div className="mt-4 grid grid-cols-[17%_83%] gap-4">
-              <div className="sticky top-24 h-[calc(100vh-7.5rem)]">
+            <div className="mt-4 grid gap-4 xl:grid-cols-[280px_minmax(0,1fr)]">
+              <div className="xl:sticky xl:top-24 xl:h-[calc(100vh-7.5rem)]">
                 <StatsSidebar />
               </div>
-              <div>{children}</div>
+              <main className="min-w-0">{children}</main>
             </div>
           </div>
         </Providers>

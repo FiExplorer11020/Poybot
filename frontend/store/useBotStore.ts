@@ -1,4 +1,4 @@
-import { create } from "zustand";
+import { useSyncExternalStore } from "react";
 
 type BotState = {
   status: "LIVE" | "PAUSED";
@@ -15,7 +15,9 @@ type BotState = {
   setRuntime: (latency: number) => void;
 };
 
-export const useBotStore = create<BotState>((set) => ({
+const listeners = new Set<() => void>();
+
+const state: BotState = {
   status: "LIVE",
   uptime: "03:41:12",
   latencyMs: 61,
@@ -26,6 +28,27 @@ export const useBotStore = create<BotState>((set) => ({
   capitalInTrade: 9321.11,
   walletAddress: undefined,
   walletBalance: 0,
-  setWallet: (walletAddress, walletBalance = 0) => set({ walletAddress, walletBalance }),
-  setRuntime: (latencyMs) => set({ latencyMs })
-}));
+  setWallet: (walletAddress, walletBalance = 0) => setState({ walletAddress, walletBalance }),
+  setRuntime: (latencyMs) => setState({ latencyMs })
+};
+
+function setState(partial: Partial<BotState>) {
+  Object.assign(state, partial);
+  listeners.forEach((listener) => listener());
+}
+
+function subscribe(listener: () => void) {
+  listeners.add(listener);
+  return () => listeners.delete(listener);
+}
+
+function getSnapshot() {
+  return state;
+}
+
+export function useBotStore(): BotState;
+export function useBotStore<T>(selector: (state: BotState) => T): T;
+export function useBotStore<T>(selector?: (state: BotState) => T) {
+  const select = selector ?? ((value: BotState) => value as unknown as T);
+  return useSyncExternalStore(subscribe, () => select(getSnapshot()), () => select(getSnapshot()));
+}

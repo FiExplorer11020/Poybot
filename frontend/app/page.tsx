@@ -1,3 +1,5 @@
+"use client";
+
 import { DetectionCard } from "@/components/trading/DetectionCard";
 import { TradeHistoryTable } from "@/components/trading/TradeHistoryTable";
 import { Card } from "@/components/ui/card";
@@ -33,7 +35,7 @@ export default function DashboardPage() {
         </ResponsiveContainer>
       </Card>
 
-      <div className="grid grid-cols-4 gap-3">
+      <div className="grid gap-3 sm:grid-cols-2 2xl:grid-cols-4">
         {scannerCards.slice(0, 4).map((card) => (
           <DetectionCard key={card.market} {...card} />
         ))}

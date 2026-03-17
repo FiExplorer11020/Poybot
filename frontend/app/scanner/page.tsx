@@ -3,8 +3,8 @@
 import { useMemo, useState } from "react";
 
 import { DetectionCard } from "@/components/trading/DetectionCard";
-import { Card } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
+import { Card } from "@/components/ui/card";
 import { scannerCards } from "@/lib/mock-data";
 
 const tabs = ["All", "Crypto", "Politics", "High-Risk"];
@@ -19,10 +19,10 @@ export default function ScannerPage() {
   }, [tab]);
 
   return (
-    <div className="grid grid-cols-[75%_25%] gap-4">
-      <div className="space-y-4">
+    <div className="grid gap-4 2xl:grid-cols-[minmax(0,1fr)_320px]">
+      <div className="space-y-4 min-w-0">
         <Card>
-          <div className="mb-3 flex gap-2">
+          <div className="mb-3 flex flex-wrap gap-2">
             {tabs.map((item) => (
               <button
                 key={item}
@@ -33,7 +33,8 @@ export default function ScannerPage() {
               </button>
             ))}
           </div>
-          <div className="grid grid-cols-2 gap-3">
+          {filtered.length === 0 ? <p className="text-sm text-zinc-400">No markets available for this filter.</p> : null}
+          <div className="grid gap-3 md:grid-cols-2">
             {filtered.map((card) => (
               <DetectionCard key={card.market} {...card} />
             ))}
@@ -54,7 +55,7 @@ export default function ScannerPage() {
 
       <Card>
         <p className="mb-3 text-sm">Live Alerts</p>
-        <div className="space-y-2 overflow-y-auto pr-1 font-mono text-xs" style={{ maxHeight: 730 }}>
+        <div className="space-y-2 overflow-y-auto pr-1 font-mono text-xs max-h-[50vh] 2xl:max-h-[730px]">
           {Array.from({ length: 25 }).map((_, i) => (
             <div key={i} className="rounded-2xl border border-zinc-800 p-2">
               <Badge className={i % 2 ? "border-emerald-400/50 text-emerald-300" : "border-amber-500/50 text-amber-300"}>
