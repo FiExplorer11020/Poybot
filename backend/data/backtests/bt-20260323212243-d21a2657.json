@@ -1,0 +1,106 @@
+{
+  "total_trades": 1,
+  "winning_trades": 1,
+  "win_rate": 100.0,
+  "total_pnl": 117.311304,
+  "total_pnl_pct": 11.73113,
+  "max_drawdown": 6.601739,
+  "max_drawdown_pct": 0.660174,
+  "sharpe_ratio": 0.0,
+  "profit_factor": 0.0,
+  "avg_trade_duration_h": 1.15,
+  "equity_curve": [
+    {
+      "timestamp": "2026-01-01T00:00:00+00:00",
+      "equity": 1000.0,
+      "drawdown_pct": 0.0
+    },
+    {
+      "timestamp": "2026-01-01T00:01:00+00:00",
+      "equity": 993.398261,
+      "drawdown_pct": 0.660174
+    },
+    {
+      "timestamp": "2026-01-01T00:01:00+00:00",
+      "equity": 993.398261,
+      "drawdown_pct": 0.660174
+    },
+    {
+      "timestamp": "2026-01-01T00:15:00+00:00",
+      "equity": 1004.267826,
+      "drawdown_pct": 0.0
+    },
+    {
+      "timestamp": "2026-01-01T00:30:00+00:00",
+      "equity": 1015.137391,
+      "drawdown_pct": 0.0
+    },
+    {
+      "timestamp": "2026-01-01T01:10:00+00:00",
+      "equity": 1117.311304,
+      "drawdown_pct": 0.0
+    },
+    {
+      "timestamp": "2026-01-01T01:10:00+00:00",
+      "equity": 1117.311304,
+      "drawdown_pct": 0.0
+    },
+    {
+      "timestamp": "2026-01-01T02:00:00+00:00",
+      "equity": 1117.311304,
+      "drawdown_pct": 0.0
+    }
+  ],
+  "trades": [
+    {
+      "market_id": "m1",
+      "question": "Will BTC finish up?",
+      "strategy": "adaptive",
+      "side": "BUY_YES",
+      "token_id": "yes-1",
+      "entry_time": "2026-01-01T00:01:00+00:00",
+      "exit_time": "2026-01-01T01:10:00+00:00",
+      "entry_price": 0.46,
+      "exit_price": 1.0,
+      "size": 217.391304,
+      "notional": 100.0,
+      "fees": 0.08,
+      "pnl": 117.311304,
+      "pnl_pct": 117.311304,
+      "expected_edge": 0.0,
+      "risk_pct": 10.0,
+      "duration_h": 1.15,
+      "resolved_outcome": "YES",
+      "settlement": "resolved"
+    }
+  ],
+  "parameters": {
+    "start_date": "2026-01-01T00:00:00Z",
+    "end_date": "2026-01-01T02:00:00Z",
+    "initial_equity": 1000.0,
+    "strategy": "adaptive",
+    "risk_cfg": {
+      "risk_per_trade_pct": 0.01,
+      "max_total_exposure_pct": 0.25,
+      "kelly_fraction": 0.25,
+      "max_drawdown_stop_pct": 0.1,
+      "fee_bps": 8.0,
+      "base_entry_threshold": 0.0,
+      "spread_cap": 0.1,
+      "allocation_mode": "manual",
+      "manual_notional_amount": 100.0,
+      "min_observations": 1,
+      "min_signal_strength": 0.0,
+      "max_concurrent_positions": 4,
+      "max_positions_per_tick": 1,
+      "cooldown_seconds": 3600,
+      "signal_staleness_seconds": 3,
+      "max_holding_seconds": 180,
+      "display_market_limit": 80
+    },
+    "slippage_model": "spread_pct",
+    "fee_bps": 8.0,
+    "market_ids": null
+  },
+  "backtest_id": "bt-20260323212243-d21a2657"
+}
