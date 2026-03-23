@@ -2,6 +2,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.clients.gamma import GammaClient
 from app.repositories.market_repository import MarketRepository
+from app.utils.polymarket import first_event_id_from_market, parse_json_list_field
 
 
 class MarketSyncService:
@@ -22,12 +23,12 @@ class MarketSyncService:
                 await self.repo.upsert_event(event)
                 events_seen += 1
             for market in markets:
-                event_id = str(market.get("eventId") or market.get("event_id") or "")
+                event_id = first_event_id_from_market(market) or ""
                 if not event_id:
                     continue
                 await self.repo.upsert_market(market, event_id=event_id)
-                token_ids = [str(token) for token in market.get("clobTokenIds", [])]
-                outcomes = market.get("outcomes") or []
+                token_ids = [str(token) for token in parse_json_list_field(market.get("clobTokenIds"))]
+                outcomes = [str(outcome) for outcome in parse_json_list_field(market.get("outcomes"))]
                 await self.repo.replace_tokens(str(market["id"]), token_ids=token_ids, outcomes=outcomes)
                 markets_seen += 1
             await self.repo.insert_raw_metadata("gamma", {"events": events, "markets": markets})

@@ -62,3 +62,29 @@ async def bot_trade_history(limit: int = Query(default=50, ge=1, le=500)) -> dic
 @router.get("/portfolio/pnl-by-timeframe")
 async def pnl_by_timeframe(timeframe: str = Query(default="7d", pattern="^(24h|7d|30d|90d)$")) -> dict:
     return {"data": live_hub.pnl_series(timeframe), "timeframe": timeframe}
+
+
+class ConfigUpdateIn(BaseModel):
+    risk_per_trade_pct: float | None = None
+    max_total_exposure_pct: float | None = None
+    kelly_fraction: float | None = None
+    max_drawdown_stop_pct: float | None = None
+    allocation_mode: str | None = None
+    manual_notional_amount: float | None = None
+    max_concurrent_positions: int | None = None
+    max_positions_per_tick: int | None = None
+    min_observations: int | None = None
+    cooldown_seconds: int | None = None
+
+
+@router.post("/strategy/config", dependencies=[Depends(require_api_token)])
+async def update_config(payload: ConfigUpdateIn) -> dict:
+    return {"data": await live_hub.update_config(payload.model_dump(exclude_unset=True))}
+
+
+@router.post("/trades/{trade_id}/close", dependencies=[Depends(require_api_token)])
+async def close_trade(trade_id: str) -> dict:
+    try:
+        return {"data": await live_hub.close_position(trade_id)}
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc

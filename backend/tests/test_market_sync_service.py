@@ -1,5 +1,8 @@
 import pytest
+from sqlalchemy import select
+from sqlalchemy.orm import selectinload
 
+from app.models import Market
 from app.services.market_sync_service import MarketSyncService
 
 
@@ -11,10 +14,11 @@ class FakeGammaClient:
         return [
             {
                 "id": "m1",
-                "eventId": "e1",
+                "conditionId": "cond-1",
+                "events": [{"id": "e1"}],
                 "question": "Will X win?",
-                "outcomes": ["Yes", "No"],
-                "clobTokenIds": ["t_yes", "t_no"],
+                "outcomes": "[\"Yes\", \"No\"]",
+                "clobTokenIds": "[\"t_yes\", \"t_no\"]",
                 "active": True,
                 "resolved": False,
             }
@@ -29,3 +33,12 @@ async def test_market_sync_service(session_factory) -> None:
 
         assert result["events_synced"] == 1
         assert result["markets_synced"] == 1
+
+        market = await session.scalar(
+            select(Market).options(selectinload(Market.tokens)).where(Market.id == "m1")
+        )
+        assert market is not None
+        assert market.event_id == "e1"
+        assert market.condition_id == "cond-1"
+        assert market.outcomes == ["Yes", "No"]
+        assert sorted(token.id for token in market.tokens) == ["t_no", "t_yes"]

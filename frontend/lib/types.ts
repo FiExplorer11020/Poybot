@@ -13,7 +13,7 @@ export type BotTrade = {
   notional: number;
   risk_pct: number;
   kelly: number;
-  slippage: number;
+  slippage?: number;
   fees: number;
   pnl_abs: number;
   pnl_pct: number;
@@ -29,6 +29,11 @@ export type LiveSnapshot = {
     kelly_fraction: number;
     max_drawdown_stop_pct: number;
     fee_bps: number;
+    allocation_mode?: string;
+    manual_notional_amount?: number;
+    max_concurrent_positions?: number;
+    max_positions_per_tick?: number;
+    min_observations?: number;
   };
   stats: {
     total_pnl: number;

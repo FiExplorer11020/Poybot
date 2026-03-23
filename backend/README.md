@@ -46,7 +46,7 @@ A wallet auth flow is now available for frontend integration:
 
 - `GET /api/v1/live-summary`
 - `POST /api/v1/bot/control`
-- `POST /api/v1/markets/{market_id}/simulate-exec` with `{ "market_title": "..." }`
+- `POST /api/v1/markets/{market_id}/execute` with `{ "market_title": "..." }`
 - `GET /api/v1/trades/bot-history`
 - `GET /api/v1/portfolio/pnl-by-timeframe?timeframe=24h|7d|30d|90d`
 - `WS /ws/live`
@@ -240,5 +240,5 @@ Two revisions are now expected:
 
 ## Trading specification
 
-Quant/risk rules are now formalized in `TRADING_SPEC.md` and implemented in runtime via `app/services/adaptive_strategy.py` + `app/live/state.py`.
-This includes Polymarket-compatible probability bounds, dynamic edge thresholds, spread/volatility penalties, risk caps, Kelly scaling, and cost-aware execution simulation.
+The runtime source of truth is currently `app/services/adaptive_strategy.py` plus `app/live/state.py`.
+Treat those modules as authoritative until a new spec is regenerated from observed runtime behavior.

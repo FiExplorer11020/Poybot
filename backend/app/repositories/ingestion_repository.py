@@ -1,4 +1,4 @@
-from datetime import datetime
+from datetime import datetime, timezone
 from decimal import Decimal
 
 from sqlalchemy import select
@@ -27,26 +27,36 @@ class IngestionRepository:
                 side=payload.get("side", "unknown"),
                 price=Decimal(str(payload.get("price", 0))),
                 size=Decimal(str(payload.get("size", 0))),
-                traded_at=datetime.fromisoformat(payload["timestamp"].replace("Z", "+00:00"))
-                if payload.get("timestamp")
-                else datetime.utcnow(),
+                traded_at=(
+                    datetime.fromisoformat(payload["timestamp"].replace("Z", "+00:00"))
+                    if payload.get("timestamp")
+                    else datetime.utcnow()
+                ),
             )
         )
 
-    async def insert_top_of_book(self, market_id: str, token_id: str, best_bid: Decimal | None, best_ask: Decimal | None) -> None:
+    async def insert_top_of_book(
+        self,
+        market_id: str,
+        token_id: str,
+        best_bid: Decimal | None,
+        best_ask: Decimal | None,
+    ) -> TopOfBook:
         spread = (best_ask - best_bid) if (best_ask is not None and best_bid is not None) else None
-        mid = ((best_ask + best_bid) / 2) if (best_ask is not None and best_bid is not None) else None
-        self.session.add(
-            TopOfBook(
-                market_id=market_id,
-                token_id=token_id,
-                best_bid=best_bid,
-                best_ask=best_ask,
-                spread=spread,
-                mid_price=mid,
-                observed_at=datetime.utcnow(),
-            )
+        mid = (
+            ((best_ask + best_bid) / 2) if (best_ask is not None and best_bid is not None) else None
         )
+        top_of_book = TopOfBook(
+            market_id=market_id,
+            token_id=token_id,
+            best_bid=best_bid,
+            best_ask=best_ask,
+            spread=spread,
+            mid_price=mid,
+            observed_at=datetime.now(timezone.utc),
+        )
+        self.session.add(top_of_book)
+        return top_of_book
 
     async def latest_mid_price(self, market_id: str) -> Decimal | None:
         row = await self.session.scalar(

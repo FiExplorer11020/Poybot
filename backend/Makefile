@@ -1,4 +1,4 @@
-.PHONY: install lint format test run migrate up down frontend
+.PHONY: install lint format test run migrate up down frontend validate smoke
 
 install:
 	pip install -e .[dev]
@@ -10,7 +10,13 @@ format:
 	black app tests
 
 test:
-	pytest -q
+	PYTHONPATH=. python -m pytest -p no:capture -q
+
+smoke:
+	PYTHONPATH=. python -m py_compile app/main.py app/live/state.py app/api/v1/live_routes.py app/services/adaptive_strategy.py
+
+validate: smoke test
+	cd ../frontend && npm run lint
 
 run:
 	uvicorn app.main:app --reload --host 0.0.0.0 --port 8000

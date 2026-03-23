@@ -1,8 +1,10 @@
 import asyncio
+import os
 from contextlib import suppress
 
 from fastapi import FastAPI, HTTPException, Request, WebSocket
 from fastapi.responses import ORJSONResponse
+from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import text
 
 from app.api.security import rate_limit_key_from_websocket, rate_limiter, require_ws_token
@@ -18,6 +20,15 @@ settings = get_settings()
 configure_logging(settings.log_level)
 
 app = FastAPI(title=settings.app_name, version="0.2.0-mvp", default_response_class=ORJSONResponse)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 app.include_router(v1_router, prefix=settings.api_prefix)
 app.include_router(live_router, prefix=settings.api_prefix)
 app.include_router(wallet_router, prefix=settings.api_prefix)
@@ -35,20 +46,26 @@ async def rate_limit_middleware(request: Request, call_next):
 async def _tick_loop() -> None:
     while True:
         await live_hub.tick()
-        await asyncio.sleep(1)
+        await asyncio.sleep(0.25)
 
 
 @app.on_event("startup")
 async def startup_event() -> None:
+    await live_hub.startup()
+    if os.getenv("PYTEST_CURRENT_TEST"):
+        app.state.ticker_task = None
+        return
     app.state.ticker_task = asyncio.create_task(_tick_loop())
 
 
 @app.on_event("shutdown")
 async def shutdown_event() -> None:
-    task = app.state.ticker_task
-    task.cancel()
-    with suppress(asyncio.CancelledError):
-        await task
+    task = getattr(app.state, "ticker_task", None)
+    if task is not None:
+        task.cancel()
+        with suppress(asyncio.CancelledError):
+            await task
+    await live_hub.shutdown()
 
 
 @app.get("/health")

@@ -27,6 +27,29 @@ def test_bot_control_requires_token_when_configured() -> None:
     security.settings.api_auth_token = None
 
 
+def test_strategy_config_requires_token_when_configured() -> None:
+    from app.api import security
+    from app.core import settings as settings_module
+
+    settings_module.get_settings.cache_clear()
+    cfg = settings_module.get_settings()
+    cfg.api_auth_token = "secret-token"
+    security.settings.api_auth_token = "secret-token"
+
+    with TestClient(app) as client:
+        unauth_resp = client.post("/api/v1/strategy/config", json={"risk_per_trade_pct": 0.02})
+        auth_resp = client.post(
+            "/api/v1/strategy/config",
+            json={"risk_per_trade_pct": 0.02},
+            headers={"x-api-token": "secret-token"},
+        )
+
+    assert unauth_resp.status_code == 401
+    assert auth_resp.status_code == 200
+    cfg.api_auth_token = None
+    security.settings.api_auth_token = None
+
+
 def test_ws_requires_token_when_configured() -> None:
     from app.api import security
     from app.core import settings as settings_module

@@ -5,6 +5,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from app.models import Event, Market, RawMetadataSnapshot, SyncJobStatus, Token, TopOfBook, Trade
+from app.utils.polymarket import parse_json_list_field
 
 
 class MarketRepository:
@@ -30,8 +31,8 @@ class MarketRepository:
         market.condition_id = payload.get("conditionId")
         market.slug = payload.get("slug")
         market.question = payload.get("question", market.question)
-        market.outcomes = payload.get("outcomes") or []
-        market.tags = payload.get("tags") or []
+        market.outcomes = [str(outcome) for outcome in parse_json_list_field(payload.get("outcomes"))]
+        market.tags = [str(tag) for tag in parse_json_list_field(payload.get("tags"))]
         market.active = payload.get("active", True)
         market.resolved = payload.get("resolved", False)
         market.status = "resolved" if market.resolved else ("active" if market.active else "closed")

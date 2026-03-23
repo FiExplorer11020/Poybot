@@ -1,6 +1,6 @@
 from functools import lru_cache
 
-from pydantic import Field
+from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -20,7 +20,7 @@ class Settings(BaseSettings):
     rate_limit_window_seconds: int = 60
 
     postgres_dsn: str = Field(
-        default="postgresql+asyncpg://postgres:postgres@localhost:5432/poybot",
+        default="sqlite+aiosqlite:///poybot.db",
         alias="POSTGRES_DSN",
     )
     redis_url: str = "redis://localhost:6379/0"
@@ -34,9 +34,22 @@ class Settings(BaseSettings):
     polymarket_api_key: str | None = None
     polymarket_api_secret: str | None = None
     polymarket_api_passphrase: str | None = None
+    polymarket_private_key: str | None = None
+    backtest_results_dir: str = "data/backtests"
 
     default_page_size: int = 25
     max_page_size: int = 100
+
+    @field_validator("debug", mode="before")
+    @classmethod
+    def normalize_debug(cls, value):
+        if isinstance(value, str):
+            lowered = value.strip().lower()
+            if lowered in {"release", "prod", "production", "false", "0", "off", "no"}:
+                return False
+            if lowered in {"debug", "dev", "true", "1", "on", "yes"}:
+                return True
+        return value
 
 
 @lru_cache

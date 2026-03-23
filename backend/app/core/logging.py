@@ -11,3 +11,7 @@ def configure_logging(level: str = "INFO") -> None:
     root.setLevel(level)
     root.handlers.clear()
     root.addHandler(handler)
+
+    # Keep third-party client chatter from drowning out actual app/runtime issues.
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
