@@ -14,6 +14,7 @@ const INITIAL_RECONNECT_DELAY_MS = 1_000;
 type LiveEvent = {
   type?: string;
   payload?: Record<string, unknown>;
+  snapshot?: Record<string, unknown>;
   reason?: unknown;
   details?: unknown;
 };
@@ -80,6 +81,11 @@ export function LiveSocketBridge() {
       }
 
       const liveStore = useLiveStore.getState();
+      const applySnapshot = (snapshot?: Record<string, unknown>) => {
+        if (snapshot) {
+          liveStore.processBootstrap(snapshot);
+        }
+      };
 
       switch (event?.type) {
         case "bootstrap":
@@ -97,18 +103,22 @@ export function LiveSocketBridge() {
         }
         case "trade":
         case "trade_closed": {
+          applySnapshot(event.snapshot);
           if (!event.payload) {
             break;
           }
 
           const tradeLabel = `${String(event.payload.side ?? "TRADE")} ${String(event.payload.market_title ?? "")}`;
-          liveStore.processTrade(event.payload);
+          if (!event.snapshot) {
+            liveStore.processTrade(event.payload);
+          }
           toast.success(tradeLabel.trim(), {
             description: `${Number(event.payload.notional ?? 0).toFixed(2)} USD notional`,
           });
           break;
         }
         case "halt": {
+          applySnapshot(event.snapshot);
           const haltPayload = event.payload ?? {
             reason: event.reason,
             details: event.details,

@@ -69,12 +69,33 @@ class ConfigUpdateIn(BaseModel):
     max_total_exposure_pct: float | None = None
     kelly_fraction: float | None = None
     max_drawdown_stop_pct: float | None = None
+    base_entry_threshold: float | None = None
+    spread_cap: float | None = None
     allocation_mode: str | None = None
     manual_notional_amount: float | None = None
     max_concurrent_positions: int | None = None
     max_positions_per_tick: int | None = None
     min_observations: int | None = None
+    min_signal_strength: float | None = None
     cooldown_seconds: int | None = None
+    signal_staleness_seconds: int | None = None
+    max_holding_seconds: int | None = None
+    display_market_limit: int | None = None
+
+
+@router.get("/bot/config")
+async def bot_config() -> dict:
+    return {"data": live_hub.snapshot()["risk_config"]}
+
+
+@router.patch("/bot/config", dependencies=[Depends(require_api_token)])
+async def patch_bot_config(payload: ConfigUpdateIn) -> dict:
+    return {"data": await live_hub.update_config(payload.model_dump(exclude_unset=True))}
+
+
+@router.post("/bot/config", dependencies=[Depends(require_api_token)])
+async def post_bot_config(payload: ConfigUpdateIn) -> dict:
+    return {"data": await live_hub.update_config(payload.model_dump(exclude_unset=True))}
 
 
 @router.post("/strategy/config", dependencies=[Depends(require_api_token)])

@@ -4,6 +4,7 @@ import { useMemo, useState } from "react";
 import { Pause, Play, Power, ShieldAlert, TimerReset, TrendingUp, Waves } from "lucide-react";
 
 import { Dialog } from "@/components/ui/dialog";
+import { useRealtimeClock } from "@/lib/useRealtimeClock";
 import { cn, formatMoney, formatPct } from "@/lib/utils";
 import { useLiveStore } from "@/store/useLiveStore";
 
@@ -89,10 +90,12 @@ function MetricLine({
 
 export function StatsSidebar({ mobile = false }: { mobile?: boolean }) {
   const [stopDialogOpen, setStopDialogOpen] = useState(false);
+  const nowMs = useRealtimeClock(500);
 
   const status = useLiveStore((state) => state.status);
   const uptimeSeconds = useLiveStore((state) => state.uptimeSeconds);
   const latencyMs = useLiveStore((state) => state.latencyMs);
+  const snapshotTime = useLiveStore((state) => state.snapshotTime);
   const portfolioTotal = useLiveStore((state) => state.portfolioTotal);
   const totalPnl = useLiveStore((state) => state.totalPnl);
   const totalPnlPct = useLiveStore((state) => state.totalPnlPct);
@@ -104,13 +107,37 @@ export function StatsSidebar({ mobile = false }: { mobile?: boolean }) {
   const clearHalt = useLiveStore((state) => state.clearHalt);
 
   const liveEquity = priceHistory.at(-1)?.portfolio ?? portfolioTotal + totalPnl;
+  const snapshotAgeMs = useMemo(() => {
+    if (!snapshotTime) {
+      return 0;
+    }
+    const parsed = Date.parse(snapshotTime);
+    if (Number.isNaN(parsed)) {
+      return 0;
+    }
+    return Math.max(0, nowMs - parsed);
+  }, [nowMs, snapshotTime]);
+
+  const liveUptimeSeconds = useMemo(() => {
+    if (status !== "RUNNING") {
+      return uptimeSeconds;
+    }
+    return uptimeSeconds + Math.floor(snapshotAgeMs / 1000);
+  }, [snapshotAgeMs, status, uptimeSeconds]);
+
+  const displayLatencyMs = useMemo(() => {
+    if (status !== "RUNNING") {
+      return latencyMs;
+    }
+    return latencyMs + snapshotAgeMs;
+  }, [latencyMs, snapshotAgeMs, status]);
 
   const exposurePct = useMemo(
     () => Math.min(100, liveEquity > 0 ? (capitalInTrade / liveEquity) * 100 : 0),
     [capitalInTrade, liveEquity]
   );
 
-  const latency = latencyTone(latencyMs);
+  const latency = latencyTone(displayLatencyMs);
   const bot = statusTone(status);
 
   return (
@@ -144,16 +171,13 @@ export function StatsSidebar({ mobile = false }: { mobile?: boolean }) {
           </div>
 
           <div className="grid grid-cols-2 gap-3">
-            <MetricLine label="Uptime" value={formatUptime(uptimeSeconds)} />
+            <MetricLine label="Uptime" value={formatUptime(liveUptimeSeconds)} />
             <div className={cn("rounded-[18px] border px-3 py-3", latency.badge)}>
-              <p className="text-[10px] uppercase tracking-[0.24em] text-white/35">Latency</p>
+              <p className="text-[10px] uppercase tracking-[0.24em] text-white/35">Data delay</p>
               <div className="mt-2 flex items-center gap-2">
                 <span className={cn("h-2.5 w-2.5 rounded-full animate-signal-pulse", latency.dot)} />
-                <span
-                  key={`latency-${latencyMs}`}
-                  className={cn("inline-flex animate-value-flip font-mono text-base font-medium", latency.text)}
-                >
-                  {latencyMs}ms
+                <span className={cn("inline-flex font-mono text-base font-medium", latency.text)}>
+                  {displayLatencyMs}ms
                 </span>
               </div>
             </div>
