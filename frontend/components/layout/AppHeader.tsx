@@ -12,7 +12,7 @@ const links = [
   { href: "/scanner", label: "Scanner" },
   { href: "/positions", label: "Positions" },
   { href: "/history", label: "History" },
-  { href: "/config", label: "Config" },
+  { href: "/config", label: "Setup" },
 ];
 
 export function AppHeader() {
