@@ -1,0 +1,69 @@
+{
+  "baseline_comparison": {
+    "fade_all": {
+      "net_pnl_usdc": -105.512625,
+      "sharpe_net": -4.14336694321019,
+      "total_trades": 2
+    },
+    "follow_all": {
+      "net_pnl_usdc": 86.875833,
+      "sharpe_net": 21.839902168232094,
+      "total_trades": 2
+    },
+    "liquid_markets_only": {
+      "net_pnl_usdc": 86.875833,
+      "sharpe_net": 21.839902168232094,
+      "total_trades": 2
+    },
+    "random_seeded": {
+      "net_pnl_usdc": 5.403244,
+      "sharpe_net": 0.06323249039402233,
+      "total_trades": 2
+    }
+  },
+  "cost_sources": {
+    "candle": 4,
+    "falcon_574": 2,
+    "sqrt_impact": 4
+  },
+  "data_quality": {
+    "book_source_fill_pct": 0.0,
+    "constant_fallback_fill_pct": 0.0,
+    "real_cost_source_fill_pct": 1.0,
+    "score_eligible_fills": 2,
+    "total_fills": 2
+  },
+  "economic_model_version": "v1.0.0",
+  "gate_passed": false,
+  "gate_status": "DATA_INSUFFICIENT",
+  "input_counts": {
+    "books": 0,
+    "candles": 58,
+    "markets": 10,
+    "trades": 20
+  },
+  "markdown": "# Leader Swing Gate Report\n\n- Gate passed: False\n- Gate status: DATA_INSUFFICIENT\n- Net PnL USDC: 86.875833\n- Score Net PnL USDC: 86.875833\n- Sharpe net: 21.83990216823209452158364750\n- Total trades: 2\n- Economic model: v1.0.0",
+  "markdown_path": "reports/leader_swing_gate_20x30_diag.md",
+  "metrics": {
+    "gross_pnl_usdc": 173.724937,
+    "losses": 0,
+    "max_drawdown_usdc": 0.0,
+    "net_pnl_usdc": 86.875833,
+    "sharpe_net": 21.839902168232094,
+    "total_trades": 2,
+    "win_rate": 1.0,
+    "wins": 2
+  },
+  "policy": "follow_all",
+  "score_metrics": {
+    "gross_pnl_usdc": 173.724937,
+    "losses": 0,
+    "max_drawdown_usdc": 0.0,
+    "net_pnl_usdc": 86.875833,
+    "sharpe_net": 21.839902168232094,
+    "total_trades": 2,
+    "win_rate": 1.0,
+    "wins": 2
+  },
+  "strategy_track": "leader_swing"
+}
