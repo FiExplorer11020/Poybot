@@ -10,6 +10,7 @@ import asyncio
 import hashlib
 import json
 import time
+from collections import deque
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Any
@@ -169,6 +170,7 @@ class TradeObserver:
         self._ws_client: PolymarketWSClient | None = None
         self._inserted: int = 0
         self._market_meta_cache: dict[str, float] = {}
+        self._book_age_samples: deque[float] = deque(maxlen=512)
 
     @property
     def inserted_count(self) -> int:
@@ -248,8 +250,61 @@ class TradeObserver:
                         except Exception:
                             pass
         elif event_type == "book":
-            # Initial book snapshot — just track that market is live
-            pass
+            await self._record_book_metrics(msg)
+
+    @staticmethod
+    def _event_timestamp_s(raw_ts: Any) -> float | None:
+        if raw_ts is None:
+            return None
+        try:
+            ts = float(raw_ts)
+        except (TypeError, ValueError):
+            return None
+        if ts > 10_000_000_000:
+            ts /= 1000.0
+        return ts
+
+    @staticmethod
+    def _percentile(values: list[float], pct: float) -> float:
+        if not values:
+            return 0.0
+        ordered = sorted(values)
+        idx = min(len(ordered) - 1, max(0, round((len(ordered) - 1) * pct)))
+        return ordered[idx]
+
+    async def _record_book_metrics(self, msg: dict) -> None:
+        if not self._redis:
+            return
+        now_s = time.time()
+        ts_s = self._event_timestamp_s(msg.get("timestamp") or msg.get("time") or msg.get("ts"))
+        age_s = 0.0 if ts_s is None else max(0.0, now_s - ts_s)
+        self._book_age_samples.append(age_s)
+        p95_s = self._percentile(list(self._book_age_samples), 0.95)
+        try:
+            await self._redis.setex("metrics:book_age_p95_s", 300, f"{p95_s:.3f}")
+            market_id = str(msg.get("market") or msg.get("market_id") or "")
+            token_id = str(msg.get("asset_id") or msg.get("token_id") or msg.get("asset") or "")
+            if market_id and token_id:
+                await self._redis.setex(
+                    f"book:last:{market_id}:{token_id}",
+                    300,
+                    json.dumps(
+                        {
+                            "market_id": market_id,
+                            "token_id": token_id,
+                            "age_s": round(age_s, 3),
+                            "book_age_p95_s": round(p95_s, 3),
+                            "observed_ts": now_s,
+                            "source_timestamp": msg.get("timestamp")
+                            or msg.get("time")
+                            or msg.get("ts"),
+                            "bid_levels": len(msg.get("bids") or []),
+                            "ask_levels": len(msg.get("asks") or []),
+                        }
+                    ),
+                )
+        except Exception:
+            logger.debug("Failed to update book quality Redis metrics", exc_info=True)
 
     async def _process_legacy_ws_trade(self, msg: dict) -> None:
         """Handle legacy trade-shaped WS events when wallet attribution is present.

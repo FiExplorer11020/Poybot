@@ -362,6 +362,13 @@ def build_neural_readiness_snapshot(inputs: ReadinessInputs) -> dict[str, Any]:
             "bars": global_bars,
             "blockers": blockers,
             "state_counts": _state_counts(markets, blockers),
+            "data_accumulation": {
+                "counts": dict(health.get("data_accumulation_counts") or {}),
+                "fee_snapshot_coverage_source": health.get("fee_snapshot_coverage_source"),
+                "book_age_p95_s": health.get("book_age_p95_s"),
+                "fee_snapshot_coverage_pct": health.get("fee_snapshot_coverage_pct"),
+                "token_map_coverage_pct": health.get("token_map_coverage_pct"),
+            },
             "economic_model_version": ECONOMIC_MODEL_VERSION,
             "updated_at": now.isoformat(),
         },

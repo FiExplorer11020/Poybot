@@ -266,6 +266,7 @@ class TestDashboardHtml:
         resp = app_client.get("/")
         assert "/api/neural-readiness" in resp.text
         assert "neural-global-bars" in resp.text
+        assert "neural-data-counts" in resp.text
 
 
 # ---------------------------------------------------------------------------

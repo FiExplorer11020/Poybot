@@ -86,3 +86,27 @@ def test_high_drawdown_blocks_portfolio_accumulation():
     assert snapshot["global"]["bars"]["portfolio_accumulation_pct"] <= 25
     assert "risk_drawdown_high" in snapshot["global"]["blockers"]
 
+
+def test_data_accumulation_counts_are_exposed():
+    snapshot = build_neural_readiness_snapshot(
+        ReadinessInputs(
+            health={
+                "book_age_p95_s": None,
+                "fee_snapshot_coverage_pct": 100.0,
+                "fee_snapshot_coverage_source": "markets.fee_rate_pct",
+                "token_map_coverage_pct": 70.0,
+                "data_accumulation_counts": {
+                    "total_markets": 10,
+                    "token_mapped_markets": 7,
+                    "fee_snapshot_tokens": 0,
+                },
+            },
+            activation=[],
+            risk={"open_count": 0, "drawdown_pct": 0.0},
+            ml={},
+        )
+    )
+
+    accumulation = snapshot["global"]["data_accumulation"]
+    assert accumulation["counts"]["total_markets"] == 10
+    assert accumulation["fee_snapshot_coverage_source"] == "markets.fee_rate_pct"

@@ -188,16 +188,21 @@ async def _health_checks(force: bool = False) -> dict:
         fee_snapshot_coverage_pct: float | None = None
         token_map_coverage_pct: float | None = None
         rejected_signals_1h: dict[str, int] = {}
+        fee_snapshot_coverage_source: str | None = None
+        data_accumulation_counts: dict[str, int] = {}
 
         try:
             async with _pool.acquire() as conn:
                 last = await conn.fetchval(
                     "SELECT EXTRACT(EPOCH FROM (NOW() - MAX(time))) FROM trades_observed"
                 )
+                db_quality = await _db_data_quality_snapshot(conn)
             db_ok = True
             last_trade_age_s = float(last) if last is not None else None
+            data_accumulation_counts = db_quality.get("counts", {})
         except Exception as e:
             logger.warning(f"DB health check failed: {e}")
+            db_quality = {}
 
         try:
             await _redis.ping()
@@ -219,6 +224,15 @@ async def _health_checks(force: bool = False) -> dict:
         except Exception as e:
             logger.warning(f"Redis health check failed: {e}")
 
+        if db_quality:
+            if fee_snapshot_coverage_pct is None:
+                fee_snapshot_coverage_pct = db_quality.get("fee_snapshot_coverage_pct")
+                fee_snapshot_coverage_source = db_quality.get("fee_snapshot_coverage_source")
+            else:
+                fee_snapshot_coverage_source = "redis"
+            if token_map_coverage_pct is None:
+                token_map_coverage_pct = db_quality.get("token_map_coverage_pct")
+
         _schedule_falcon_probe()
         data = {
             "db": db_ok,
@@ -230,13 +244,83 @@ async def _health_checks(force: bool = False) -> dict:
             "last_message_age_s": last_message_age_s,
             "book_age_p95_s": book_age_p95_s,
             "fee_snapshot_coverage_pct": fee_snapshot_coverage_pct,
+            "fee_snapshot_coverage_source": fee_snapshot_coverage_source,
             "token_map_coverage_pct": token_map_coverage_pct,
+            "data_accumulation_counts": data_accumulation_counts,
             "rejected_signals_1h": rejected_signals_1h,
             "last_trade_age_s": last_trade_age_s,
         }
         _health_cache["data"] = copy.deepcopy(data)
         _health_cache["last_checked"] = now
         return data
+
+
+async def _db_data_quality_snapshot(conn) -> dict:
+    row = await conn.fetchrow(
+        """
+        WITH market_counts AS (
+            SELECT
+                COUNT(*) AS total_markets,
+                COUNT(*) FILTER (
+                    WHERE NULLIF(token_yes, '') IS NOT NULL
+                      AND NULLIF(token_no, '') IS NOT NULL
+                ) AS token_mapped_markets,
+                (
+                    COUNT(token_yes) FILTER (WHERE NULLIF(token_yes, '') IS NOT NULL)
+                    + COUNT(token_no) FILTER (WHERE NULLIF(token_no, '') IS NOT NULL)
+                ) AS mapped_tokens,
+                COUNT(*) FILTER (WHERE fee_rate_pct IS NOT NULL) AS legacy_fee_markets
+            FROM markets
+        ),
+        fee_snapshot_counts AS (
+            SELECT COUNT(DISTINCT (market_id, token_id)) AS fee_snapshot_tokens
+            FROM fee_snapshots
+        )
+        SELECT
+            market_counts.total_markets,
+            market_counts.token_mapped_markets,
+            market_counts.mapped_tokens,
+            market_counts.legacy_fee_markets,
+            fee_snapshot_counts.fee_snapshot_tokens
+        FROM market_counts, fee_snapshot_counts
+        """
+    )
+    if not row:
+        return {}
+
+    def _int(name: str) -> int:
+        try:
+            return int(row[name] or 0)
+        except Exception:
+            return 0
+
+    total_markets = _int("total_markets")
+    token_mapped_markets = _int("token_mapped_markets")
+    mapped_tokens = _int("mapped_tokens")
+    legacy_fee_markets = _int("legacy_fee_markets")
+    fee_snapshot_tokens = _int("fee_snapshot_tokens")
+    token_coverage = (
+        round(token_mapped_markets / total_markets * 100, 2) if total_markets else None
+    )
+    if fee_snapshot_tokens > 0 and mapped_tokens > 0:
+        fee_coverage = round(min(fee_snapshot_tokens / mapped_tokens * 100, 100.0), 2)
+        fee_source = "fee_snapshots"
+    else:
+        fee_coverage = round(legacy_fee_markets / total_markets * 100, 2) if total_markets else None
+        fee_source = "markets.fee_rate_pct" if fee_coverage is not None else None
+
+    return {
+        "token_map_coverage_pct": token_coverage,
+        "fee_snapshot_coverage_pct": fee_coverage,
+        "fee_snapshot_coverage_source": fee_source,
+        "counts": {
+            "total_markets": total_markets,
+            "token_mapped_markets": token_mapped_markets,
+            "mapped_tokens": mapped_tokens,
+            "legacy_fee_markets": legacy_fee_markets,
+            "fee_snapshot_tokens": fee_snapshot_tokens,
+        },
+    }
 
 
 async def _fetch_overview_snapshot() -> dict:

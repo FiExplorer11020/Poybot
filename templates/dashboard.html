@@ -1143,6 +1143,7 @@
           <div class="badge bb">Paper-only</div>
         </div>
         <div id="neural-global-bars" style="display:grid;grid-template-columns:repeat(5,1fr);gap:16px;margin-top:16px;"></div>
+        <div id="neural-data-counts" class="info-box-v2" style="margin-top:16px;"></div>
       </div>
 
       <div class="grid-layout" style="display:grid;grid-template-columns:1fr 1fr;gap:24px;align-items:start;margin-bottom:24px;">
@@ -2232,6 +2233,19 @@
           pctBar('Portfolio Accumulation', bars.portfolio_accumulation_pct),
           pctBar('V1 Go/No-Go', bars.v1_go_no_go_pct),
         ].join('');
+      }
+      const accumulation = global.data_accumulation || {};
+      const counts = accumulation.counts || {};
+      const dataCounts = document.getElementById('neural-data-counts');
+      if (dataCounts) {
+        dataCounts.innerHTML = `
+          <div style="display:flex;gap:18px;flex-wrap:wrap;font-size:12px;color:var(--text2);">
+            <span>Total markets: <code>${counts.total_markets ?? 0}</code></span>
+            <span>Token mapped: <code>${counts.token_mapped_markets ?? 0}</code></span>
+            <span>Mapped tokens: <code>${counts.mapped_tokens ?? 0}</code></span>
+            <span>Fee source: <code>${accumulation.fee_snapshot_coverage_source || 'none'}</code></span>
+            <span>Book p95: <code>${accumulation.book_age_p95_s != null ? accumulation.book_age_p95_s + 's' : 'missing'}</code></span>
+          </div>`;
       }
 
       const tracks = neural.tracks || {};

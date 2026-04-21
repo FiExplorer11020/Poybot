@@ -265,6 +265,27 @@ async def test_handle_ws_message_ignores_non_trade():
     conn.execute.assert_not_awaited()
 
 
+@pytest.mark.asyncio
+async def test_handle_book_message_updates_book_age_metric():
+    obs, redis, _ = _make_observer()
+
+    with patch("src.observer.trade_observer.time.time", return_value=1_700_000_001.0):
+        await obs._handle_ws_message(
+            {
+                "event_type": "book",
+                "market": _MARKET,
+                "asset_id": _TOKEN,
+                "timestamp": "1700000000000",
+                "bids": [{"price": "0.44", "size": "20"}],
+                "asks": [{"price": "0.46", "size": "12"}],
+            }
+        )
+
+    metric_calls = [call.args for call in redis.setex.await_args_list]
+    assert ("metrics:book_age_p95_s", 300, "1.000") in metric_calls
+    assert any(args[0] == f"book:last:{_MARKET}:{_TOKEN}" for args in metric_calls)
+
+
 # ---------------------------------------------------------------------------
 # 7. handle_ws_message parses a valid trade event and calls _process_trade
 # ---------------------------------------------------------------------------
