@@ -20,6 +20,7 @@ from loguru import logger
 from src.api import queries
 from src.api.ws_bridge import WSBridge
 from src.config import settings
+from src.engine.neural_readiness import ReadinessInputs, build_neural_readiness_snapshot
 from src.registry.falcon_client import FalconClient
 
 # ---------------------------------------------------------------------------
@@ -354,6 +355,35 @@ async def api_risk():
 async def api_ml():
     snapshot = await _get_live_snapshot()
     return snapshot.get("ml", {})
+
+
+@app.get("/api/neural-readiness")
+async def api_neural_readiness():
+    health = await _health_checks()
+    async with _pool.acquire() as conn:
+        try:
+            activation = await queries.activation_queue(conn)
+        except Exception as exc:
+            logger.warning(f"Neural readiness activation snapshot failed: {exc}")
+            activation = []
+        try:
+            risk = await queries.risk(conn)
+        except Exception as exc:
+            logger.warning(f"Neural readiness risk snapshot failed: {exc}")
+            risk = {"open_count": 0, "drawdown_pct": 0.0}
+        try:
+            ml = await queries.ml_summary(conn)
+        except Exception as exc:
+            logger.warning(f"Neural readiness ML snapshot failed: {exc}")
+            ml = {}
+    return build_neural_readiness_snapshot(
+        ReadinessInputs(
+            health=health,
+            activation=activation,
+            risk=risk,
+            ml=ml,
+        )
+    )
 
 
 @app.get("/api/system")

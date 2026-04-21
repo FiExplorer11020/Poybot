@@ -207,6 +207,17 @@ class TestML:
             assert key in data
 
 
+class TestNeuralReadiness:
+    def test_returns_neural_readiness_contract(self, app_client):
+        resp = app_client.get("/api/neural-readiness")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert set(data) >= {"global", "tracks", "markets", "transitions"}
+        assert "leader_swing" in data["tracks"]
+        assert "micro_reactive" in data["tracks"]
+        assert "data_accumulation_pct" in data["global"]["bars"]
+
+
 class TestLiveSnapshotCache:
     @pytest.mark.asyncio
     async def test_reuses_recent_live_snapshot(self):
@@ -250,6 +261,11 @@ class TestDashboardHtml:
     def test_contains_websocket_code(self, app_client):
         resp = app_client.get("/")
         assert "/ws/live" in resp.text
+
+    def test_fetches_neural_readiness(self, app_client):
+        resp = app_client.get("/")
+        assert "/api/neural-readiness" in resp.text
+        assert "neural-global-bars" in resp.text
 
 
 # ---------------------------------------------------------------------------
