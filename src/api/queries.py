@@ -8,6 +8,8 @@ import json
 from datetime import datetime, timezone
 from typing import Any
 
+from loguru import logger
+
 from src.config import settings
 from src.economics.versioning import (
     valid_decision_filter,
@@ -433,12 +435,13 @@ async def _fetch_equity_curve(conn, limit: int = 500) -> list[dict]:
     ]
 
 
-async def _compute_unrealized_pnl_total(conn) -> float:
+async def _compute_unrealized_pnl_total(conn, redis_client=None) -> float:
     """Sum direction-aware unrealized PnL across all open paper trades.
 
-    Uses the most recent observed trade price per (market, token).  No Redis
-    lookup here — the dashboard path is read-only; per-position live prices
-    from `/api/positions/live` use the Redis cache.
+    Prefers the websocket-fed Redis price cache (`price:{market}:{token}`,
+    populated by `observer.trade_observer`), which reflects the latest book-side
+    price and stays fresh on markets that haven't printed a trade in minutes.
+    Falls back to the most recent `trades_observed` row per (market, token).
     """
     try:
         rows = await conn.fetch(
@@ -449,7 +452,8 @@ async def _compute_unrealized_pnl_total(conn) -> float:
                 FROM trades_observed
                 ORDER BY market_id, token_id, time DESC
             )
-            SELECT pt.direction, pt.entry_price, pt.size_usdc, lp.price
+            SELECT pt.market_id, pt.token_id, pt.direction,
+                   pt.entry_price, pt.size_usdc, lp.price
             FROM paper_trades pt
             LEFT JOIN last_px lp
                    ON lp.market_id = pt.market_id
@@ -466,19 +470,34 @@ async def _compute_unrealized_pnl_total(conn) -> float:
         price = r["price"]
         entry = r["entry_price"]
         size = r["size_usdc"]
-        if price is None or entry is None or not entry:
+        if entry is None or not entry:
+            continue
+        # Prefer Redis cache — the websocket-fed price is fresher than the
+        # latest trades_observed row on low-liquidity markets.
+        if redis_client is not None:
+            try:
+                cached = await redis_client.get(f"price:{r['market_id']}:{r['token_id']}")
+                if cached is not None:
+                    price = cached
+            except Exception:
+                pass
+        if price is None:
+            continue
+        try:
+            price_f = float(price)
+        except (TypeError, ValueError):
             continue
         direction = r["direction"]
         pct = (
-            (float(price) - float(entry)) / float(entry)
+            (price_f - float(entry)) / float(entry)
             if direction == "yes"
-            else (float(entry) - float(price)) / float(entry)
+            else (float(entry) - price_f) / float(entry)
         )
         total += pct * float(size or 0)
     return round(total, 2)
 
 
-async def overview(conn) -> dict:
+async def overview(conn, redis_client=None) -> dict:
     total_pnl = await conn.fetchval(
         f"""
         SELECT COALESCE(SUM(pnl_usdc), 0)
@@ -585,7 +604,7 @@ async def overview(conn) -> dict:
     # --- Portfolio state (persisted) + live mark-to-market ------------------
     portfolio = await _fetch_portfolio_snapshot(conn)
     equity_curve = await _fetch_equity_curve(conn)
-    unrealized_pnl_total = await _compute_unrealized_pnl_total(conn)
+    unrealized_pnl_total = await _compute_unrealized_pnl_total(conn, redis_client=redis_client)
 
     return {
         "total_pnl": float(total_pnl or 0),
@@ -1130,6 +1149,91 @@ async def decisions(conn, limit: int = 100, offset: int = 0) -> list[dict]:
     ]
 
 
+async def decisions_stats(conn, window_hours: int = 24) -> dict:
+    """Aggregate decision-log telemetry for the Signal Stream tab.
+
+    Returns per-action counts, win-rates, and pending volume inside a rolling
+    window so the dashboard can surface signal quality at a glance rather than
+    forcing the operator to eyeball individual rows.
+    """
+    window_hours = max(1, min(int(window_hours or 24), 24 * 30))
+    try:
+        rows = await conn.fetch(
+            f"""
+            SELECT
+                d.action,
+                COUNT(*)::int AS total,
+                COUNT(*) FILTER (WHERE d.outcome = 'win')::int  AS wins,
+                COUNT(*) FILTER (WHERE d.outcome = 'loss')::int AS losses,
+                COUNT(*) FILTER (WHERE d.outcome IS NULL
+                                   OR d.outcome NOT IN ('win','loss'))::int AS pending,
+                AVG(d.confidence)::float AS avg_confidence,
+                AVG(d.kelly_fraction)::float AS avg_kelly
+            FROM decision_log d
+            WHERE d.time >= NOW() - ($1 || ' hours')::interval
+              AND {V1_DECISION_D_SQL}
+            GROUP BY d.action
+            """,
+            str(window_hours),
+        )
+    except Exception as exc:
+        logger.debug(f"decisions_stats query failed: {exc}")
+        rows = []
+
+    out: dict[str, dict] = {}
+    totals = {"total": 0, "wins": 0, "losses": 0, "pending": 0}
+    for r in rows:
+        action = (r["action"] or "skip").lower()
+        total = int(r["total"] or 0)
+        wins = int(r["wins"] or 0)
+        losses = int(r["losses"] or 0)
+        pending = int(r["pending"] or 0)
+        resolved = wins + losses
+        win_rate = (wins / resolved) if resolved > 0 else None
+        out[action] = {
+            "action": action,
+            "total": total,
+            "wins": wins,
+            "losses": losses,
+            "pending": pending,
+            "win_rate": None if win_rate is None else round(win_rate, 4),
+            "avg_confidence": round(float(r["avg_confidence"] or 0.0), 4),
+            "avg_kelly": round(float(r["avg_kelly"] or 0.0), 4),
+        }
+        totals["total"] += total
+        totals["wins"] += wins
+        totals["losses"] += losses
+        totals["pending"] += pending
+
+    # Guarantee all three buckets exist so the dashboard can render a stable strip.
+    for action in ("follow", "fade", "skip"):
+        out.setdefault(
+            action,
+            {
+                "action": action,
+                "total": 0,
+                "wins": 0,
+                "losses": 0,
+                "pending": 0,
+                "win_rate": None,
+                "avg_confidence": 0.0,
+                "avg_kelly": 0.0,
+            },
+        )
+
+    resolved_total = totals["wins"] + totals["losses"]
+    return {
+        "window_hours": window_hours,
+        "buckets": out,
+        "totals": {
+            **totals,
+            "win_rate": (
+                round(totals["wins"] / resolved_total, 4) if resolved_total > 0 else None
+            ),
+        },
+    }
+
+
 async def risk(conn) -> dict:
     daily = await conn.fetchrow(f"""
         SELECT
@@ -1439,3 +1543,295 @@ async def open_positions_with_prices(conn, redis_client) -> list[dict]:
             }
         )
     return result
+
+
+# ---------------------------------------------------------------------------
+# Bundle 3 — observability queries
+# ---------------------------------------------------------------------------
+async def graph_top_edges(conn, limit: int = 30) -> dict:
+    """Strongest Hawkes-confirmed follower edges.
+
+    Ranks by hawkes_alpha_mu * follow_probability so a causal link with both
+    strong excitation and high posterior probability floats to the top.
+    """
+    rows = await conn.fetch(
+        """
+        SELECT
+            e.leader_wallet,
+            e.follower_wallet,
+            e.hawkes_alpha_mu,
+            e.follow_probability,
+            e.follow_beta_a,
+            e.follow_beta_b,
+            e.co_occurrences,
+            e.avg_delay_s,
+            e.same_direction_rate,
+            e.trapped_rate,
+            e.last_observed,
+            e.first_observed
+        FROM follower_edges e
+        WHERE e.follow_probability > 0.6
+          AND e.co_occurrences >= 5
+        ORDER BY
+            COALESCE(e.hawkes_alpha_mu, 0) * COALESCE(e.follow_probability, 0) DESC,
+            e.co_occurrences DESC
+        LIMIT $1
+        """,
+        limit,
+    )
+    edges = []
+    for r in rows:
+        edges.append(
+            {
+                "leader_wallet": _row_get(r, "leader_wallet"),
+                "follower_wallet": _row_get(r, "follower_wallet"),
+                "hawkes_alpha_mu": _to_float(_row_get(r, "hawkes_alpha_mu"), 0.0),
+                "follow_probability": _to_float(_row_get(r, "follow_probability"), 0.0),
+                "beta_a": _to_float(_row_get(r, "follow_beta_a"), 0.0),
+                "beta_b": _to_float(_row_get(r, "follow_beta_b"), 0.0),
+                "co_occurrences": _to_int(_row_get(r, "co_occurrences"), 0),
+                "avg_delay_s": _to_float(_row_get(r, "avg_delay_s"), 0.0),
+                "same_direction_rate": _to_float(_row_get(r, "same_direction_rate"), 0.0),
+                "trapped_rate": _to_float(_row_get(r, "trapped_rate"), 0.0),
+                "last_observed": _row_get(r, "last_observed").isoformat()
+                if _row_get(r, "last_observed")
+                else None,
+                "first_observed": _row_get(r, "first_observed").isoformat()
+                if _row_get(r, "first_observed")
+                else None,
+            }
+        )
+    totals = await conn.fetchrow(
+        """
+        SELECT
+            COUNT(*) FILTER (WHERE follow_probability > 0.6 AND co_occurrences >= 5) AS confirmed,
+            COUNT(*) FILTER (WHERE hawkes_alpha_mu > 1.0) AS hawkes_strong,
+            COUNT(DISTINCT leader_wallet)
+                FILTER (WHERE follow_probability > 0.6 AND co_occurrences >= 5) AS leaders_with_edges
+        FROM follower_edges
+        """
+    )
+    return {
+        "edges": edges,
+        "totals": {
+            "confirmed": _to_int(_row_get(totals, "confirmed"), 0),
+            "hawkes_strong": _to_int(_row_get(totals, "hawkes_strong"), 0),
+            "leaders_with_edges": _to_int(_row_get(totals, "leaders_with_edges"), 0),
+        },
+    }
+
+
+async def profiler_health(conn) -> dict:
+    """Error-model phase distribution, active drift alerts, and phase transition rate.
+
+    Surfaces CUSUM drift signals (profile_json.error_model_runtime.drift_alert)
+    and counts leaders per Beta / LogReg / LightGBM phase.
+    """
+    rows = await conn.fetch(
+        f"""
+        SELECT
+            p.wallet_address,
+            p.error_model_phase,
+            p.positions_resolved,
+            p.trades_observed,
+            p.last_updated,
+            p.profile_json
+        FROM leader_profiles p
+        WHERE {V1_PROFILE_P_SQL}
+        """
+    )
+    phases = {"1": 0, "2": 0, "3": 0}
+    drift_alerts: list[dict] = []
+    recent_transitions = 0
+    transitioned_24h = 0
+    total_profiles = 0
+    stale_profiles = 0
+    now = datetime.now(timezone.utc)
+
+    for r in rows:
+        total_profiles += 1
+        phase = _to_int(_row_get(r, "error_model_phase"), 1)
+        key = "3" if phase >= 3 else ("2" if phase == 2 else "1")
+        phases[key] += 1
+
+        last_updated = _parse_dt(_row_get(r, "last_updated"))
+        if last_updated is not None:
+            age_s = (now - last_updated).total_seconds()
+            if age_s > 2 * settings.FALCON_REFRESH_INTERVAL_S:
+                stale_profiles += 1
+            if age_s <= 86400:
+                transitioned_24h += 1
+
+        profile = _json_dict(_row_get(r, "profile_json"))
+        runtime = profile.get("error_model_runtime") or {}
+        if runtime.get("drift_alert"):
+            triggered_at = runtime.get("drift_triggered_at") or runtime.get("last_drift_at")
+            drift_alerts.append(
+                {
+                    "wallet_address": _row_get(r, "wallet_address"),
+                    "phase": phase,
+                    "drift_score": _to_float(runtime.get("cusum_score"), 0.0),
+                    "error_rate": _to_float(runtime.get("error_rate"), 0.0),
+                    "triggered_at": triggered_at,
+                    "positions_resolved": _to_int(_row_get(r, "positions_resolved"), 0),
+                }
+            )
+        if runtime.get("phase_transitioned_at"):
+            tdt = _parse_dt(runtime.get("phase_transitioned_at"))
+            if tdt and (now - tdt).total_seconds() <= 7 * 86400:
+                recent_transitions += 1
+
+    drift_alerts.sort(key=lambda d: d["drift_score"], reverse=True)
+    return {
+        "total_profiles": total_profiles,
+        "phases": phases,
+        "phase2_pct": round(phases["2"] / total_profiles * 100, 1) if total_profiles else 0.0,
+        "phase3_pct": round(phases["3"] / total_profiles * 100, 1) if total_profiles else 0.0,
+        "drift_alerts": drift_alerts[:20],
+        "drift_alert_count": len(drift_alerts),
+        "phase_transitions_7d": recent_transitions,
+        "profiles_refreshed_24h": transitioned_24h,
+        "stale_profiles": stale_profiles,
+    }
+
+
+async def data_quality(conn, redis_client=None) -> dict:
+    """Silent-rot detector: unenriched markets, stale leaders, dead WS feed, orphan trades."""
+    now = datetime.now(timezone.utc)
+    report: dict[str, Any] = {}
+
+    # --- Market enrichment gaps ----------------------------------------------
+    mrow = await conn.fetchrow(
+        """
+        SELECT
+            COUNT(*) AS total,
+            COUNT(*) FILTER (
+                WHERE NULLIF(token_yes, '') IS NULL OR NULLIF(token_no, '') IS NULL
+            ) AS unmapped_tokens,
+            COUNT(*) FILTER (WHERE end_date IS NOT NULL AND end_date < NOW()) AS expired_active,
+            COUNT(*) FILTER (WHERE active = TRUE) AS active
+        FROM markets
+        """
+    )
+    total_markets = _to_int(_row_get(mrow, "total"), 0)
+    report["markets"] = {
+        "total": total_markets,
+        "active": _to_int(_row_get(mrow, "active"), 0),
+        "unmapped_tokens": _to_int(_row_get(mrow, "unmapped_tokens"), 0),
+        "expired_still_active": _to_int(_row_get(mrow, "expired_active"), 0),
+        "token_map_coverage_pct": (
+            round(
+                (total_markets - _to_int(_row_get(mrow, "unmapped_tokens"), 0))
+                / total_markets
+                * 100,
+                2,
+            )
+            if total_markets
+            else None
+        ),
+    }
+
+    # --- Orphan trades (trades whose market_id never got enriched) ----------
+    orphan = await conn.fetchval(
+        """
+        SELECT COUNT(DISTINCT t.market_id)
+        FROM trades_observed t
+        LEFT JOIN markets m USING(market_id)
+        WHERE m.market_id IS NULL
+          AND t.time >= NOW() - INTERVAL '7 days'
+        """
+    )
+    report["markets"]["orphan_market_ids_7d"] = _to_int(orphan, 0)
+
+    # --- Leader refresh staleness --------------------------------------------
+    refresh_threshold = settings.FALCON_REFRESH_INTERVAL_S * 2
+    lrow = await conn.fetchrow(
+        """
+        SELECT
+            COUNT(*) AS total,
+            COUNT(*) FILTER (
+                WHERE last_refresh IS NULL
+                   OR EXTRACT(EPOCH FROM (NOW() - last_refresh)) > $1
+            ) AS stale
+        FROM leaders
+        WHERE on_watchlist = TRUE AND excluded = FALSE
+        """,
+        refresh_threshold,
+    )
+    report["leaders"] = {
+        "active": _to_int(_row_get(lrow, "total"), 0),
+        "stale_refresh": _to_int(_row_get(lrow, "stale"), 0),
+        "stale_threshold_s": refresh_threshold,
+    }
+
+    # --- Profile staleness ---------------------------------------------------
+    prow = await conn.fetchrow(
+        f"""
+        SELECT
+            COUNT(*) AS total,
+            COUNT(*) FILTER (
+                WHERE last_updated IS NULL
+                   OR EXTRACT(EPOCH FROM (NOW() - last_updated)) > 86400
+            ) AS stale
+        FROM leader_profiles p
+        WHERE {V1_PROFILE_P_SQL}
+        """
+    )
+    report["profiles"] = {
+        "total": _to_int(_row_get(prow, "total"), 0),
+        "stale_over_24h": _to_int(_row_get(prow, "stale"), 0),
+    }
+
+    # --- Trade ingestion & WS feed (Redis) -----------------------------------
+    last_trade_age_s = None
+    try:
+        last_trade_age_s = await conn.fetchval(
+            "SELECT EXTRACT(EPOCH FROM (NOW() - MAX(time))) FROM trades_observed"
+        )
+    except Exception as exc:
+        logger.warning(f"data_quality: last trade fetch failed: {exc}")
+
+    ws_age_s = None
+    price_cache_count = None
+    if redis_client is not None:
+        try:
+            ts = await redis_client.get("ws:market:last_message_ts")
+            if ts is not None:
+                ws_age_s = max(0.0, now.timestamp() - float(ts))
+        except Exception as exc:
+            logger.warning(f"data_quality: ws ts fetch failed: {exc}")
+        try:
+            # Count cached prices (sample, capped)
+            keys = []
+            async for k in redis_client.scan_iter(match="price:*", count=500):
+                keys.append(k)
+                if len(keys) >= 5000:
+                    break
+            price_cache_count = len(keys)
+        except Exception as exc:
+            logger.warning(f"data_quality: price cache scan failed: {exc}")
+
+    report["feed"] = {
+        "last_trade_age_s": float(last_trade_age_s) if last_trade_age_s is not None else None,
+        "ws_last_message_age_s": ws_age_s,
+        "ws_healthy": ws_age_s is not None and ws_age_s <= 30.0,
+        "price_cache_entries": price_cache_count,
+    }
+
+    # --- Overall health score -----------------------------------------------
+    issues = 0
+    if report["markets"]["unmapped_tokens"] > 0:
+        issues += 1
+    if report["markets"]["expired_still_active"] > 0:
+        issues += 1
+    if report["markets"]["orphan_market_ids_7d"] > 0:
+        issues += 1
+    if report["leaders"]["stale_refresh"] > 0:
+        issues += 1
+    if report["profiles"]["stale_over_24h"] > 0:
+        issues += 1
+    if not report["feed"]["ws_healthy"]:
+        issues += 1
+    report["issues_count"] = issues
+    report["status"] = "healthy" if issues == 0 else ("degraded" if issues <= 2 else "unhealthy")
+    return report

@@ -346,6 +346,81 @@ async def test_redis_publish_on_close():
 
 
 @pytest.mark.asyncio
+async def test_merge_exit_closes_sibling_position():
+    """
+    Buying the complementary token within MERGE_WINDOW_S with matching size
+    should close the existing YES position as 'merge' at exit_price = 1 - 0.40.
+    """
+    tracker, redis = _make_tracker()
+    # Prime the token cache so _sibling_token resolves without hitting the DB
+    tracker._market_tokens[_MARKET] = (_TOKEN_YES, _TOKEN_NO)
+    conn = _make_conn()
+
+    captured_args: list = []
+
+    async def capture_execute(sql, *args):
+        captured_args.append(args)
+
+    conn.execute = AsyncMock(side_effect=capture_execute)
+
+    with _mock_get_db(conn):
+        # BUY YES at 0.60 for 1000 shares
+        await tracker.on_trade(_buy_trade(token_id=_TOKEN_YES, price="0.60"))
+        # BUY NO at 0.40 for matching 1000 shares 10 min later → merge exit
+        await tracker.on_trade(
+            _buy_trade(
+                token_id=_TOKEN_NO,
+                price="0.40",
+                size_usdc="400",
+                size_shares="1000",
+                time=_T0.replace(minute=5),
+            )
+        )
+
+    # Sibling YES position should be closed via merge; no fresh open from the
+    # complementary BUY (sizes matched exactly).
+    assert (_WALLET, _MARKET, _TOKEN_YES) not in tracker._open_positions
+    assert (_WALLET, _MARKET, _TOKEN_NO) not in tracker._open_positions
+
+    # Exactly one INSERT for the merged close
+    assert len(captured_args) == 1
+    close_args = captured_args[0]
+    # close_method is $13 → index 12
+    assert close_args[12] == "merge"
+    # exit_price $8 → index 7 should be 1 - 0.40 = 0.60
+    assert abs(float(close_args[7]) - 0.60) < 1e-6
+
+
+@pytest.mark.asyncio
+async def test_merge_skipped_outside_window():
+    """A complementary buy outside MERGE_WINDOW_S should NOT merge."""
+    from datetime import timedelta
+
+    tracker, _ = _make_tracker()
+    tracker._market_tokens[_MARKET] = (_TOKEN_YES, _TOKEN_NO)
+    conn = _make_conn()
+
+    with _mock_get_db(conn):
+        await tracker.on_trade(_buy_trade(token_id=_TOKEN_YES, price="0.60"))
+        # 2 hours later — well outside the 10-minute MERGE_WINDOW_S
+        late = _T0 + timedelta(hours=2)
+        await tracker.on_trade(
+            _buy_trade(
+                token_id=_TOKEN_NO,
+                price="0.40",
+                size_usdc="400",
+                size_shares="1000",
+                time=late,
+            )
+        )
+
+    # Both positions remain open (no merge)
+    assert (_WALLET, _MARKET, _TOKEN_YES) in tracker._open_positions
+    assert (_WALLET, _MARKET, _TOKEN_NO) in tracker._open_positions
+    conn.execute.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_on_trade_ignores_missing_fields():
     tracker, _ = _make_tracker()
     conn = _make_conn()

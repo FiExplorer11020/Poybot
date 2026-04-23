@@ -40,6 +40,11 @@ class PositionTracker:
         self._redis = redis_client
         # Key: (wallet, market_id, token_id) → list of OpenPosition (FIFO queue)
         self._open_positions: dict[tuple, list[OpenPosition]] = {}
+        # Cache of market_id → (token_yes, token_no). Needed to detect merge exits,
+        # which are invisible on the orderbook (CLAUDE.md pitfall #12): a leader
+        # exits a YES position by buying the complementary NO token and merging
+        # YES + NO → $1.00. We must reconcile BOTH token legs per (wallet, market).
+        self._market_tokens: dict[str, tuple[str | None, str | None]] = {}
         self._running = False
         self._stop_event = asyncio.Event()
 
@@ -96,7 +101,7 @@ class PositionTracker:
             logger.debug(f"Bad trade fields: {e}")
             return
 
-        direction = _token_direction(token_id, market_id)
+        direction = await self._resolve_direction(market_id, token_id)
 
         if side == "BUY":
             await self._handle_buy(
@@ -131,25 +136,65 @@ class PositionTracker:
         size_usdc: Decimal,
         size_shares: Decimal,
     ) -> None:
-        """Open a new position or detect merge exit."""
-        # Check if this BUY of opposite direction closes an existing position (merge).
-        # _opposite_key returns None in the simplified stub, so merge detection is
-        # skipped until the markets table lookup is wired in.
-        opposite_token_key = _opposite_key(wallet, market_id, token_id)
-        if opposite_token_key and opposite_token_key in self._open_positions:
-            opposite_positions = self._open_positions[opposite_token_key]
-            for pos in list(opposite_positions):
-                delta_s = abs((trade_time - pos.open_time).total_seconds())
-                if delta_s <= MERGE_WINDOW_S:
-                    await self._close_position(
-                        pos, trade_time, price, pos.shares_remaining, "merge"
-                    )
-                    opposite_positions.remove(pos)
-                    if not opposite_positions:
-                        del self._open_positions[opposite_token_key]
-                    return
+        """Open a new position, accounting for merge exits.
 
-        # Open new position
+        A BUY of the complementary token in the same market within MERGE_WINDOW_S,
+        with size roughly matching an outstanding position on the sibling token,
+        is reinterpreted as a merge exit (YES + NO → $1.00). We close the sibling
+        position(s) FIFO at the merge-implied exit price (1 − opposite_buy_price)
+        and continue to open any residual buy quantity as a fresh position.
+        """
+        opposite_token = await self._sibling_token(market_id, token_id)
+        remaining_buy = size_shares
+        merged_shares = Decimal("0")
+
+        if opposite_token:
+            opp_key = (wallet, market_id, opposite_token)
+            opposite_positions = self._open_positions.get(opp_key, [])
+            # Merge-implied exit for the sibling position: the pair (YES+NO) is
+            # worth exactly $1 post-merge, so the sibling's exit price equals
+            # 1 − price of this complementary BUY.
+            merge_exit_price = Decimal("1") - price
+            if merge_exit_price < Decimal("0"):
+                merge_exit_price = Decimal("0")
+
+            while remaining_buy > 0 and opposite_positions:
+                pos = opposite_positions[0]
+                delta_s = abs((trade_time - pos.open_time).total_seconds())
+                if delta_s > MERGE_WINDOW_S:
+                    break
+                # Close up to min(remaining_buy, pos.shares_remaining) via merge.
+                close_shares = min(pos.shares_remaining, remaining_buy)
+                # Require size symmetry: the merge hypothesis is only credible
+                # when the new BUY is within ±20% of the sibling position size.
+                ratio = (
+                    (close_shares / pos.shares_remaining)
+                    if pos.shares_remaining > 0
+                    else Decimal("0")
+                )
+                if ratio < Decimal("0.8"):
+                    break
+
+                await self._close_position(
+                    pos, trade_time, merge_exit_price, close_shares, "merge"
+                )
+                pos.shares_remaining -= close_shares
+                remaining_buy -= close_shares
+                merged_shares += close_shares
+                if pos.shares_remaining <= Decimal("0"):
+                    opposite_positions.pop(0)
+            if not opposite_positions and opp_key in self._open_positions:
+                del self._open_positions[opp_key]
+
+        if remaining_buy <= Decimal("0"):
+            return
+
+        # Open a new position for whatever quantity wasn't consumed by the merge.
+        if merged_shares > 0 and size_shares > 0:
+            residual_fraction = remaining_buy / size_shares
+            size_usdc = (size_usdc * residual_fraction).quantize(Decimal("0.01"))
+            size_shares = remaining_buy
+
         fee_rate = await self._get_fee_rate(market_id)
         pos = OpenPosition(
             wallet_address=wallet,
@@ -371,20 +416,57 @@ class PositionTracker:
             logger.debug(f"Fee lookup failed for {market_id}: {e}")
         return Decimal("0")
 
+    async def _get_market_tokens(
+        self, market_id: str
+    ) -> tuple[str | None, str | None]:
+        """Return (token_yes, token_no) for a market, using an in-memory cache.
 
-def _token_direction(token_id: str, market_id: str) -> str:
-    """
-    Infer direction from token_id. In Polymarket each market has a token_yes and
-    token_no. Without the markets table we cannot resolve this here, so we default
-    to 'yes'. The caller can pass explicit direction if available.
-    """
-    return "yes"  # Simplified — real implementation would check markets table
+        Needed for merge-exit detection and correct direction labelling. A cache
+        entry is stored even when tokens are unknown (None, None) to avoid
+        re-querying the DB every trade on markets that haven't been enriched yet.
+        """
+        cached = self._market_tokens.get(market_id)
+        # Only cache resolved pairs; an unresolved (None, None) might become
+        # resolved once trade_observer's Gamma enrichment lands, so re-query
+        # on the next trade for that market rather than locking in a miss.
+        if cached is not None and (cached[0] or cached[1]):
+            return cached
+        tokens: tuple[str | None, str | None] = (None, None)
+        try:
+            async with get_db() as conn:
+                row = await conn.fetchrow(
+                    "SELECT token_yes, token_no FROM markets WHERE market_id = $1",
+                    market_id,
+                )
+                if row:
+                    tokens = (row["token_yes"], row["token_no"])
+        except Exception as e:
+            logger.debug(f"Market token lookup failed for {market_id}: {e}")
+        if tokens[0] or tokens[1]:
+            self._market_tokens[market_id] = tokens
+        return tokens
 
+    def invalidate_market_tokens(self, market_id: str) -> None:
+        """Drop the cached (token_yes, token_no) for a market.
 
-def _opposite_key(wallet: str, market_id: str, token_id: str) -> tuple | None:
-    """
-    Return the dict key that would represent the opposite token in the same market.
-    Merge detection requires market context (token_yes / token_no mapping) which is
-    not available in this module. Returns None to skip merge detection until wired in.
-    """
-    return None  # Simplified — merge detection requires market context
+        Callers should invoke this after upserting market metadata so the next
+        trade on this market re-reads the resolved tokens.
+        """
+        self._market_tokens.pop(market_id, None)
+
+    async def _sibling_token(self, market_id: str, token_id: str) -> str | None:
+        """Return the complementary token_id in the same market, if known."""
+        token_yes, token_no = await self._get_market_tokens(market_id)
+        if token_yes and token_id == token_yes:
+            return token_no
+        if token_no and token_id == token_no:
+            return token_yes
+        return None
+
+    async def _resolve_direction(self, market_id: str, token_id: str) -> str:
+        """Infer 'yes' / 'no' from the markets table. Falls back to 'yes'."""
+        token_yes, token_no = await self._get_market_tokens(market_id)
+        if token_no and token_id == token_no:
+            return "no"
+        # If yes is known and matches, or if neither token is known, default to 'yes'.
+        return "yes"

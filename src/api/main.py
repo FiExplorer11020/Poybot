@@ -325,7 +325,7 @@ async def _db_data_quality_snapshot(conn) -> dict:
 
 async def _fetch_overview_snapshot() -> dict:
     async with _pool.acquire() as conn:
-        return await queries.overview(conn)
+        return await queries.overview(conn, redis_client=_redis)
 
 
 async def _fetch_ml_snapshot() -> dict:
@@ -429,6 +429,14 @@ async def api_decisions(
         return await queries.decisions(conn, limit=limit, offset=offset)
 
 
+@app.get("/api/decisions/stats")
+async def api_decisions_stats(
+    window_hours: int = Query(default=24, ge=1, le=720),
+):
+    async with _pool.acquire() as conn:
+        return await queries.decisions_stats(conn, window_hours=window_hours)
+
+
 @app.get("/api/risk")
 async def api_risk():
     async with _pool.acquire() as conn:
@@ -488,6 +496,24 @@ async def api_activation():
 async def api_positions_live():
     async with _pool.acquire() as conn:
         return await queries.open_positions_with_prices(conn, _redis)
+
+
+@app.get("/api/graph/top-edges")
+async def api_graph_top_edges(limit: int = Query(default=30, ge=1, le=200)):
+    async with _pool.acquire() as conn:
+        return await queries.graph_top_edges(conn, limit=limit)
+
+
+@app.get("/api/profiler/health")
+async def api_profiler_health():
+    async with _pool.acquire() as conn:
+        return await queries.profiler_health(conn)
+
+
+@app.get("/api/data-quality")
+async def api_data_quality():
+    async with _pool.acquire() as conn:
+        return await queries.data_quality(conn, redis_client=_redis)
 
 
 @app.websocket("/ws/live")

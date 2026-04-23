@@ -917,6 +917,37 @@
         </div>
       </div>
 
+      <!-- TOP FOLLOWER EDGES -->
+      <div class="card-glass" id="edges-card" style="margin-bottom: 32px;">
+        <div class="section-header coll-hdr open" onclick="toggleColl(this)">
+          <div class="section-title">Top Follower Edges
+            <span id="edges-count" class="badge bo" style="margin-left: 8px;">0</span>
+            <span id="edges-totals" class="badge bb" style="margin-left: 8px;"></span>
+          </div>
+          <span class="arr">▼</span>
+        </div>
+        <div class="coll-body open" style="margin-top: 16px;">
+          <div class="tbl-wrap">
+            <table id="edges-table">
+              <thead>
+                <tr>
+                  <th>Leader</th>
+                  <th>Follower</th>
+                  <th title="Hawkes excitation ratio">α/μ</th>
+                  <th title="Beta posterior mean">P(follow)</th>
+                  <th>Co-occurs</th>
+                  <th>Delay (s)</th>
+                  <th>Same-dir</th>
+                  <th title="P(follower still in when leader exits)">Trapped</th>
+                  <th>Last</th>
+                </tr>
+              </thead>
+              <tbody id="edges-tbody"></tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+
       <div class="card-glass">
         <div class="fbar" style="display: flex; gap: 12px; margin-bottom: 20px;">
           <input class="finput" id="ldr-search" placeholder="Filter registry by address..." oninput="filterLeaders()">
@@ -1043,6 +1074,28 @@
 
     <!-- ══════════════════════════ TAB 4: SIGNAL STREAM ══════════════════════════ -->
     <div id="tab-decisions" class="page">
+      <div class="stats-grid" id="dec-stats-strip" style="margin-bottom:16px;">
+        <div class="stat-card">
+          <div class="stat-label">FOLLOW Win Rate <span class="stat-trend" style="display:inline;">(24h)</span></div>
+          <div class="stat-value" id="dec-follow-wr">—</div>
+          <div class="stat-trend" id="dec-follow-meta">— signals</div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-label">FADE Win Rate <span class="stat-trend" style="display:inline;">(24h)</span></div>
+          <div class="stat-value" id="dec-fade-wr">—</div>
+          <div class="stat-trend" id="dec-fade-meta">— signals</div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-label">SKIP Volume <span class="stat-trend" style="display:inline;">(24h)</span></div>
+          <div class="stat-value neon-blue" id="dec-skip-vol">—</div>
+          <div class="stat-trend" id="dec-skip-meta">Gated by readiness checks</div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-label">Pending Resolution</div>
+          <div class="stat-value neon-orange" id="dec-pending">—</div>
+          <div class="stat-trend" id="dec-pending-meta">Awaiting leader exit / resolution</div>
+        </div>
+      </div>
       <div class="card-glass">
         <div class="section-header">
           <div class="section-title">Global Signal Intelligence</div>
@@ -1131,6 +1184,48 @@
         <div class="card-glass">
           <div class="section-title" style="margin-bottom:16px;">FADE Loss Reasons</div>
           <div id="risk-fade-reasons" class="info-box-v2"></div>
+        </div>
+      </div>
+
+      <!-- MODEL HEALTH -->
+      <div class="card-glass" style="margin-top:24px;">
+        <div class="section-title" style="margin-bottom:16px;">Model Health</div>
+        <div class="stats-grid" style="grid-template-columns:repeat(5,1fr);gap:12px;margin-bottom:16px;">
+          <div class="stat-card">
+            <div class="stat-label">Phase 1 (Beta)</div>
+            <div class="stat-value" id="ph-p1">—</div>
+          </div>
+          <div class="stat-card">
+            <div class="stat-label">Phase 2 (LogReg)</div>
+            <div class="stat-value neon-blue" id="ph-p2">—</div>
+          </div>
+          <div class="stat-card">
+            <div class="stat-label">Phase 3 (LightGBM)</div>
+            <div class="stat-value neon-green" id="ph-p3">—</div>
+          </div>
+          <div class="stat-card">
+            <div class="stat-label">Drift Alerts</div>
+            <div class="stat-value neon-orange" id="ph-drift">—</div>
+          </div>
+          <div class="stat-card">
+            <div class="stat-label">Transitions 7d</div>
+            <div class="stat-value" id="ph-trans">—</div>
+          </div>
+        </div>
+        <div class="tbl-wrap">
+          <table id="drift-table">
+            <thead>
+              <tr>
+                <th>Leader</th>
+                <th>Phase</th>
+                <th>CUSUM</th>
+                <th>Error Rate</th>
+                <th>Resolved</th>
+                <th>Triggered</th>
+              </tr>
+            </thead>
+            <tbody id="drift-tbody"></tbody>
+          </table>
         </div>
       </div>
     </div>
@@ -1240,6 +1335,48 @@
       <div class="card-glass" style="margin-top:24px;">
         <div class="section-title" style="margin-bottom:16px;">ML Memory</div>
         <div id="sys-ml"></div>
+      </div>
+
+      <!-- DATA QUALITY -->
+      <div class="card-glass" style="margin-top:24px;">
+        <div class="section-header">
+          <div class="section-title">Data Quality</div>
+          <div id="dq-status" class="badge bb">—</div>
+        </div>
+        <div class="stats-grid" style="grid-template-columns:repeat(4,1fr);gap:12px;margin-top:16px;">
+          <div class="stat-card">
+            <div class="stat-label">Unmapped Tokens</div>
+            <div class="stat-value" id="dq-unmapped">—</div>
+          </div>
+          <div class="stat-card">
+            <div class="stat-label">Expired Still Active</div>
+            <div class="stat-value" id="dq-expired">—</div>
+          </div>
+          <div class="stat-card">
+            <div class="stat-label">Orphan Markets (7d)</div>
+            <div class="stat-value" id="dq-orphan">—</div>
+          </div>
+          <div class="stat-card">
+            <div class="stat-label">Stale Leader Refresh</div>
+            <div class="stat-value" id="dq-stale-ld">—</div>
+          </div>
+          <div class="stat-card">
+            <div class="stat-label">Profiles &gt;24h Stale</div>
+            <div class="stat-value" id="dq-stale-pr">—</div>
+          </div>
+          <div class="stat-card">
+            <div class="stat-label">Last Trade Age</div>
+            <div class="stat-value" id="dq-trade-age">—</div>
+          </div>
+          <div class="stat-card">
+            <div class="stat-label">WS Feed Age</div>
+            <div class="stat-value" id="dq-ws-age">—</div>
+          </div>
+          <div class="stat-card">
+            <div class="stat-label">Price Cache Entries</div>
+            <div class="stat-value" id="dq-cache">—</div>
+          </div>
+        </div>
       </div>
     </div>
 
@@ -2020,6 +2157,146 @@
       applyDecFilter();
     }
 
+    function renderDecisionStats(stats) {
+      const b = (stats && stats.buckets) || {};
+      const follow = b.follow || {};
+      const fade = b.fade || {};
+      const skip = b.skip || {};
+      const totals = (stats && stats.totals) || {};
+
+      const setWR = (elId, metaId, bucket) => {
+        const el = document.getElementById(elId);
+        const meta = document.getElementById(metaId);
+        if (!el) return;
+        const wr = bucket.win_rate;
+        if (wr == null) {
+          el.textContent = '—';
+          el.className = 'stat-value';
+        } else {
+          el.textContent = (wr * 100).toFixed(1) + '%';
+          el.className = 'stat-value ' + (wr >= 0.55 ? 'neon-green' : wr >= 0.40 ? 'neon-orange' : 'neon-red');
+        }
+        if (meta) {
+          const resolved = (bucket.wins || 0) + (bucket.losses || 0);
+          meta.textContent = `${bucket.total || 0} signals · ${resolved} resolved (${bucket.wins || 0}W / ${bucket.losses || 0}L)`;
+        }
+      };
+
+      setWR('dec-follow-wr', 'dec-follow-meta', follow);
+      setWR('dec-fade-wr', 'dec-fade-meta', fade);
+
+      const skipVol = document.getElementById('dec-skip-vol');
+      if (skipVol) skipVol.textContent = (skip.total || 0).toLocaleString();
+      const skipMeta = document.getElementById('dec-skip-meta');
+      if (skipMeta) {
+        const gated = ((skip.total || 0) / Math.max(1, totals.total || 0) * 100).toFixed(0);
+        skipMeta.textContent = `${gated}% of signals gated by readiness`;
+      }
+
+      const pending = document.getElementById('dec-pending');
+      if (pending) pending.textContent = (totals.pending || 0).toLocaleString();
+    }
+
+    // ─────────── Bundle 3 renderers ───────────
+    function shortWallet(w) { return w ? (w.slice(0, 6) + '…' + w.slice(-4)) : '—'; }
+    function fmtAge(sec) {
+      if (sec == null || isNaN(sec)) return '—';
+      if (sec < 60) return Math.round(sec) + 's';
+      if (sec < 3600) return (sec / 60).toFixed(1) + 'm';
+      if (sec < 86400) return (sec / 3600).toFixed(1) + 'h';
+      return (sec / 86400).toFixed(1) + 'd';
+    }
+
+    function renderGraphEdges(data) {
+      const edges = (data && data.edges) || [];
+      const totals = (data && data.totals) || {};
+      const count = document.getElementById('edges-count');
+      if (count) count.textContent = edges.length;
+      const tot = document.getElementById('edges-totals');
+      if (tot) tot.textContent = `${totals.confirmed || 0} confirmed · ${totals.leaders_with_edges || 0} leaders · ${totals.hawkes_strong || 0} strong Hawkes`;
+      const tbody = document.getElementById('edges-tbody');
+      if (!tbody) return;
+      if (!edges.length) { tbody.innerHTML = emptyRow(9); return; }
+      tbody.innerHTML = edges.map(e => {
+        const am = (e.hawkes_alpha_mu || 0).toFixed(2);
+        const amClass = e.hawkes_alpha_mu > 1 ? 'neon-green' : (e.hawkes_alpha_mu < 0.3 ? 'neon-red' : 'neon-orange');
+        const pf = ((e.follow_probability || 0) * 100).toFixed(1) + '%';
+        const sd = ((e.same_direction_rate || 0) * 100).toFixed(0) + '%';
+        const tr = ((e.trapped_rate || 0) * 100).toFixed(0) + '%';
+        const last = e.last_observed ? new Date(e.last_observed).toLocaleString() : '—';
+        return `<tr>
+          <td class="mono" title="${e.leader_wallet || ''}">${shortWallet(e.leader_wallet)}</td>
+          <td class="mono" title="${e.follower_wallet || ''}">${shortWallet(e.follower_wallet)}</td>
+          <td class="${amClass}">${am}</td>
+          <td>${pf}</td>
+          <td>${e.co_occurrences || 0}</td>
+          <td>${Math.round(e.avg_delay_s || 0)}</td>
+          <td>${sd}</td>
+          <td>${tr}</td>
+          <td style="font-size:11px;">${last}</td>
+        </tr>`;
+      }).join('');
+    }
+
+    function renderProfilerHealth(data) {
+      if (!data) return;
+      const phases = data.phases || { "1": 0, "2": 0, "3": 0 };
+      const setN = (id, v) => { const el = document.getElementById(id); if (el) el.textContent = (v != null ? v : '—'); };
+      setN('ph-p1', phases["1"] || 0);
+      setN('ph-p2', phases["2"] || 0);
+      setN('ph-p3', phases["3"] || 0);
+      const driftEl = document.getElementById('ph-drift');
+      if (driftEl) {
+        const n = data.drift_alert_count || 0;
+        driftEl.textContent = n;
+        driftEl.className = 'stat-value ' + (n === 0 ? 'neon-green' : (n < 5 ? 'neon-orange' : 'neon-red'));
+      }
+      setN('ph-trans', data.phase_transitions_7d || 0);
+      const tbody = document.getElementById('drift-tbody');
+      if (!tbody) return;
+      const alerts = data.drift_alerts || [];
+      if (!alerts.length) { tbody.innerHTML = emptyRow(6); return; }
+      tbody.innerHTML = alerts.map(a => {
+        const trig = a.triggered_at ? new Date(a.triggered_at).toLocaleString() : '—';
+        return `<tr>
+          <td class="mono" title="${a.wallet_address || ''}">${shortWallet(a.wallet_address)}</td>
+          <td>Phase ${a.phase || 1}</td>
+          <td class="neon-orange">${(a.drift_score || 0).toFixed(3)}</td>
+          <td>${((a.error_rate || 0) * 100).toFixed(1)}%</td>
+          <td>${a.positions_resolved || 0}</td>
+          <td style="font-size:11px;">${trig}</td>
+        </tr>`;
+      }).join('');
+    }
+
+    function renderDataQuality(data) {
+      if (!data) return;
+      const m = data.markets || {};
+      const l = data.leaders || {};
+      const p = data.profiles || {};
+      const f = data.feed || {};
+      const status = document.getElementById('dq-status');
+      if (status) {
+        status.textContent = (data.status || 'unknown').toUpperCase() + ` · ${data.issues_count || 0} issue(s)`;
+        status.className = 'badge ' + (data.status === 'healthy' ? 'bg' : data.status === 'degraded' ? 'bo' : 'br');
+      }
+      const setV = (id, v, cls) => {
+        const el = document.getElementById(id);
+        if (!el) return;
+        el.textContent = v;
+        if (cls !== undefined) el.className = 'stat-value ' + cls;
+      };
+      const warn = (n) => n > 0 ? 'neon-orange' : 'neon-green';
+      setV('dq-unmapped', m.unmapped_tokens || 0, warn(m.unmapped_tokens));
+      setV('dq-expired', m.expired_still_active || 0, warn(m.expired_still_active));
+      setV('dq-orphan', m.orphan_market_ids_7d || 0, warn(m.orphan_market_ids_7d));
+      setV('dq-stale-ld', l.stale_refresh || 0, warn(l.stale_refresh));
+      setV('dq-stale-pr', p.stale_over_24h || 0, warn(p.stale_over_24h));
+      setV('dq-trade-age', fmtAge(f.last_trade_age_s), (f.last_trade_age_s != null && f.last_trade_age_s < 300) ? 'neon-green' : 'neon-orange');
+      setV('dq-ws-age', fmtAge(f.ws_last_message_age_s), f.ws_healthy ? 'neon-green' : 'neon-red');
+      setV('dq-cache', (f.price_cache_entries != null ? f.price_cache_entries.toLocaleString() : '—'));
+    }
+
     function filterDec(f, btn) {
       _decFilter = f;
       document.querySelectorAll('#dec-chips .chip').forEach(c => c.classList.remove('on'));
@@ -2450,28 +2727,36 @@
     // ─────────────────────────────────────────────────────────────────────────────
     async function loadAll() {
       try {
-        const [overview, leaders, positions, decisions, risk, system, activation, live, ml, neural] = await Promise.all([
+        const [overview, leaders, positions, decisions, decisionStats, risk, system, activation, live, ml, neural, topEdges, profHealth, dataQ] = await Promise.all([
           fetch('/api/overview').then(r => r.json()),
           fetch('/api/leaders').then(r => r.json()),
           fetch('/api/positions').then(r => r.json()),
           fetch('/api/decisions?limit=200').then(r => r.json()),
+          fetch('/api/decisions/stats?window_hours=24').then(r => r.json()).catch(() => null),
           fetch('/api/risk').then(r => r.json()),
           fetch('/api/system').then(r => r.json()),
           fetch('/api/activation').then(r => r.json()),
           fetch('/api/positions/live').then(r => r.json()).catch(() => []),
           fetch('/api/ml').then(r => r.json()).catch(() => ({})),
           fetch('/api/neural-readiness').then(r => r.json()).catch(() => null),
+          fetch('/api/graph/top-edges?limit=30').then(r => r.json()).catch(() => null),
+          fetch('/api/profiler/health').then(r => r.json()).catch(() => null),
+          fetch('/api/data-quality').then(r => r.json()).catch(() => null),
         ]);
         _ml = ml || {};
         renderOverview(overview);
         renderLeaders(leaders, activation, system);
         renderPositions(positions, risk, live);
         renderDecisions(decisions);
+        renderDecisionStats(decisionStats);
         _riskState = risk;
         _systemState = system;
         renderRisk(risk, _ml);
         renderSystem(system, _ml);
         renderNeuralReadiness(neural);
+        renderGraphEdges(topEdges);
+        renderProfilerHealth(profHealth);
+        renderDataQuality(dataQ);
       } catch (err) {
         console.error('Dashboard load error:', err);
       }
