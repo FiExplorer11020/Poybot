@@ -525,6 +525,22 @@ async def _get_terminal_snapshot(force: bool = False) -> dict:
             return copy.deepcopy(cached)
 
         build_started = time.perf_counter()
+        results = await asyncio.gather(
+            _fetch_overview_snapshot(),
+            _fetch_ml_snapshot(),
+            _fetch_system_snapshot(),
+            _fetch_positions_live_snapshot(),
+            _fetch_positions_snapshot(),
+            _fetch_decisions_snapshot(),
+            _fetch_decisions_stats_snapshot(),
+            _fetch_risk_snapshot(),
+            _fetch_activation_snapshot(),
+            _fetch_data_quality_snapshot(),
+            _health_checks(),
+            _fetch_market_scanner_rows(),
+            _fetch_recent_observed_trades(),
+            return_exceptions=True,
+        )
         (
             overview_data,
             ml_data,
@@ -539,21 +555,79 @@ async def _get_terminal_snapshot(force: bool = False) -> dict:
             health_data,
             market_rows,
             observed_trades,
-        ) = await asyncio.gather(
-            _fetch_overview_snapshot(),
-            _fetch_ml_snapshot(),
-            _fetch_system_snapshot(),
-            _fetch_positions_live_snapshot(),
-            _fetch_positions_snapshot(),
-            _fetch_decisions_snapshot(),
-            _fetch_decisions_stats_snapshot(),
-            _fetch_risk_snapshot(),
-            _fetch_activation_snapshot(),
-            _fetch_data_quality_snapshot(),
-            _health_checks(),
-            _fetch_market_scanner_rows(),
-            _fetch_recent_observed_trades(),
+        ) = results
+
+        defaults = (
+            {},
+            {},
+            {},
+            [],
+            {"open": [], "closed": [], "stats": {}},
+            [],
+            {"totals": {}},
+            {},
+            [],
+            {},
+            {},
+            [],
+            [],
         )
+        names = (
+            "overview",
+            "ml",
+            "system",
+            "positions_live",
+            "positions",
+            "decisions",
+            "decision_stats",
+            "risk",
+            "activation",
+            "data_quality",
+            "health",
+            "market_rows",
+            "observed_trades",
+        )
+        normalized: list = []
+        for name, value, default in zip(
+            names,
+            (
+                overview_data,
+                ml_data,
+                system_data,
+                positions_live_data,
+                positions_data,
+                decisions_data,
+                decision_stats_data,
+                risk_data,
+                activation_data,
+                data_quality_data,
+                health_data,
+                market_rows,
+                observed_trades,
+            ),
+            defaults,
+        ):
+            if isinstance(value, Exception):
+                logger.warning(f"Terminal snapshot section failed: {name}: {value}")
+                normalized.append(copy.deepcopy(default))
+            else:
+                normalized.append(value)
+
+        (
+            overview_data,
+            ml_data,
+            system_data,
+            positions_live_data,
+            positions_data,
+            decisions_data,
+            decision_stats_data,
+            risk_data,
+            activation_data,
+            data_quality_data,
+            health_data,
+            market_rows,
+            observed_trades,
+        ) = normalized
         readiness_data = build_neural_readiness_snapshot(
             ReadinessInputs(
                 health=health_data,

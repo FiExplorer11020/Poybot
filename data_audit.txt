@@ -1,0 +1,74 @@
+=== Mon Apr 27 22:21:29 CEST 2026 ===
+
+--- 1. Conteneurs Docker (running + stopped) ---
+NAME               IMAGE              COMMAND                  SERVICE    CREATED      STATUS                PORTS
+polymarket_db      postgres:15        "docker-entrypoint.s…"   postgres   7 days ago   Up 7 days (healthy)   0.0.0.0:5432->5432/tcp, [::]:5432->5432/tcp
+polymarket_redis   redis:7.2-alpine   "docker-entrypoint.s…"   redis      7 days ago   Up 7 days (healthy)   0.0.0.0:6379->6379/tcp, [::]:6379->6379/tcp
+
+--- 2. Volumes Postgres/Redis ---
+local     backend_postgres_data
+local     polymarket-bot_grafana_data
+local     polymarket-bot_postgres_data
+local     polymarket-bot_redis_data
+local     polymarket-bot_timescale_data
+
+--- 3. Tables présentes ---
+                    List of relations
+ Schema |            Name            | Type  |   Owner    
+--------+----------------------------+-------+------------
+ public | book_quality_snapshots     | table | polymarket
+ public | decision_log               | table | polymarket
+ public | decision_state_transitions | table | polymarket
+ public | fee_snapshots              | table | polymarket
+ public | follower_edges             | table | polymarket
+ public | leader_profiles            | table | polymarket
+ public | leaders                    | table | polymarket
+ public | market_belief_states       | table | polymarket
+ public | markets                    | table | polymarket
+ public | paper_trades               | table | polymarket
+ public | portfolio_equity           | table | polymarket
+ public | portfolio_state            | table | polymarket
+ public | positions_reconstructed    | table | polymarket
+ public | schema_migrations          | table | polymarket
+ public | signal_audits              | table | polymarket
+ public | trades_observed            | table | polymarket
+ public | v1_label_invalidations     | table | polymarket
+(17 rows)
+
+
+--- 4. Lignes par table (volumétrie) ---
+           table            | rows  |    size    
+----------------------------+-------+------------
+ book_quality_snapshots     | 87031 | 123 MB
+ trades_observed            | 71321 | 27 MB
+ positions_reconstructed    |  5559 | 2552 kB
+ markets                    |  2195 | 1176 kB
+ follower_edges             |  1134 | 840 kB
+ leaders                    |   384 | 1592 kB
+ decision_log               |   366 | 320 kB
+ leader_profiles            |    62 | 1208 kB
+ market_belief_states       |    26 | 104 kB
+ decision_state_transitions |    26 | 96 kB
+ paper_trades               |    10 | 136 kB
+ schema_migrations          |     5 | 24 kB
+ portfolio_equity           |     0 | 16 kB
+ portfolio_state            |     0 | 8192 bytes
+ fee_snapshots              |     0 | 24 kB
+ v1_label_invalidations     |     0 | 16 kB
+ signal_audits              |     0 | 16 kB
+(17 rows)
+
+
+--- 5. Plage temporelle des données (si tables observer présentes) ---
+ERROR:  relation "trades" does not exist
+LINE 1: ...at) AS first, MAX(created_at) AS last, COUNT(*) FROM trades;
+                                                                ^
+
+--- 6. Taille totale DB ---
+ pg_size_pretty 
+----------------
+ 167 MB
+(1 row)
+
+
+=== fin ===

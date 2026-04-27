@@ -10,11 +10,12 @@ from src.config import settings
 
 _LOGURU_RE = re.compile(
     r"^(?P<timestamp>\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d+)\s+\|\s+"
-    r"(?P<level>[A-Z]+)\s+\|\s+(?P<origin>[^|]+)\|\s+-\s+(?P<message>.+)$"
+    r"(?P<level>[A-Z]+)\s+\|\s+(?P<origin>.+?)\s+-\s+(?P<message>.+)$"
 )
 
 _READINESS_EXECUTABLE_STATES = {"CANDIDATE_SIGNAL", "PROBE_PAPER", "V1_GO_CANDIDATE"}
 _READINESS_OPEN_STATES = {"CANDIDATE_SIGNAL", "PROBE_PAPER", "V1_GO_CANDIDATE", "HOLD"}
+_LIVE_MARKET_FRESHNESS_MS = 15000
 
 
 def _to_float(value: Any, default: float | None = None) -> float | None:
@@ -86,24 +87,22 @@ def parse_loguru_line(line: str) -> dict[str, Any] | None:
 
 
 def load_recent_log_entries(paths: Iterable[Path], limit: int = 120) -> list[dict[str, Any]]:
-    lines: deque[str] = deque(maxlen=max(1, int(limit)))
+    entries: deque[dict[str, Any]] = deque(maxlen=max(1, int(limit)))
     for path in paths:
         try:
             if not path.exists() or not path.is_file():
                 continue
             with path.open("r", encoding="utf-8", errors="ignore") as handle:
                 for line in handle:
-                    if line.strip():
-                        lines.append(line.rstrip("\n"))
+                    if not line.strip():
+                        continue
+                    parsed = parse_loguru_line(line.rstrip("\n"))
+                    if parsed is not None:
+                        entries.append(parsed)
         except OSError:
             continue
 
-    entries: list[dict[str, Any]] = []
-    for line in reversed(lines):
-        parsed = parse_loguru_line(line)
-        if parsed is not None:
-            entries.append(parsed)
-    return entries[:limit]
+    return list(reversed(entries))[:limit]
 
 
 def _map_decision_action(action: str | None) -> str:
@@ -151,7 +150,7 @@ def _market_decision_action(row: dict[str, Any], signal_strength: float) -> str:
     freshness_ms = _to_float(row.get("freshness_ms"), 999999.0) or 999999.0
     spread = _to_float(row.get("spread"), 999.0)
     observations = _to_int(row.get("observations"), 0)
-    if signal_strength >= 0.75 and freshness_ms <= 5000 and (spread is None or spread <= 0.04) and observations > 0:
+    if signal_strength >= 0.75 and freshness_ms <= _LIVE_MARKET_FRESHNESS_MS and (spread is None or spread <= 0.04) and observations > 0:
         return "open"
     if signal_strength >= 0.55 and observations > 0:
         return "reduce"
@@ -380,7 +379,7 @@ def _build_ingestion(
     data_quality: dict[str, Any],
     health: dict[str, Any],
 ) -> dict[str, Any]:
-    live_markets = sum(1 for row in market_rows if _to_int(row.get("freshness_ms"), 999999) <= 5000)
+    live_markets = sum(1 for row in market_rows if _to_int(row.get("freshness_ms"), 999999) <= _LIVE_MARKET_FRESHNESS_MS)
     stale_markets = max(0, len(market_rows) - live_markets)
     updates_last_minute = sum(_to_int(row.get("messages_last_minute"), 0) for row in market_rows)
     avg_freshness = _mean([float(row.get("freshness_ms") or 0.0) for row in market_rows])

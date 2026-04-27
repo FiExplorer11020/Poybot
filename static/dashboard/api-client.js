@@ -2,8 +2,34 @@
 // Exposes window.LiveStore (reactive pub/sub) and window.PoybotAPI (actions)
 
 (function () {
-  const API_BASE  = localStorage.getItem('poybot_base')  || 'http://localhost:8000';
+  const API_BASE  = localStorage.getItem('poybot_base')  || window.location.origin;
   const API_TOKEN = localStorage.getItem('poybot_token') || '';
+  const READ_ONLY_ERROR = 'Dashboard is wired in read-only display mode for this backend.';
+
+  const normalizeObservedTrade = trade => {
+    if (!trade) return null;
+    return {
+      id: trade.id || [
+        trade.market_id || 'market',
+        trade.token_id || 'token',
+        trade.wallet_address || 'wallet',
+        trade.side || 'side',
+        trade.price != null ? String(trade.price) : 'na',
+        trade.notional != null ? String(trade.notional) : (trade.size_usdc != null ? String(trade.size_usdc) : 'na'),
+        trade.time || trade.timestamp || Date.now(),
+      ].join(':'),
+      timestamp: trade.timestamp || trade.time || null,
+      market_title: trade.market_title || trade.market_question || trade.question || trade.market_id || 'Unknown market',
+      side: trade.side || '—',
+      price: trade.price != null ? Number(trade.price) : null,
+      notional: trade.notional != null ? Number(trade.notional) : (trade.size_usdc != null ? Number(trade.size_usdc) : null),
+      fees: trade.fees != null ? Number(trade.fees) : null,
+      pnl_abs: trade.pnl_abs != null ? Number(trade.pnl_abs) : null,
+      pnl_pct: trade.pnl_pct != null ? Number(trade.pnl_pct) : null,
+      execution_mode: trade.execution_mode || 'observed',
+      status: trade.status || 'observed',
+    };
+  };
 
   // ── Reactive store ─────────────────────────────────────────────────────────
   const store = {
@@ -26,7 +52,8 @@
     processTick(p) {
       if (!this.snapshot) { this.processBootstrap(p); return; }
       ['analytics','bot','stats','positions','ingestion',
-       'decision_engine','markets','price_history','clock'].forEach(k => {
+       'decision_engine','markets','price_history','clock',
+       'recent_trades','risk_config','logs','meta'].forEach(k => {
         if (p[k] !== undefined) this.snapshot[k] = p[k];
       });
       this.lastUpdate = Date.now();
@@ -34,7 +61,7 @@
     },
 
     processTrade(trade) {
-      if (!this.snapshot) return;
+      if (!this.snapshot || !trade) return;
       this.snapshot.recent_trades = [trade, ...(this.snapshot.recent_trades || [])].slice(0, 100);
       this.lastUpdate = Date.now();
       this._emit();
@@ -76,11 +103,12 @@
     rtimer = setTimeout(connect, Math.min(1000 * Math.pow(2, attempts - 1), 15000));
   };
 
-  const onEvent = ({ type, payload, snapshot } = {}) => {
+  const onEvent = ({ type, payload, snapshot, data } = {}) => {
+    const body = payload !== undefined ? payload : data;
     if (snapshot) store.processBootstrap(snapshot);
-    if      (type === 'bootstrap' || type === 'control') { if (payload) store.processBootstrap(payload); }
-    else if (type === 'tick')                             { if (payload) store.processTick(payload); }
-    else if ((type === 'trade' || type === 'trade_closed') && !snapshot && payload) store.processTrade(payload);
+    if      (type === 'bootstrap' || type === 'control') { if (body) store.processBootstrap(body); }
+    else if (type === 'tick' || type === 'stats')        { if (body) store.processTick(body); }
+    else if ((type === 'trade' || type === 'trade_closed') && !snapshot && body) store.processTrade(normalizeObservedTrade(body));
   };
 
   function connect() {
@@ -98,11 +126,11 @@
 
   // ── Public API actions ─────────────────────────────────────────────────────
   window.PoybotAPI = {
-    botControl:    cmd => apiFetch('/api/v1/bot/control', { method: 'POST', body: JSON.stringify({ command: cmd }) }),
-    updateConfig:  cfg => apiFetch('/api/v1/bot/config',  { method: 'PATCH', body: JSON.stringify(cfg) }),
-    closePosition:  id => apiFetch(`/api/v1/trades/${id}/close`, { method: 'POST' }),
-    pnlTimeframe:   tf => apiFetch(`/api/v1/portfolio/pnl-by-timeframe?timeframe=${tf}`),
-    runBacktest:   cfg => apiFetch('/api/v1/backtest', { method: 'POST', body: JSON.stringify(cfg) }),
+    botControl: async () => { throw new Error(READ_ONLY_ERROR); },
+    updateConfig: async () => { throw new Error(READ_ONLY_ERROR); },
+    closePosition: async () => { throw new Error(READ_ONLY_ERROR); },
+    pnlTimeframe: async () => { throw new Error(READ_ONLY_ERROR); },
+    runBacktest: async () => { throw new Error(READ_ONLY_ERROR); },
     getSettings:    () => ({ API_BASE, API_TOKEN }),
     setSettings: (base, token) => {
       localStorage.setItem('poybot_base',  base);

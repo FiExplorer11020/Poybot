@@ -260,18 +260,19 @@ class TestDashboardHtml:
         assert "/static/dashboard/dashboard-components.jsx" in resp.text
 
     def test_contains_websocket_code(self, app_client):
-        resp = app_client.get("/")
+        resp = app_client.get("/static/dashboard/api-client.js")
         assert "/ws/live" in resp.text
 
     def test_bootstraps_live_summary(self, app_client):
-        resp = app_client.get("/")
+        resp = app_client.get("/static/dashboard/api-client.js")
         assert "/api/v1/live-summary" in resp.text
 
     def test_surfaces_terminal_shell(self, app_client):
-        resp = app_client.get("/")
+        resp = app_client.get("/static/dashboard/dashboard-app.jsx")
+        tabs = app_client.get("/static/dashboard/dashboard-tabs.jsx")
         assert "ALPHA TERMINAL" in resp.text
-        assert "MARKET SCANNER" in resp.text
-        assert "BOT HEALTH" in resp.text
+        assert "MARKET SCANNER" in tabs.text
+        assert "BOT HEALTH" in tabs.text
 
     def test_serves_static_dashboard_asset(self, app_client):
         resp = app_client.get("/static/dashboard/api-client.js")

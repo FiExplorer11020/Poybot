@@ -1614,6 +1614,9 @@ async def recent_observed_trades(conn, limit: int = 50) -> list[dict]:
     rows = await conn.fetch(
         """
         SELECT
+            ROW_NUMBER() OVER (
+                ORDER BY t.time DESC, t.market_id, t.token_id, t.wallet_address, t.side, t.price
+            )::int AS seq,
             t.time,
             t.market_id,
             t.token_id,
@@ -1635,7 +1638,11 @@ async def recent_observed_trades(conn, limit: int = 50) -> list[dict]:
     for r in rows:
         out.append(
             {
-                "id": f"obs:{_row_get(r, 'market_id')}:{_row_get(r, 'token_id')}:{_row_get(r, 'time').isoformat() if _row_get(r, 'time') else 'na'}",
+                "id": (
+                    f"obs:{_row_get(r, 'market_id')}:{_row_get(r, 'token_id')}:"
+                    f"{_row_get(r, 'time').isoformat() if _row_get(r, 'time') else 'na'}:"
+                    f"{_row_get(r, 'seq')}"
+                ),
                 "timestamp": _row_get(r, "time").isoformat() if _row_get(r, "time") else None,
                 "market_id": _row_get(r, "market_id"),
                 "market_title": _row_get(r, "question")

@@ -4,6 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>POYBOT // POLYMARKET TRADING TERMINAL</title>
+<link rel="icon" href="data:,">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:ital,wght@0,300;0,400;0,500;0,600;0,700;1,400&display=swap" rel="stylesheet">
 <script src="https://unpkg.com/react@18.3.1/umd/react.development.js" integrity="sha384-hD6/rw4ppMLGNu3tX5cjIb+uRZ7UkRJ6BPkLpg4hAu/6onKUg4lLsHAs9EBPT82L" crossorigin="anonymous"></script>
@@ -31,7 +32,7 @@
 </div>
 
 <!-- Poybot live data client (plain JS, runs synchronously) -->
-<script src="api-client.js"></script>
+<script src="/static/dashboard/api-client.js"></script>
 
 <!-- Load, combine and Babel-transform the three JSX modules in order -->
 <script>
@@ -48,9 +49,9 @@
     // Each file is wrapped in its own IIFE so local `const` declarations
     // don't collide between modules. They communicate via window.
     const files = [
-      'dashboard-components.jsx',
-      'dashboard-tabs.jsx',
-      'dashboard-app.jsx',
+      '/static/dashboard/dashboard-components.jsx',
+      '/static/dashboard/dashboard-tabs.jsx',
+      '/static/dashboard/dashboard-app.jsx',
     ];
 
     let combined = '';

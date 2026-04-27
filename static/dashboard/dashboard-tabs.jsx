@@ -383,6 +383,8 @@ const RiskConfig = () => {
 
   const merged  = { ...rcfg, ...edits };
   const isDirty = Object.keys(edits).length > 0;
+  const isReadOnly = rcfg.config_mutable === false || bot.config_mutable === false;
+  const controlsAvailable = bot.control_available === true;
 
   const numField = (key, label, step = 0.01) => (
     <div key={key} style={{ background: C.panel2, padding: '8px 10px' }}>
@@ -390,11 +392,12 @@ const RiskConfig = () => {
       <input
         type="number" step={step}
         value={merged[key] ?? ''}
+        disabled={isReadOnly}
         onChange={e => setEdits(p => ({ ...p, [key]: parseFloat(e.target.value) }))}
         style={{
           background: 'transparent', border: 'none',
           borderBottom: `1px solid ${edits[key] != null ? C.amber : C.border2}`,
-          color: C.text, width: '100%', marginTop: 4,
+          color: isReadOnly ? C.dim2 : C.text, width: '100%', marginTop: 4,
           padding: '2px 0', fontSize: 14, fontWeight: 700, outline: 'none',
         }}
       />
@@ -439,6 +442,11 @@ const RiskConfig = () => {
           {/* Config editor */}
           <div>
             <SectionLabel>Risk Configuration {isDirty && <span style={{ color: C.amber, marginLeft: 8 }}>● unsaved changes</span>}</SectionLabel>
+            {isReadOnly && (
+              <div style={{ fontSize: 10, color: C.dim2, marginBottom: 10 }}>
+                Display-only mapping from live backend safeguards. Commands stay disabled in this build.
+              </div>
+            )}
             <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4,1fr)', gap: 1, background: C.border, marginBottom: 10 }}>
               {numField('risk_per_trade_pct',      'Risk / Trade %',    0.001)}
               {numField('max_total_exposure_pct',  'Max Exposure %',    0.01)}
@@ -456,13 +464,13 @@ const RiskConfig = () => {
               {numField('max_holding_seconds',     'Max Hold (s)',      10)}
             </div>
             <div style={{ display: 'flex', gap: 8, marginTop: 10, alignItems: 'center' }}>
-              <button onClick={saveConfig} disabled={!isDirty || saving} style={{
-                background: isDirty ? 'rgba(40,168,78,0.1)' : 'transparent',
-                border: `1px solid ${isDirty ? C.green : C.border2}`,
-                color: isDirty ? C.green : C.dim2,
-                padding: '5px 16px', cursor: isDirty ? 'pointer' : 'default', fontSize: 11, fontWeight: 700,
+              <button onClick={saveConfig} disabled={isReadOnly || !isDirty || saving} style={{
+                background: !isReadOnly && isDirty ? 'rgba(40,168,78,0.1)' : 'transparent',
+                border: `1px solid ${!isReadOnly && isDirty ? C.green : C.border2}`,
+                color: !isReadOnly && isDirty ? C.green : C.dim2,
+                padding: '5px 16px', cursor: !isReadOnly && isDirty ? 'pointer' : 'default', fontSize: 11, fontWeight: 700,
               }}>{saving ? 'SAVING…' : 'SAVE CONFIG'}</button>
-              {isDirty && (
+              {isDirty && !isReadOnly && (
                 <button onClick={() => setEdits({})} style={{ background: 'transparent', border: `1px solid ${C.border2}`, color: C.dim2, padding: '5px 12px', cursor: 'pointer', fontSize: 11 }}>DISCARD</button>
               )}
               {saveMsg && <span style={{ fontSize: 11, color: saveMsg.startsWith('✓') ? C.green : C.red }}>{saveMsg}</span>}
@@ -474,9 +482,9 @@ const RiskConfig = () => {
             <div style={{ padding: 14, border: `1px solid ${C.border}` }}>
               <div style={{ ...S.label, marginBottom: 10 }}>Bot Control</div>
               {[
-                { cmd: 'start', label: '▶ START', active: !isRunning, type: 'green' },
-                { cmd: 'stop',  label: '■ STOP',  active: isRunning,  type: 'red'   },
-                { cmd: 'pause', label: '⏸ PAUSE', active: true,       type: 'default' },
+                { cmd: 'start', label: '▶ START', active: controlsAvailable && !isRunning, type: 'green' },
+                { cmd: 'stop',  label: '■ STOP',  active: controlsAvailable && isRunning,  type: 'red'   },
+                { cmd: 'pause', label: '⏸ PAUSE', active: controlsAvailable,                type: 'default' },
               ].map(({ cmd, label, active, type }) => (
                 <button key={cmd} onClick={() => sendCmd(cmd)} disabled={cmdBusy || !active} style={{
                   display: 'block', width: '100%', marginBottom: 6,
@@ -486,13 +494,18 @@ const RiskConfig = () => {
                   padding: '7px', cursor: active && !cmdBusy ? 'pointer' : 'default', fontSize: 11, fontWeight: 700,
                 }}>{label}</button>
               ))}
+              {!controlsAvailable && (
+                <div style={{ fontSize: 10, color: C.dim2, marginTop: 6 }}>
+                  Control actions are not exposed by this backend build.
+                </div>
+              )}
             </div>
 
             <div style={{ padding: 14, border: `1px solid ${C.red}`, background: 'rgba(201,53,69,0.03)' }}>
               <div style={{ ...S.label, color: C.red, marginBottom: 8 }}>Emergency Kill</div>
               <div style={{ fontSize: 10, color: C.dim2, marginBottom: 10, lineHeight: 1.7 }}>Halts all bot activity immediately.</div>
               {!killConfirm
-                ? <button onClick={() => setKillConfirm(true)} disabled={cmdBusy} style={{ width: '100%', background: 'rgba(201,53,69,0.1)', border: `1px solid ${C.red}`, color: C.red, padding: '7px 0', cursor: 'pointer', fontSize: 11, fontWeight: 700 }}>KILL SWITCH</button>
+                ? <button onClick={() => setKillConfirm(true)} disabled={cmdBusy || !controlsAvailable} style={{ width: '100%', background: 'rgba(201,53,69,0.1)', border: `1px solid ${C.red}`, color: controlsAvailable ? C.red : C.dim2, padding: '7px 0', cursor: controlsAvailable ? 'pointer' : 'default', fontSize: 11, fontWeight: 700 }}>KILL SWITCH</button>
                 : <div>
                     <div style={{ fontSize: 11, color: C.red, marginBottom: 8, fontWeight: 700 }}>CONFIRM HALT?</div>
                     <div style={{ display: 'flex', gap: 6 }}>
@@ -575,7 +588,7 @@ const BotHealth = () => {
                 </thead>
                 <tbody>
                   {mkts.map((m, i) => {
-                    const stale = (m.freshness_ms || 0) > 5000;
+                    const stale = (m.freshness_ms || 0) > 15000;
                     return (
                       <tr key={i}>
                         <TD style={{ maxWidth: 180 }}><div style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', color: C.text }}>{m.title}</div></TD>
