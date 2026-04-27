@@ -272,6 +272,87 @@ class TradeObserver:
         idx = min(len(ordered) - 1, max(0, round((len(ordered) - 1) * pct)))
         return ordered[idx]
 
+    @staticmethod
+    def _level_price(levels: list | None) -> Decimal | None:
+        if not levels:
+            return None
+        level = levels[0]
+        try:
+            if isinstance(level, dict):
+                raw = level.get("price") or level.get("p")
+            elif isinstance(level, (list, tuple)) and level:
+                raw = level[0]
+            else:
+                raw = None
+            return Decimal(str(raw)) if raw is not None else None
+        except Exception:
+            return None
+
+    async def _persist_book_quality_snapshot(
+        self,
+        *,
+        msg: dict,
+        market_id: str,
+        token_id: str,
+        age_s: float,
+        now_s: float,
+        bids: list,
+        asks: list,
+        best_bid: Decimal | None,
+        best_ask: Decimal | None,
+        source_ts_s: float | None,
+    ) -> None:
+        mid_price = None
+        spread_bps = None
+        if best_bid is not None and best_ask is not None:
+            mid_price = (best_bid + best_ask) / Decimal("2")
+            if mid_price > 0:
+                spread_bps = ((best_ask - best_bid) / mid_price) * Decimal("10000")
+
+        source_timestamp = (
+            datetime.fromtimestamp(source_ts_s, tz=timezone.utc) if source_ts_s is not None else None
+        )
+        observed_at = datetime.fromtimestamp(now_s, tz=timezone.utc)
+        depth = {
+            "bids": bids[:5],
+            "asks": asks[:5],
+            "bid_levels": len(bids),
+            "ask_levels": len(asks),
+        }
+        raw_reference = {
+            "event_type": msg.get("event_type"),
+            "source_timestamp": msg.get("timestamp") or msg.get("time") or msg.get("ts"),
+            "market": market_id,
+            "asset_id": token_id,
+        }
+        try:
+            async with get_db() as conn:
+                await conn.execute(
+                    """
+                    INSERT INTO book_quality_snapshots
+                        (market_id, token_id, book_age_ms, spread_bps,
+                         best_bid, best_ask, mid_price, depth_top_levels,
+                         gap_detected, source_timestamp, observed_at, raw_reference,
+                         economic_model_version)
+                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb,
+                            $9, $10, $11, $12::jsonb, 'v1.0.0')
+                    """,
+                    market_id,
+                    token_id,
+                    int(round(age_s * 1000)),
+                    spread_bps,
+                    best_bid,
+                    best_ask,
+                    mid_price,
+                    json.dumps(depth),
+                    False,
+                    source_timestamp,
+                    observed_at,
+                    json.dumps(raw_reference),
+                )
+        except Exception:
+            logger.debug("Failed to persist book quality snapshot", exc_info=True)
+
     async def _record_book_metrics(self, msg: dict) -> None:
         if not self._redis:
             return
@@ -285,6 +366,10 @@ class TradeObserver:
             market_id = str(msg.get("market") or msg.get("market_id") or "")
             token_id = str(msg.get("asset_id") or msg.get("token_id") or msg.get("asset") or "")
             if market_id and token_id:
+                bids = msg.get("bids") or []
+                asks = msg.get("asks") or []
+                best_bid = self._level_price(bids)
+                best_ask = self._level_price(asks)
                 await self._redis.setex(
                     f"book:last:{market_id}:{token_id}",
                     300,
@@ -298,10 +383,25 @@ class TradeObserver:
                             "source_timestamp": msg.get("timestamp")
                             or msg.get("time")
                             or msg.get("ts"),
-                            "bid_levels": len(msg.get("bids") or []),
-                            "ask_levels": len(msg.get("asks") or []),
+                            "best_bid": str(best_bid) if best_bid is not None else None,
+                            "best_ask": str(best_ask) if best_ask is not None else None,
+                            "bid_levels": len(bids),
+                            "ask_levels": len(asks),
+                            "source": "polymarket_market_ws",
                         }
                     ),
+                )
+                await self._persist_book_quality_snapshot(
+                    msg=msg,
+                    market_id=market_id,
+                    token_id=token_id,
+                    age_s=age_s,
+                    now_s=now_s,
+                    bids=bids,
+                    asks=asks,
+                    best_bid=best_bid,
+                    best_ask=best_ask,
+                    source_ts_s=ts_s,
                 )
         except Exception:
             logger.debug("Failed to update book quality Redis metrics", exc_info=True)

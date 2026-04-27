@@ -8,12 +8,16 @@ import json
 import math
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from decimal import Decimal
+from typing import Any
 
 import numpy as np
 from loguru import logger
 
 from src.config import settings
 from src.database.connection import get_db
+from src.economics.gates import BookSnapshotRef, evaluate_signal_gate
+from src.economics.models import ECONOMIC_MODEL_VERSION, FeeSnapshot, StrategyTrack
 from src.profiler.behavior_profiler import (
     _cyclical_time_features,
     _default_profile,
@@ -39,6 +43,9 @@ class Decision:
     reason: str
     trade_context: dict | None = None
     context_penalty: float = 0.0
+    signal_audit: dict | None = None
+    strategy_track: str = StrategyTrack.LEADER_SWING.value
+    economic_model_version: str = ECONOMIC_MODEL_VERSION
 
 
 REDIS_TRADES_CHANNEL = "trades:observed"
@@ -359,6 +366,8 @@ class ConfidenceEngine:
             trade_context=trade_context,
             context_penalty=round(context_penalty, 4),
         )
+        decision.signal_audit = await self._build_signal_audit(decision)
+        trade_context["signal_audit"] = decision.signal_audit
 
         await self._log_decision(
             wallet,
@@ -369,6 +378,9 @@ class ConfidenceEngine:
             kelly_fraction,
             confidence,
             decision.reason,
+            signal_audit=decision.signal_audit,
+            strategy_track=decision.strategy_track,
+            economic_model_version=decision.economic_model_version,
         )
         return decision
 
@@ -782,15 +794,21 @@ class ConfidenceEngine:
         kelly: float,
         confidence: float,
         reason: str,
+        *,
+        signal_audit: dict | None = None,
+        strategy_track: str | None = None,
+        economic_model_version: str | None = None,
     ) -> None:
+        audit_payload = signal_audit or {}
         try:
             async with get_db() as conn:
                 await conn.execute(
                     """
                     INSERT INTO decision_log
                         (leader_wallet, market_id, action, thompson_follow, thompson_fade,
-                         kelly_fraction, confidence, reason)
-                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+                         kelly_fraction, confidence, reason, strategy_track,
+                         economic_model_version, signal_audit)
+                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11::jsonb)
                     """,
                     wallet,
                     market_id,
@@ -800,9 +818,32 @@ class ConfidenceEngine:
                     round(kelly, 4),
                     round(confidence, 4),
                     reason,
+                    strategy_track or StrategyTrack.LEADER_SWING.value,
+                    economic_model_version or ECONOMIC_MODEL_VERSION,
+                    json.dumps(audit_payload),
                 )
         except Exception as e:
-            logger.error(f"Failed to log decision: {e}")
+            logger.warning(f"Extended decision log failed, retrying legacy insert: {e}")
+            try:
+                async with get_db() as conn:
+                    await conn.execute(
+                        """
+                        INSERT INTO decision_log
+                            (leader_wallet, market_id, action, thompson_follow, thompson_fade,
+                             kelly_fraction, confidence, reason)
+                        VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+                        """,
+                        wallet,
+                        market_id,
+                        action,
+                        round(t_follow, 4),
+                        round(t_fade, 4),
+                        round(kelly, 4),
+                        round(confidence, 4),
+                        reason,
+                    )
+            except Exception as fallback_exc:
+                logger.error(f"Failed to log decision: {fallback_exc}")
 
     async def _emit(self, decision: Decision) -> None:
         """Publish decision to Redis decisions channel."""
@@ -830,8 +871,180 @@ class ConfidenceEngine:
                         "wallet_influence": (decision.trade_context or {}).get("wallet_influence"),
                         "trade_context": decision.trade_context or {},
                         "context_penalty": decision.context_penalty,
+                        "strategy_track": decision.strategy_track,
+                        "economic_model_version": decision.economic_model_version,
+                        "signal_audit": decision.signal_audit or {},
                     }
                 ),
             )
         except Exception as e:
             logger.warning(f"Failed to emit decision: {e}")
+
+    def _row_value(self, row: Any, key: str, default: Any = None) -> Any:
+        try:
+            return row[key]
+        except Exception:
+            return default
+
+    def _parse_dt_value(self, value: Any) -> datetime:
+        if isinstance(value, datetime):
+            return value if value.tzinfo is not None else value.replace(tzinfo=timezone.utc)
+        if isinstance(value, (int, float)):
+            return datetime.fromtimestamp(float(value), tz=timezone.utc)
+        if isinstance(value, str):
+            try:
+                return datetime.fromisoformat(value.replace("Z", "+00:00"))
+            except ValueError:
+                pass
+        return datetime.now(tz=timezone.utc)
+
+    def _fee_snapshot_from_row(self, row: Any) -> FeeSnapshot | None:
+        if not row:
+            return None
+        try:
+            return FeeSnapshot(
+                market_id=str(self._row_value(row, "market_id", "")),
+                token_id=str(self._row_value(row, "token_id", "")),
+                fee_enabled=bool(self._row_value(row, "fee_enabled", True)),
+                fee_rate=Decimal(str(self._row_value(row, "fee_rate", "0"))),
+                maker_fee_rate=Decimal(str(self._row_value(row, "maker_fee_rate", "0"))),
+                source=str(self._row_value(row, "source", "fee_snapshots")),
+                captured_at=self._parse_dt_value(self._row_value(row, "captured_at")),
+                compatibility=dict(self._row_value(row, "compatibility", {}) or {}),
+                economic_model_version=str(
+                    self._row_value(row, "economic_model_version", ECONOMIC_MODEL_VERSION)
+                ),
+            )
+        except Exception as exc:
+            logger.warning(f"Invalid fee snapshot row ignored: {exc}")
+            return None
+
+    async def _load_book_snapshot(self, market_id: str, token_id: str) -> BookSnapshotRef | None:
+        if self._redis is None:
+            return None
+        try:
+            raw = await self._redis.get(f"book:last:{market_id}:{token_id}")
+        except Exception as exc:
+            logger.warning(f"Live book lookup failed for {market_id}/{token_id}: {exc}")
+            return None
+        if not raw:
+            return None
+        try:
+            payload = json.loads(raw) if isinstance(raw, str) else dict(raw)
+            best_bid = payload.get("best_bid")
+            best_ask = payload.get("best_ask")
+            if best_bid is None or best_ask is None:
+                return None
+            observed = (
+                payload.get("captured_at")
+                or payload.get("observed_at")
+                or payload.get("observed_ts")
+                or payload.get("source_timestamp")
+            )
+            return BookSnapshotRef(
+                market_id=market_id,
+                token_id=token_id,
+                best_bid=Decimal(str(best_bid)),
+                best_ask=Decimal(str(best_ask)),
+                captured_at=self._parse_dt_value(observed),
+                source=str(payload.get("source", "redis_book_last")),
+                reference=payload,
+            )
+        except Exception as exc:
+            logger.warning(f"Invalid live book snapshot ignored for {market_id}/{token_id}: {exc}")
+            return None
+
+    async def _record_signal_rejection(self, reason: str, decision: Decision) -> None:
+        logger.warning(
+            "SignalAudit rejected decision "
+            f"reason={reason} market={decision.market_id} token={decision.token_id} "
+            f"leader={decision.leader_wallet} action={decision.action}"
+        )
+        if self._redis is None:
+            return
+        try:
+            await self._redis.hincrby("signals:rejected:1h", reason, 1)
+            await self._redis.expire("signals:rejected:1h", 3600)
+        except Exception as exc:
+            logger.debug(f"Failed to increment signal rejection counter: {exc}")
+
+    async def _build_signal_audit(self, decision: Decision) -> dict:
+        token_map_ok = False
+        fee_snapshot = None
+        book_snapshot = await self._load_book_snapshot(decision.market_id, decision.token_id)
+        audit_inputs = {
+            "stage": "confidence_engine",
+            "paper_only": True,
+            "readiness_mode": "deterministic",
+            "leader_wallet": decision.leader_wallet,
+            "action": decision.action,
+            "confidence": decision.confidence,
+            "size_usdc": decision.size_usdc,
+        }
+
+        try:
+            async with get_db() as conn:
+                market_row = await conn.fetchrow(
+                    """
+                    SELECT token_yes, token_no
+                    FROM markets
+                    WHERE market_id = $1
+                    """,
+                    decision.market_id,
+                )
+                token_yes = self._row_value(market_row, "token_yes")
+                token_no = self._row_value(market_row, "token_no")
+                token_map_ok = bool(
+                    token_yes
+                    and token_no
+                    and decision.token_id
+                    and decision.token_id in {str(token_yes), str(token_no)}
+                )
+                audit_inputs["token_yes_present"] = bool(token_yes)
+                audit_inputs["token_no_present"] = bool(token_no)
+
+                fee_row = await conn.fetchrow(
+                    """
+                    SELECT market_id, token_id, fee_enabled, fee_rate, maker_fee_rate,
+                           source, captured_at, compatibility, economic_model_version
+                    FROM fee_snapshots
+                    WHERE market_id = $1 AND token_id = $2
+                    ORDER BY captured_at DESC
+                    LIMIT 1
+                    """,
+                    decision.market_id,
+                    decision.token_id,
+                )
+                fee_snapshot = self._fee_snapshot_from_row(fee_row)
+        except Exception as exc:
+            audit_inputs["lookup_error"] = str(exc)
+            logger.warning(
+                "SignalAudit input lookup failed "
+                f"market={decision.market_id} token={decision.token_id}: {exc}"
+            )
+
+        audit = evaluate_signal_gate(
+            strategy_track=StrategyTrack.LEADER_SWING,
+            market_id=decision.market_id,
+            token_id=decision.token_id,
+            token_map_ok=token_map_ok,
+            fee_snapshot=fee_snapshot,
+            book_snapshot=book_snapshot,
+        )
+        payload = audit.to_metadata()
+        payload["economic_model_version"] = ECONOMIC_MODEL_VERSION
+        payload["inputs"] = {
+            **payload.get("inputs", {}),
+            **audit_inputs,
+            "token_map_ok": token_map_ok,
+            "has_fee_snapshot": fee_snapshot is not None,
+            "has_book_snapshot": book_snapshot is not None,
+        }
+        if book_snapshot is not None:
+            payload["book_reference"] = dict(book_snapshot.reference)
+        if payload.get("accepted") is not True:
+            await self._record_signal_rejection(
+                str(payload.get("reject_reason") or "unknown_rejection"),
+                decision,
+            )
+        return payload

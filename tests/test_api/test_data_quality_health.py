@@ -40,6 +40,8 @@ class _FakeRedis:
     async def hgetall(self, key):
         if key == "signals:rejected:1h":
             return {"stale_book": "3", "missing_fee": "1"}
+        if key == "paper:rejections:1h":
+            return {"missing_accepted_signal_audit": "2"}
         return {}
 
 
@@ -69,6 +71,9 @@ async def test_health_exposes_v1_data_quality_without_static_websocket(monkeypat
     assert data["fee_snapshot_coverage_pct"] == 98.0
     assert data["token_map_coverage_pct"] == 100.0
     assert data["rejected_signals_1h"] == {"stale_book": 3, "missing_fee": 1}
+    assert data["paper_rejections_1h"] == {"missing_accepted_signal_audit": 2}
+    assert data["pipeline_stage_health"]["market_belief_states"] == 0
+    assert data["pipeline_stage_health"]["book_quality_snapshots_5m"] == 0
 
 
 @pytest.mark.asyncio

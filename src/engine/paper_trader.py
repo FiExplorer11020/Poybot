@@ -87,6 +87,45 @@ class PaperTrader:
     def open_trades(self) -> list[OpenPaperTrade]:
         return list(self._open_trades)
 
+    async def _record_open_trade_refusal(
+        self,
+        decision: dict,
+        reason: str,
+        detail: dict | None = None,
+    ) -> None:
+        payload = {
+            "type": "paper_refusal",
+            "reason": reason,
+            "market_id": decision.get("market_id"),
+            "token_id": decision.get("token_id"),
+            "leader_wallet": decision.get("leader_wallet"),
+            "action": decision.get("action"),
+            "size_usdc": decision.get("size_usdc"),
+            "confidence": decision.get("confidence"),
+            "signal_audit": decision.get("signal_audit") or {},
+            "detail": detail or {},
+            "created_at": datetime.now(tz=timezone.utc).isoformat(),
+        }
+        logger.warning(
+            "PaperTrader refusal "
+            f"reason={reason} market={payload['market_id']} token={payload['token_id']} "
+            f"leader={payload['leader_wallet']} action={payload['action']}"
+        )
+        if self._redis is None:
+            return
+        try:
+            inc = self._redis.hincrby("paper:rejections:1h", reason, 1)
+            if inspect.isawaitable(inc):
+                await inc
+            exp = self._redis.expire("paper:rejections:1h", 3600)
+            if inspect.isawaitable(exp):
+                await exp
+            publish = self._redis.publish("decisions:trace", json.dumps(payload))
+            if inspect.isawaitable(publish):
+                await publish
+        except Exception as exc:
+            logger.debug(f"PaperTrader refusal telemetry failed: {exc}")
+
     async def start(self) -> None:
         self._running = True
         self._stop_event.clear()
@@ -342,48 +381,63 @@ class PaperTrader:
         if live_candidate is False or (
             trade_age_s is not None and trade_age_s > float(settings.LIVE_DECISION_MAX_TRADE_AGE_S)
         ):
-            logger.debug(
-                f"PaperTrader: ignoring stale decision for {leader_wallet} on {market_id} "
-                f"(age={trade_age_s}, live_candidate={live_candidate})"
+            await self._record_open_trade_refusal(
+                decision,
+                "stale_decision",
+                {"trade_age_s": trade_age_s, "live_candidate": live_candidate},
             )
             return None
 
         signal_audit = decision.get("signal_audit")
         if not isinstance(signal_audit, dict) or signal_audit.get("accepted") is not True:
-            logger.debug(
-                f"PaperTrader: refusing unaudited decision for {leader_wallet} on {market_id}"
+            reason = (
+                "missing_accepted_signal_audit"
+                if not isinstance(signal_audit, dict)
+                else str(signal_audit.get("reject_reason") or "signal_audit_rejected")
+            )
+            await self._record_open_trade_refusal(
+                decision,
+                reason,
+                {"accepted": signal_audit.get("accepted") if isinstance(signal_audit, dict) else None},
             )
             return None
 
         if size_usdc < settings.MIN_POSITION_USDC:
-            logger.debug(
-                "PaperTrader: "
-                f"size_usdc={size_usdc} below min={settings.MIN_POSITION_USDC}, skipping"
+            await self._record_open_trade_refusal(
+                decision,
+                "below_min_position_size",
+                {"size_usdc": size_usdc, "min_position_usdc": settings.MIN_POSITION_USDC},
             )
             return None
         if size_usdc > self._capital:
-            logger.warning(
-                f"PaperTrader: size_usdc={size_usdc} exceeds capital={self._capital}, skipping"
+            await self._record_open_trade_refusal(
+                decision,
+                "insufficient_paper_capital",
+                {"size_usdc": size_usdc, "capital": self._capital},
             )
             return None
 
         if await self._has_open_trade_conflict(market_id, leader_wallet, strategy):
-            logger.debug(
-                "PaperTrader: open trade already exists for "
-                f"{leader_wallet} {strategy} {market_id}, skipping"
+            await self._record_open_trade_refusal(
+                decision,
+                "open_trade_conflict",
+                {"strategy": strategy},
             )
             return None
 
         if await self._has_recent_reentry_conflict(market_id, leader_wallet, strategy):
-            logger.debug(
-                "PaperTrader: recent "
-                f"{strategy} trade already opened for {leader_wallet} on {market_id}, skipping"
+            await self._record_open_trade_refusal(
+                decision,
+                "recent_reentry_conflict",
+                {"strategy": strategy, "cooldown_s": settings.PAPER_REENTRY_COOLDOWN_S},
             )
             return None
 
         if await self._is_market_resolved(market_id):
-            logger.debug(
-                f"PaperTrader: market {market_id} appears resolved, refusing new {strategy} trade"
+            await self._record_open_trade_refusal(
+                decision,
+                "market_resolved",
+                {"strategy": strategy},
             )
             return None
 
@@ -391,9 +445,19 @@ class PaperTrader:
         if self._risk_manager is not None:
             can_trade = await self._risk_manager.check_can_trade(decision, self._capital)
             if not can_trade:
+                await self._record_open_trade_refusal(
+                    decision,
+                    "risk_manager_rejected",
+                    {"capital": self._capital},
+                )
                 return None
             size_usdc = self._risk_manager.apply_size(size_usdc, decision)
             if size_usdc <= 0:
+                await self._record_open_trade_refusal(
+                    decision,
+                    "risk_manager_zero_size",
+                    {"capital": self._capital},
+                )
                 return None
 
         # --- FIX 3 + FIX 5: Direction and price ---

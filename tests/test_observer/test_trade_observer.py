@@ -286,6 +286,37 @@ async def test_handle_book_message_updates_book_age_metric():
     assert any(args[0] == f"book:last:{_MARKET}:{_TOKEN}" for args in metric_calls)
 
 
+@pytest.mark.asyncio
+async def test_handle_book_message_persists_book_quality_snapshot():
+    obs, redis, _ = _make_observer()
+    conn = _make_conn()
+
+    with (
+        _mock_get_db(conn),
+        patch("src.observer.trade_observer.time.time", return_value=1_700_000_001.0),
+    ):
+        await obs._handle_ws_message(
+            {
+                "event_type": "book",
+                "market": _MARKET,
+                "asset_id": _TOKEN,
+                "timestamp": "1700000000000",
+                "bids": [{"price": "0.44", "size": "20"}],
+                "asks": [{"price": "0.46", "size": "12"}],
+            }
+        )
+
+    sql_calls = [call.args[0] for call in conn.execute.await_args_list]
+    assert any("INSERT INTO book_quality_snapshots" in sql for sql in sql_calls)
+    snapshot_call = next(
+        call for call in conn.execute.await_args_list if "INSERT INTO book_quality_snapshots" in call.args[0]
+    )
+    assert snapshot_call.args[1] == _MARKET
+    assert snapshot_call.args[2] == _TOKEN
+    assert snapshot_call.args[5] == Decimal("0.44")
+    assert snapshot_call.args[6] == Decimal("0.46")
+
+
 # ---------------------------------------------------------------------------
 # 7. handle_ws_message parses a valid trade event and calls _process_trade
 # ---------------------------------------------------------------------------

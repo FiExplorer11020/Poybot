@@ -1101,13 +1101,16 @@ async def decisions(conn, limit: int = 100, offset: int = 0) -> list[dict]:
         f"""
         SELECT d.id, d.time, d.leader_wallet, d.market_id, d.action,
                d.thompson_follow, d.thompson_fade, d.kelly_fraction,
-               d.confidence, d.reason, d.outcome,
+               d.confidence, d.reason, d.outcome, d.strategy_track,
+               d.economic_model_version, d.signal_audit,
                m.question,
-               pt.leader_context
+               pt.leader_context, pt.paper_trade_id, pt.paper_status,
+               pt.close_reason, pt.pnl_usdc, pt.opened_at, pt.closed_at
         FROM decision_log d
         LEFT JOIN markets m USING (market_id)
         LEFT JOIN LATERAL (
-            SELECT leader_context
+            SELECT id AS paper_trade_id, leader_context, status AS paper_status,
+                   close_reason, pnl_usdc, opened_at, closed_at
             FROM paper_trades pt
             WHERE pt.leader_wallet = d.leader_wallet
               AND pt.market_id = d.market_id
@@ -1125,28 +1128,90 @@ async def decisions(conn, limit: int = 100, offset: int = 0) -> list[dict]:
         limit,
         offset,
     )
-    return [
-        {
-            "id": _row_get(r, "id"),
-            "time": _row_get(r, "time").isoformat(),
-            "leader_wallet": _row_get(r, "leader_wallet"),
-            "market_id": _row_get(r, "market_id"),
-            "question": _row_get(r, "question")
-            or ((_row_get(r, "market_id", "")[:30] + "…") if _row_get(r, "market_id") else "—"),
+    result = []
+    for r in rows:
+        ml_snapshot = _extract_ml_snapshot(_row_get(r, "leader_context"))
+        signal_audit = _json_dict(_row_get(r, "signal_audit", {}))
+        size_usdc = round(
+            min(_to_float(_row_get(r, "kelly_fraction", 0), 0.0) * 10000.0, 200.0), 2
+        )
+        gate_result = (
+            "accepted"
+            if signal_audit.get("accepted") is True
+            else "refused"
+            if signal_audit
+            else "not_audited"
+        )
+        paper_status = _row_get(r, "paper_status")
+        close_reason = _row_get(r, "close_reason")
+        pnl_usdc = _row_get(r, "pnl_usdc")
+        refusal_reason = signal_audit.get("reject_reason") if signal_audit else None
+        execution_result = paper_status or ("blocked" if gate_result == "refused" else "pending")
+        trace = {
+            "input_trade": {
+                "leader_wallet": _row_get(r, "leader_wallet"),
+                "market_id": _row_get(r, "market_id"),
+                "token_id": signal_audit.get("token_id"),
+            },
+            "market_metadata": {
+                "question": _row_get(r, "question"),
+                "strategy_track": _row_get(r, "strategy_track") or signal_audit.get("strategy_track"),
+                "economic_model_version": _row_get(r, "economic_model_version")
+                or signal_audit.get("economic_model_version"),
+            },
+            "profiling": ml_snapshot,
+            "gate_result": gate_result,
             "action": _row_get(r, "action"),
-            "thompson_follow": _to_float(_row_get(r, "thompson_follow", 0), 0.0),
-            "thompson_fade": _to_float(_row_get(r, "thompson_fade", 0), 0.0),
-            "kelly_fraction": _to_float(_row_get(r, "kelly_fraction", 0), 0.0),
-            "size_usdc": round(
-                min(_to_float(_row_get(r, "kelly_fraction", 0), 0.0) * 10000.0, 200.0), 2
-            ),
-            "confidence": _to_float(_row_get(r, "confidence", 0), 0.0),
-            "reason": _row_get(r, "reason"),
-            "outcome": _row_get(r, "outcome"),
-            "ml_snapshot": _extract_ml_snapshot(_row_get(r, "leader_context")),
+            "size_usdc": size_usdc,
+            "refusal_reason": refusal_reason,
+            "execution_result": execution_result,
+            "paper_trade_id": _row_get(r, "paper_trade_id"),
+            "close_result": {
+                "status": paper_status,
+                "close_reason": close_reason,
+                "pnl_usdc": _to_float(pnl_usdc, 0.0) if pnl_usdc is not None else None,
+                "opened_at": _row_get(r, "opened_at").isoformat()
+                if _row_get(r, "opened_at")
+                else None,
+                "closed_at": _row_get(r, "closed_at").isoformat()
+                if _row_get(r, "closed_at")
+                else None,
+            },
+            "feedback_learning": {
+                "outcome": _row_get(r, "outcome"),
+                "reason_codes": ml_snapshot.get("reason_codes", []),
+            },
         }
-        for r in rows
-    ]
+        result.append(
+            {
+                "id": _row_get(r, "id"),
+                "time": _row_get(r, "time").isoformat(),
+                "leader_wallet": _row_get(r, "leader_wallet"),
+                "market_id": _row_get(r, "market_id"),
+                "question": _row_get(r, "question")
+                or (
+                    (_row_get(r, "market_id", "")[:30] + "…")
+                    if _row_get(r, "market_id")
+                    else "—"
+                ),
+                "action": _row_get(r, "action"),
+                "strategy_track": _row_get(r, "strategy_track")
+                or signal_audit.get("strategy_track"),
+                "economic_model_version": _row_get(r, "economic_model_version")
+                or signal_audit.get("economic_model_version"),
+                "thompson_follow": _to_float(_row_get(r, "thompson_follow", 0), 0.0),
+                "thompson_fade": _to_float(_row_get(r, "thompson_fade", 0), 0.0),
+                "kelly_fraction": _to_float(_row_get(r, "kelly_fraction", 0), 0.0),
+                "size_usdc": size_usdc,
+                "confidence": _to_float(_row_get(r, "confidence", 0), 0.0),
+                "reason": _row_get(r, "reason"),
+                "outcome": _row_get(r, "outcome"),
+                "signal_audit": signal_audit,
+                "trace": trace,
+                "ml_snapshot": ml_snapshot,
+            }
+        )
+    return result
 
 
 async def decisions_stats(conn, window_hours: int = 24) -> dict:
@@ -1543,6 +1608,154 @@ async def open_positions_with_prices(conn, redis_client) -> list[dict]:
             }
         )
     return result
+
+
+async def recent_observed_trades(conn, limit: int = 50) -> list[dict]:
+    rows = await conn.fetch(
+        """
+        SELECT
+            t.time,
+            t.market_id,
+            t.token_id,
+            t.wallet_address,
+            t.side,
+            t.price,
+            t.size_usdc,
+            t.is_leader,
+            m.question,
+            m.category
+        FROM trades_observed t
+        LEFT JOIN markets m USING (market_id)
+        ORDER BY t.time DESC
+        LIMIT $1
+        """,
+        limit,
+    )
+    out: list[dict] = []
+    for r in rows:
+        out.append(
+            {
+                "id": f"obs:{_row_get(r, 'market_id')}:{_row_get(r, 'token_id')}:{_row_get(r, 'time').isoformat() if _row_get(r, 'time') else 'na'}",
+                "timestamp": _row_get(r, "time").isoformat() if _row_get(r, "time") else None,
+                "market_id": _row_get(r, "market_id"),
+                "market_title": _row_get(r, "question")
+                or ((_row_get(r, "market_id", "")[:30] + "…") if _row_get(r, "market_id") else "—"),
+                "market_category": _row_get(r, "category") or "unknown",
+                "token_id": _row_get(r, "token_id"),
+                "wallet_address": _row_get(r, "wallet_address"),
+                "side": _row_get(r, "side"),
+                "price": _to_float(_row_get(r, "price")),
+                "notional": _to_float(_row_get(r, "size_usdc")),
+                "execution_mode": "observed",
+                "status": "observed",
+                "is_leader": bool(_row_get(r, "is_leader", False)),
+            }
+        )
+    return out
+
+
+async def market_scanner_rows(conn, limit: int = 60) -> list[dict]:
+    now = datetime.now(timezone.utc)
+    rows = await conn.fetch(
+        """
+        WITH latest_books AS (
+            SELECT DISTINCT ON (b.market_id, b.token_id)
+                b.market_id,
+                b.token_id,
+                b.book_age_ms,
+                b.spread_bps,
+                b.mid_price,
+                b.best_bid,
+                b.best_ask,
+                b.observed_at,
+                b.source_timestamp
+            FROM book_quality_snapshots b
+            WHERE b.observed_at >= NOW() - INTERVAL '30 minutes'
+            ORDER BY b.market_id, b.token_id, b.observed_at DESC
+        ),
+        trade_stats AS (
+            SELECT
+                t.market_id,
+                COUNT(*) FILTER (WHERE t.time >= NOW() - INTERVAL '5 minutes')::int AS observations_5m,
+                COUNT(*) FILTER (WHERE t.time >= NOW() - INTERVAL '1 minute')::int AS messages_last_minute,
+                COUNT(*) FILTER (WHERE t.time >= NOW() - INTERVAL '30 minutes' AND t.is_leader)::int AS leader_trades_30m,
+                MAX(t.time) AS last_trade_at
+            FROM trades_observed t
+            WHERE t.time >= NOW() - INTERVAL '30 minutes'
+            GROUP BY t.market_id
+        )
+        SELECT
+            lb.market_id,
+            lb.token_id,
+            lb.book_age_ms,
+            lb.spread_bps,
+            lb.mid_price,
+            lb.best_bid,
+            lb.best_ask,
+            lb.observed_at,
+            lb.source_timestamp,
+            m.question,
+            m.category,
+            m.token_yes,
+            m.token_no,
+            COALESCE(ts.observations_5m, 0) AS observations_5m,
+            COALESCE(ts.messages_last_minute, 0) AS messages_last_minute,
+            COALESCE(ts.leader_trades_30m, 0) AS leader_trades_30m,
+            ts.last_trade_at
+        FROM latest_books lb
+        LEFT JOIN markets m USING (market_id)
+        LEFT JOIN trade_stats ts USING (market_id)
+        ORDER BY
+            COALESCE(ts.messages_last_minute, 0) DESC,
+            COALESCE(ts.observations_5m, 0) DESC,
+            lb.observed_at DESC
+        LIMIT $1
+        """,
+        limit,
+    )
+    out: list[dict] = []
+    for r in rows:
+        observed_at = _parse_dt(_row_get(r, "observed_at"))
+        source_ts = _parse_dt(_row_get(r, "source_timestamp"))
+        freshness_ms = int(max(0.0, (now - observed_at).total_seconds() * 1000)) if observed_at else _to_int(_row_get(r, "book_age_ms"), 0)
+        source_delay_ms = int(max(0.0, (observed_at - source_ts).total_seconds() * 1000)) if observed_at and source_ts else _to_int(_row_get(r, "book_age_ms"), 0)
+        token_id = str(_row_get(r, "token_id") or "")
+        token_yes = str(_row_get(r, "token_yes") or "")
+        token_no = str(_row_get(r, "token_no") or "")
+        if token_id and token_id == token_yes:
+            direction = "YES"
+        elif token_id and token_id == token_no:
+            direction = "NO"
+        else:
+            direction = None
+        spread_bps = _to_float(_row_get(r, "spread_bps"))
+        out.append(
+            {
+                "market_id": _row_get(r, "market_id"),
+                "token_id": token_id or None,
+                "title": _row_get(r, "question")
+                or ((_row_get(r, "market_id", "")[:30] + "…") if _row_get(r, "market_id") else "—"),
+                "category": _row_get(r, "category") or "unknown",
+                "market_type": _market_type_label(_row_get(r, "category"), _row_get(r, "question")),
+                "direction": direction,
+                "mid_price": _to_float(_row_get(r, "mid_price")),
+                "spread_bps": spread_bps,
+                "spread": round(spread_bps / 10000.0, 4) if spread_bps is not None else None,
+                "best_bid": _to_float(_row_get(r, "best_bid")),
+                "best_ask": _to_float(_row_get(r, "best_ask")),
+                "freshness_ms": freshness_ms,
+                "source_delay_ms": source_delay_ms,
+                "observations": _to_int(_row_get(r, "observations_5m"), 0),
+                "messages_last_minute": _to_int(_row_get(r, "messages_last_minute"), 0),
+                "leader_trades_30m": _to_int(_row_get(r, "leader_trades_30m"), 0),
+                "detected": _to_int(_row_get(r, "observations_5m"), 0) > 0,
+                "quote_source": "book_quality_snapshots",
+                "last_trade_at": _row_get(r, "last_trade_at").isoformat()
+                if _row_get(r, "last_trade_at")
+                else None,
+            }
+        )
+    return out
 
 
 # ---------------------------------------------------------------------------

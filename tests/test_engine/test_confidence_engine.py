@@ -3,14 +3,16 @@ Unit tests for ConfidenceEngine (Thompson Sampling + Bayesian Kelly).
 All external I/O (DB, Redis) is mocked.
 """
 
+import json
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import numpy as np
 import pytest
 
 from src.config import settings
-from src.engine.confidence_engine import DEFAULT_ALPHA, DEFAULT_BETA, ConfidenceEngine
+from src.engine.confidence_engine import DEFAULT_ALPHA, DEFAULT_BETA, ConfidenceEngine, Decision
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -396,3 +398,125 @@ class TestEvaluate:
 
         assert decision is not None
         engine._log_decision.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_evaluate_attaches_signal_audit_before_logging_decision(self):
+        engine = make_engine()
+        wallet = "0xAUDIT"
+        engine._get_readiness = AsyncMock(
+            return_value={
+                "trades_observed": 60,
+                "positions_resolved": 10,
+                "confirmed_followers": 6,
+            }
+        )
+        engine._build_trade_context = AsyncMock(
+            return_value={
+                "process_score": 0.9,
+                "market_question": "Will X happen?",
+                "category": "crypto",
+            }
+        )
+        engine._build_signal_audit = AsyncMock(
+            return_value={
+                "accepted": False,
+                "reject_reason": "missing_fee_snapshot",
+                "strategy_track": "leader_swing",
+            }
+        )
+        engine._log_decision = AsyncMock()
+
+        with patch("numpy.random.random", return_value=1.0):
+            with patch("numpy.random.beta", side_effect=[0.95, 0.05]):
+                decision = await engine.evaluate(
+                    {
+                        "wallet_address": wallet,
+                        "market_id": "mkt-audit",
+                        "token_id": "tok-audit",
+                        "is_leader": True,
+                    }
+                )
+
+        assert decision is not None
+        assert decision.signal_audit["reject_reason"] == "missing_fee_snapshot"
+        engine._build_signal_audit.assert_awaited_once()
+        assert engine._log_decision.await_args.kwargs["signal_audit"]["accepted"] is False
+
+
+class TestDecisionEmission:
+    @pytest.mark.asyncio
+    async def test_emit_includes_signal_audit_in_redis_payload(self):
+        engine = make_engine()
+        decision = Decision(
+            action="follow",
+            leader_wallet="0xLeader",
+            market_id="market-1",
+            token_id="token-1",
+            size_usdc=100.0,
+            kelly_fraction=0.01,
+            thompson_follow=0.8,
+            thompson_fade=0.2,
+            confidence=0.74,
+            reason="risk_adjusted_thompson",
+            signal_audit={
+                "accepted": False,
+                "reject_reason": "missing_fee_snapshot",
+                "strategy_track": "leader_swing",
+            },
+        )
+
+        await engine._emit(decision)
+
+        raw_payload = engine._redis.publish.await_args.args[1]
+        payload = json.loads(raw_payload)
+        assert payload["signal_audit"]["accepted"] is False
+        assert payload["signal_audit"]["reject_reason"] == "missing_fee_snapshot"
+
+    @pytest.mark.asyncio
+    async def test_build_signal_audit_rejects_and_counts_missing_fee_snapshot(self):
+        engine = make_engine()
+        engine._redis.get = AsyncMock(
+            return_value=json.dumps(
+                {
+                    "market_id": "market-1",
+                    "token_id": "token-1",
+                    "best_bid": "0.49",
+                    "best_ask": "0.51",
+                    "observed_ts": datetime.now(tz=timezone.utc).timestamp(),
+                }
+            )
+        )
+        engine._redis.hincrby = AsyncMock()
+        engine._redis.expire = AsyncMock()
+        fetchrow = AsyncMock(
+            side_effect=[
+                {"token_yes": "token-1", "token_no": "token-2"},
+                None,
+            ]
+        )
+        patcher, _ = _mock_get_db(fetchrow_mock=fetchrow)
+        decision = Decision(
+            action="follow",
+            leader_wallet="0xLeader",
+            market_id="market-1",
+            token_id="token-1",
+            size_usdc=100.0,
+            kelly_fraction=0.01,
+            thompson_follow=0.8,
+            thompson_fade=0.2,
+            confidence=0.74,
+            reason="risk_adjusted_thompson",
+        )
+
+        with patcher:
+            audit = await engine._build_signal_audit(decision)
+
+        assert audit["accepted"] is False
+        assert audit["reject_reason"] == "missing_fee_snapshot"
+        assert audit["inputs"]["token_map_ok"] is True
+        assert audit["inputs"]["has_book_snapshot"] is True
+        engine._redis.hincrby.assert_awaited_once_with(
+            "signals:rejected:1h",
+            "missing_fee_snapshot",
+            1,
+        )

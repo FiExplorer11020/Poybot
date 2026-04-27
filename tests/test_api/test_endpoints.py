@@ -252,21 +252,52 @@ class TestDashboardHtml:
         resp = app_client.get("/")
         assert resp.status_code == 200
         assert "text/html" in resp.headers["content-type"]
-        assert "Polymarket Intelligence" in resp.text
+        assert "POYBOT // POLYMARKET TRADING TERMINAL" in resp.text
 
-    def test_contains_chartjs(self, app_client):
+    def test_contains_dashboard_assets(self, app_client):
         resp = app_client.get("/")
-        assert "chart.umd.min.js" in resp.text
+        assert "/static/dashboard/api-client.js" in resp.text
+        assert "/static/dashboard/dashboard-components.jsx" in resp.text
 
     def test_contains_websocket_code(self, app_client):
         resp = app_client.get("/")
         assert "/ws/live" in resp.text
 
-    def test_fetches_neural_readiness(self, app_client):
+    def test_bootstraps_live_summary(self, app_client):
         resp = app_client.get("/")
-        assert "/api/neural-readiness" in resp.text
-        assert "neural-global-bars" in resp.text
-        assert "neural-data-counts" in resp.text
+        assert "/api/v1/live-summary" in resp.text
+
+    def test_surfaces_terminal_shell(self, app_client):
+        resp = app_client.get("/")
+        assert "ALPHA TERMINAL" in resp.text
+        assert "MARKET SCANNER" in resp.text
+        assert "BOT HEALTH" in resp.text
+
+    def test_serves_static_dashboard_asset(self, app_client):
+        resp = app_client.get("/static/dashboard/api-client.js")
+        assert resp.status_code == 200
+        assert "window.LiveStore" in resp.text
+
+
+class TestLiveSummaryV1:
+    def test_returns_unified_terminal_snapshot(self, app_client):
+        resp = app_client.get("/api/v1/live-summary")
+        assert resp.status_code == 200
+        payload = resp.json()
+        assert "data" in payload
+        data = payload["data"]
+        for key in (
+            "stats",
+            "analytics",
+            "bot",
+            "positions",
+            "decision_engine",
+            "risk_config",
+            "ingestion",
+            "recent_trades",
+            "logs",
+        ):
+            assert key in data, f"Missing terminal key: {key}"
 
 
 # ---------------------------------------------------------------------------
@@ -398,6 +429,18 @@ class TestQueriesDecisions:
             "reason": "exploration",
             "outcome": None,
             "question": "Will X happen?",
+            "strategy_track": "leader_swing",
+            "economic_model_version": "v1.0.0",
+            "signal_audit": json.dumps(
+                {
+                    "accepted": False,
+                    "reject_reason": "missing_book_snapshot",
+                    "strategy_track": "leader_swing",
+                }
+            ),
+            "paper_status": None,
+            "close_reason": None,
+            "pnl_usdc": None,
             "leader_context": json.dumps(
                 {
                     "trade_context": {
@@ -420,6 +463,9 @@ class TestQueriesDecisions:
         assert result[0]["kelly_fraction"] == 0.015
         assert result[0]["ml_snapshot"]["category"] == "crypto"
         assert result[0]["ml_snapshot"]["reason_codes"] == ["high_deviation"]
+        assert result[0]["signal_audit"]["accepted"] is False
+        assert result[0]["trace"]["gate_result"] == "refused"
+        assert result[0]["trace"]["refusal_reason"] == "missing_book_snapshot"
 
 
 class TestQueriesPositions:

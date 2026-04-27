@@ -156,6 +156,25 @@ class TestOpenTrade:
         mock_get_db.assert_not_called()
 
     @pytest.mark.asyncio
+    async def test_open_trade_records_rejection_counter_for_missing_signal_audit(self):
+        redis = _make_redis()
+        redis.hincrby = AsyncMock()
+        redis.expire = AsyncMock()
+        trader = _make_trader(redis=redis)
+        decision = _make_decision()
+        decision.pop("signal_audit")
+
+        result = await trader.open_trade(decision)
+
+        assert result is None
+        redis.hincrby.assert_awaited_once_with(
+            "paper:rejections:1h",
+            "missing_accepted_signal_audit",
+            1,
+        )
+        redis.expire.assert_awaited_once_with("paper:rejections:1h", 3600)
+
+    @pytest.mark.asyncio
     async def test_open_trade_skips_when_matching_open_trade_already_exists(self):
         trader = _make_trader()
         trader._open_trades.append(

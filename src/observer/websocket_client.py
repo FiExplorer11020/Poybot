@@ -17,6 +17,7 @@ from src.config import settings
 
 class PolymarketWSClient:
     WS_URL = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
+    SUBSCRIBE_CHUNK_SIZE = 100
 
     def __init__(
         self,
@@ -128,10 +129,15 @@ class PolymarketWSClient:
                 break
 
     async def _subscribe(self, ws) -> None:
-        msg = {
-            "assets_ids": list(self._markets),
-            "type": "market",
-            "custom_feature_enabled": True,
-        }
-        await ws.send(json.dumps(msg))
+        market_ids = sorted(self._markets)
+        for start in range(0, len(market_ids), self.SUBSCRIBE_CHUNK_SIZE):
+            chunk = market_ids[start : start + self.SUBSCRIBE_CHUNK_SIZE]
+            msg = {
+                "assets_ids": chunk,
+                "type": "market",
+                "custom_feature_enabled": True,
+            }
+            await ws.send(json.dumps(msg))
+            if start + self.SUBSCRIBE_CHUNK_SIZE < len(market_ids):
+                await asyncio.sleep(0.05)
         logger.info(f"Subscribed to {len(self._markets)} markets")

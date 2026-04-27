@@ -67,6 +67,25 @@ async def test_subscribe_sends_correct_message():
     assert set(sent["assets_ids"]) == markets
 
 
+@pytest.mark.asyncio
+async def test_subscribe_chunks_large_market_sets():
+    markets = {f"token-{i}" for i in range(205)}
+
+    async def on_msg(msg):
+        pass
+
+    client = PolymarketWSClient(on_message=on_msg, markets=markets)
+    cm, ws = _make_ws_mock(messages=[])
+
+    with patch("src.observer.websocket_client.websockets.connect", return_value=cm):
+        await client._connect_and_run()
+
+    assert ws.send.await_count == 3
+    payloads = [json.loads(call.args[0]) for call in ws.send.await_args_list]
+    assert sum(len(payload["assets_ids"]) for payload in payloads) == 205
+    assert all(len(payload["assets_ids"]) <= client.SUBSCRIBE_CHUNK_SIZE for payload in payloads)
+
+
 # ---------------------------------------------------------------------------
 # 2. Reconnect on ConnectionClosed
 # ---------------------------------------------------------------------------

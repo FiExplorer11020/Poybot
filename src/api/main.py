@@ -9,18 +9,25 @@ import asyncio
 import copy
 import time
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 from pathlib import Path
 
 import asyncpg
 import redis.asyncio as redis_async
 from fastapi import FastAPI, HTTPException, Query, WebSocket
 from fastapi.responses import HTMLResponse
+from fastapi.staticfiles import StaticFiles
 from loguru import logger
 
 from src.api import queries
+from src.api.terminal_snapshot import build_terminal_snapshot, load_recent_log_entries
 from src.api.ws_bridge import WSBridge
 from src.config import settings
 from src.engine.neural_readiness import ReadinessInputs, build_neural_readiness_snapshot
+from src.engine.readiness_persistence import (
+    load_recent_persisted_transitions,
+    persist_readiness_snapshot,
+)
 from src.registry.falcon_client import FalconClient
 
 # ---------------------------------------------------------------------------
@@ -39,9 +46,18 @@ _live_snapshot_cache: dict = {"data": None, "last_built": 0.0}
 _live_snapshot_lock = asyncio.Lock()
 
 TEMPLATE_PATH = Path(__file__).parent.parent.parent / "templates" / "dashboard.html"
+STATIC_DIR = Path(__file__).parent.parent.parent / "static"
 STATS_PUSH_INTERVAL_S = 1.0  # how often to push live stats over WebSocket
 HEALTH_CACHE_TTL_S = 5.0
 LIVE_SNAPSHOT_TTL_S = 1.0
+TERMINAL_SNAPSHOT_TTL_S = 1.0
+LOG_PATHS = [
+    Path("/tmp/polymarket-bot-observer.log"),
+    Path(__file__).parent.parent.parent / "orchestrate.log",
+]
+_terminal_snapshot_cache: dict = {"data": None, "last_built": 0.0}
+_terminal_snapshot_lock = asyncio.Lock()
+_api_started_at = datetime.now(timezone.utc)
 
 
 # ---------------------------------------------------------------------------
@@ -80,6 +96,7 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="Polymarket Intelligence Dashboard", lifespan=lifespan)
+app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
 
 # ---------------------------------------------------------------------------
@@ -188,8 +205,10 @@ async def _health_checks(force: bool = False) -> dict:
         fee_snapshot_coverage_pct: float | None = None
         token_map_coverage_pct: float | None = None
         rejected_signals_1h: dict[str, int] = {}
+        paper_rejections_1h: dict[str, int] = {}
         fee_snapshot_coverage_source: str | None = None
         data_accumulation_counts: dict[str, int] = {}
+        pipeline_stage_health: dict = {}
 
         try:
             async with _pool.acquire() as conn:
@@ -197,6 +216,10 @@ async def _health_checks(force: bool = False) -> dict:
                     "SELECT EXTRACT(EPOCH FROM (NOW() - MAX(time))) FROM trades_observed"
                 )
                 db_quality = await _db_data_quality_snapshot(conn)
+                try:
+                    pipeline_stage_health = await _db_pipeline_stage_health_snapshot(conn)
+                except Exception as exc:
+                    logger.warning(f"Pipeline stage health check failed: {exc}")
             db_ok = True
             last_trade_age_s = float(last) if last is not None else None
             data_accumulation_counts = db_quality.get("counts", {})
@@ -215,11 +238,15 @@ async def _health_checks(force: bool = False) -> dict:
             fee_coverage = await _redis.get("metrics:fee_snapshot_coverage_pct")
             token_coverage = await _redis.get("metrics:token_map_coverage_pct")
             rejected = await _redis.hgetall("signals:rejected:1h")
+            paper_rejected = await _redis.hgetall("paper:rejections:1h")
             book_age_p95_s = float(book_age) if book_age is not None else None
             fee_snapshot_coverage_pct = float(fee_coverage) if fee_coverage is not None else None
             token_map_coverage_pct = float(token_coverage) if token_coverage is not None else None
             rejected_signals_1h = {
                 str(reason): int(count) for reason, count in dict(rejected).items()
+            }
+            paper_rejections_1h = {
+                str(reason): int(count) for reason, count in dict(paper_rejected).items()
             }
         except Exception as e:
             logger.warning(f"Redis health check failed: {e}")
@@ -232,6 +259,24 @@ async def _health_checks(force: bool = False) -> dict:
                 fee_snapshot_coverage_source = "redis"
             if token_map_coverage_pct is None:
                 token_map_coverage_pct = db_quality.get("token_map_coverage_pct")
+
+        pipeline_stage_health["signal_rejections_1h"] = rejected_signals_1h
+        pipeline_stage_health["paper_rejections_1h"] = paper_rejections_1h
+        pipeline_stage_health["stage_status"] = {
+            "book_capture": (
+                "healthy"
+                if book_age_p95_s is not None
+                and int(pipeline_stage_health.get("book_quality_snapshots_5m") or 0) > 0
+                else "blocked"
+            ),
+            "readiness_persistence": (
+                "active"
+                if int(pipeline_stage_health.get("market_belief_states") or 0) > 0
+                else "empty"
+            ),
+            "signal_gate": "active" if rejected_signals_1h else "idle",
+            "paper_execution": "active" if paper_rejections_1h else "idle",
+        }
 
         _schedule_falcon_probe()
         data = {
@@ -248,6 +293,8 @@ async def _health_checks(force: bool = False) -> dict:
             "token_map_coverage_pct": token_map_coverage_pct,
             "data_accumulation_counts": data_accumulation_counts,
             "rejected_signals_1h": rejected_signals_1h,
+            "paper_rejections_1h": paper_rejections_1h,
+            "pipeline_stage_health": pipeline_stage_health,
             "last_trade_age_s": last_trade_age_s,
         }
         _health_cache["data"] = copy.deepcopy(data)
@@ -323,6 +370,44 @@ async def _db_data_quality_snapshot(conn) -> dict:
     }
 
 
+async def _db_pipeline_stage_health_snapshot(conn) -> dict:
+    row = await conn.fetchrow(
+        """
+        SELECT
+            (SELECT COUNT(*) FROM market_belief_states) AS market_belief_states,
+            (SELECT COUNT(*) FROM decision_state_transitions
+             WHERE created_at >= NOW() - INTERVAL '1 hour') AS decision_transitions_1h,
+            (SELECT COUNT(*) FROM book_quality_snapshots
+             WHERE observed_at >= NOW() - INTERVAL '5 minutes') AS book_quality_snapshots_5m,
+            (SELECT EXTRACT(EPOCH FROM (NOW() - MAX(observed_at)))
+             FROM book_quality_snapshots) AS last_book_snapshot_age_s,
+            (SELECT COUNT(*) FROM signal_audits
+             WHERE created_at >= NOW() - INTERVAL '1 hour') AS signal_audits_1h
+        """
+    )
+
+    def _int(name: str) -> int:
+        try:
+            return int(row[name] or 0)
+        except Exception:
+            return 0
+
+    def _float(name: str) -> float | None:
+        try:
+            value = row[name]
+            return float(value) if value is not None else None
+        except Exception:
+            return None
+
+    return {
+        "market_belief_states": _int("market_belief_states"),
+        "decision_transitions_1h": _int("decision_transitions_1h"),
+        "book_quality_snapshots_5m": _int("book_quality_snapshots_5m"),
+        "last_book_snapshot_age_s": _float("last_book_snapshot_age_s"),
+        "signal_audits_1h": _int("signal_audits_1h"),
+    }
+
+
 async def _fetch_overview_snapshot() -> dict:
     async with _pool.acquire() as conn:
         return await queries.overview(conn, redis_client=_redis)
@@ -331,6 +416,56 @@ async def _fetch_overview_snapshot() -> dict:
 async def _fetch_ml_snapshot() -> dict:
     async with _pool.acquire() as conn:
         return await queries.ml_summary(conn)
+
+
+async def _fetch_system_snapshot() -> dict:
+    async with _pool.acquire() as conn:
+        return await queries.system_status(conn)
+
+
+async def _fetch_positions_snapshot() -> dict:
+    async with _pool.acquire() as conn:
+        return await queries.positions(conn)
+
+
+async def _fetch_positions_live_snapshot() -> list[dict]:
+    async with _pool.acquire() as conn:
+        return await queries.open_positions_with_prices(conn, _redis)
+
+
+async def _fetch_decisions_snapshot(limit: int = 60) -> list[dict]:
+    async with _pool.acquire() as conn:
+        return await queries.decisions(conn, limit=limit, offset=0)
+
+
+async def _fetch_decisions_stats_snapshot(window_hours: int = 24) -> dict:
+    async with _pool.acquire() as conn:
+        return await queries.decisions_stats(conn, window_hours=window_hours)
+
+
+async def _fetch_risk_snapshot() -> dict:
+    async with _pool.acquire() as conn:
+        return await queries.risk(conn)
+
+
+async def _fetch_activation_snapshot() -> list[dict]:
+    async with _pool.acquire() as conn:
+        return await queries.activation_queue(conn)
+
+
+async def _fetch_data_quality_snapshot() -> dict:
+    async with _pool.acquire() as conn:
+        return await queries.data_quality(conn, redis_client=_redis)
+
+
+async def _fetch_market_scanner_rows(limit: int = 60) -> list[dict]:
+    async with _pool.acquire() as conn:
+        return await queries.market_scanner_rows(conn, limit=limit)
+
+
+async def _fetch_recent_observed_trades(limit: int = 60) -> list[dict]:
+    async with _pool.acquire() as conn:
+        return await queries.recent_observed_trades(conn, limit=limit)
 
 
 async def _get_live_snapshot(force: bool = False) -> dict:
@@ -367,6 +502,100 @@ async def _get_live_snapshot(force: bool = False) -> dict:
         return snapshot
 
 
+async def _get_terminal_snapshot(force: bool = False) -> dict:
+    now = time.monotonic()
+    cached = _terminal_snapshot_cache.get("data")
+    if (
+        not force
+        and cached is not None
+        and now - float(_terminal_snapshot_cache.get("last_built", 0.0) or 0.0)
+        < TERMINAL_SNAPSHOT_TTL_S
+    ):
+        return copy.deepcopy(cached)
+
+    async with _terminal_snapshot_lock:
+        now = time.monotonic()
+        cached = _terminal_snapshot_cache.get("data")
+        if (
+            not force
+            and cached is not None
+            and now - float(_terminal_snapshot_cache.get("last_built", 0.0) or 0.0)
+            < TERMINAL_SNAPSHOT_TTL_S
+        ):
+            return copy.deepcopy(cached)
+
+        build_started = time.perf_counter()
+        (
+            overview_data,
+            ml_data,
+            system_data,
+            positions_live_data,
+            positions_data,
+            decisions_data,
+            decision_stats_data,
+            risk_data,
+            activation_data,
+            data_quality_data,
+            health_data,
+            market_rows,
+            observed_trades,
+        ) = await asyncio.gather(
+            _fetch_overview_snapshot(),
+            _fetch_ml_snapshot(),
+            _fetch_system_snapshot(),
+            _fetch_positions_live_snapshot(),
+            _fetch_positions_snapshot(),
+            _fetch_decisions_snapshot(),
+            _fetch_decisions_stats_snapshot(),
+            _fetch_risk_snapshot(),
+            _fetch_activation_snapshot(),
+            _fetch_data_quality_snapshot(),
+            _health_checks(),
+            _fetch_market_scanner_rows(),
+            _fetch_recent_observed_trades(),
+        )
+        readiness_data = build_neural_readiness_snapshot(
+            ReadinessInputs(
+                health=health_data,
+                activation=activation_data,
+                risk=risk_data,
+                ml=ml_data,
+            )
+        )
+        runtime = {
+            "started_at": _api_started_at.isoformat(),
+            "uptime_seconds": int((datetime.now(timezone.utc) - _api_started_at).total_seconds()),
+            "cycle_latency_ms": 0.0,
+            "last_command_at": None,
+            "control_available": False,
+            "config_mutable": False,
+        }
+        logs = load_recent_log_entries(LOG_PATHS, limit=120)
+        snapshot = build_terminal_snapshot(
+            overview=overview_data,
+            ml=ml_data,
+            system=system_data,
+            positions_live=positions_live_data,
+            positions=positions_data,
+            decisions=decisions_data,
+            decision_stats=decision_stats_data,
+            risk=risk_data,
+            readiness=readiness_data,
+            data_quality=data_quality_data,
+            health=health_data,
+            market_rows=market_rows,
+            observed_trades=observed_trades,
+            runtime=runtime,
+            logs=logs,
+        )
+        build_ms = round((time.perf_counter() - build_started) * 1000, 2)
+        snapshot.setdefault("bot", {})["cycle_latency_ms"] = build_ms
+
+        _terminal_snapshot_cache["data"] = copy.deepcopy(snapshot)
+        _terminal_snapshot_cache["last_built"] = now
+        return snapshot
+
+
 async def _stats_push_loop() -> None:
     """Push fresh overview stats to all connected WS clients every STATS_PUSH_INTERVAL_S."""
     while True:
@@ -374,8 +603,8 @@ async def _stats_push_loop() -> None:
         if not _bridge.has_connections:
             continue
         try:
-            data = await _get_live_snapshot()
-            await _bridge.broadcast({"type": "stats", "data": data})
+            data = await _get_terminal_snapshot()
+            await _bridge.broadcast({"type": "tick", "payload": data})
         except asyncio.CancelledError:
             break
         except Exception as exc:
@@ -468,7 +697,7 @@ async def api_neural_readiness():
         except Exception as exc:
             logger.warning(f"Neural readiness ML snapshot failed: {exc}")
             ml = {}
-    return build_neural_readiness_snapshot(
+    snapshot = build_neural_readiness_snapshot(
         ReadinessInputs(
             health=health,
             activation=activation,
@@ -476,6 +705,31 @@ async def api_neural_readiness():
             ml=ml,
         )
     )
+    async with _pool.acquire() as conn:
+        try:
+            persistence = await persist_readiness_snapshot(
+                conn,
+                snapshot,
+                trigger_event_type="api_neural_readiness",
+                trigger_event_ref={
+                    "updated_at": snapshot.get("global", {}).get("updated_at"),
+                    "blockers": snapshot.get("global", {}).get("blockers", []),
+                },
+            )
+            snapshot.setdefault("global", {})["persistence"] = {
+                "ok": True,
+                **persistence,
+            }
+            persisted_transitions = await load_recent_persisted_transitions(conn, limit=8)
+            if persisted_transitions:
+                snapshot["transitions"] = persisted_transitions
+        except Exception as exc:
+            logger.warning(f"Neural readiness persistence failed: {exc}")
+            snapshot.setdefault("global", {})["persistence"] = {
+                "ok": False,
+                "error": str(exc),
+            }
+    return snapshot
 
 
 @app.get("/api/system")
@@ -514,6 +768,11 @@ async def api_profiler_health():
 async def api_data_quality():
     async with _pool.acquire() as conn:
         return await queries.data_quality(conn, redis_client=_redis)
+
+
+@app.get("/api/v1/live-summary")
+async def api_live_summary_v1():
+    return {"data": await _get_terminal_snapshot()}
 
 
 @app.websocket("/ws/live")
