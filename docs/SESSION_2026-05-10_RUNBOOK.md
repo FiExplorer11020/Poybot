@@ -20,7 +20,9 @@ docker compose -f docker-compose.yml -f docker-compose.prod.yml build
 docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d --force-recreate
 
 # One-shot DQ cleanup (existing 158 leaders stamped 'falcon_no_data')
-docker exec -i polymarket_db psql -U postgres polymarket \
+# NB: the postgres role in the container is "polymarket" (not "postgres"),
+# matching POSTGRES_USER in docker-compose.yml.
+docker exec -i polymarket_db psql -U polymarket -d polymarket \
   < scripts/cleanup_falcon_no_data_leaders.sql
 ```
 

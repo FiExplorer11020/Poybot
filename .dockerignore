@@ -33,6 +33,11 @@ venv/
 # Tests + dev fixtures (don't ship to prod)
 tests/
 docs/
+# …but keep docs/migrations/ in the build context — the runtime image
+# needs the SQL files so scripts/setup_db.py can apply pending schema
+# changes at boot. Order matters: the negation must come AFTER docs/.
+!docs/migrations/
+!docs/migrations/**
 reports/
 data_cache/
 data/
