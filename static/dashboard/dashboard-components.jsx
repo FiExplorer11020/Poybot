@@ -2,6 +2,27 @@
 
 const { useState, useEffect, useRef, useMemo } = React;
 
+// ── usePersistedState ──────────────────────────────────────────────────────
+// Drop-in replacement for useState that mirrors the value to localStorage
+// under a `pmi:<key>` namespace. Re-read on remount so reload restores the
+// last UI state (filter, sort, view mode, etc.). Wrapped in try/catch so
+// quota or privacy-mode errors silently fall back to in-memory state.
+const usePersistedState = (key, initial) => {
+  const storageKey = `pmi:${key}`;
+  const [value, setValue] = useState(() => {
+    try {
+      const raw = localStorage.getItem(storageKey);
+      if (raw == null) return initial;
+      return JSON.parse(raw);
+    } catch (_) { return initial; }
+  });
+  useEffect(() => {
+    try { localStorage.setItem(storageKey, JSON.stringify(value)); }
+    catch (_) {}
+  }, [storageKey, value]);
+  return [value, setValue];
+};
+
 const C = {
   amber: '#e8a020', green: '#28a84e', red: '#c93545', blue: '#3d7dc8', purple: '#7855c0',
   text: '#c4ccd8', dim: '#3a4558', dim2: '#6b7a94', white: '#eef2f8',
@@ -108,7 +129,7 @@ const Dot = ({ status }) => {
 const KpiStrip = ({ items }) => (
   <div style={{
     display: 'grid',
-    gridTemplateColumns: `repeat(auto-fit, minmax(140px, 1fr))`,
+    gridTemplateColumns: `repeat(auto-fit, minmax(110px, 1fr))`,
     borderBottom: `1px solid ${C.border}`,
     flexShrink: 0,
   }}>
@@ -128,25 +149,37 @@ const KpiStrip = ({ items }) => (
 );
 
 // ── Sparkline (SVG inline, no external deps) ──────────────────────────────────
-const Sparkline = ({ data, width = 100, height = 18, color = C.amber, fillOpacity = 0.12 }) => {
+// Pass `fluid` to render at 100% container width (preserveAspectRatio=none means
+// the curve stretches horizontally — fine for trends since we don't care about
+// aspect ratio, only relative shape over time).
+const Sparkline = ({ data, width = 100, height = 18, color = C.amber, fillOpacity = 0.12, fluid = false }) => {
   if (!Array.isArray(data) || data.length < 2) {
-    return <div style={{ width, height, display: 'flex', alignItems: 'center', color: C.dim2, fontSize: 9 }}>—</div>;
+    return <div style={{ width: fluid ? '100%' : width, height, display: 'flex', alignItems: 'center', color: C.dim2, fontSize: 9 }}>—</div>;
   }
+  const W = width;
   const max = Math.max(...data, 1);
   const min = Math.min(...data, 0);
   const range = (max - min) || 1;
-  const stepX = width / (data.length - 1);
+  const stepX = W / (data.length - 1);
   const pts = data.map((v, i) => {
     const x = i * stepX;
     const y = height - ((v - min) / range) * height;
     return `${x.toFixed(1)},${y.toFixed(1)}`;
   });
-  const areaPts = `0,${height} ${pts.join(' ')} ${width},${height}`;
+  const areaPts = `0,${height} ${pts.join(' ')} ${W},${height}`;
   return (
-    <svg width={width} height={height} viewBox={`0 0 ${width} ${height}`} style={{ display: 'block' }}>
+    <svg
+      width={fluid ? '100%' : W}
+      height={height}
+      viewBox={`0 0 ${W} ${height}`}
+      preserveAspectRatio={fluid ? 'none' : 'xMidYMid meet'}
+      style={{ display: 'block' }}
+    >
       <polygon points={areaPts} fill={color} opacity={fillOpacity} />
-      <polyline fill="none" stroke={color} strokeWidth="1.4" strokeLinecap="round" strokeLinejoin="round" points={pts.join(' ')} />
-      <circle cx={width} cy={parseFloat(pts[pts.length - 1].split(',')[1])} r="2" fill={color} />
+      <polyline fill="none" stroke={color} strokeWidth={fluid ? 1.6 : 1.4}
+        vectorEffect={fluid ? 'non-scaling-stroke' : 'none'}
+        strokeLinecap="round" strokeLinejoin="round" points={pts.join(' ')} />
+      <circle cx={W} cy={parseFloat(pts[pts.length - 1].split(',')[1])} r={fluid ? 2.4 : 2} fill={color} />
     </svg>
   );
 };
@@ -188,7 +221,7 @@ const SectionLabel = ({ children, mb = 10 }) => (
 // ── Helpers ────────────────────────────────────────────────────────────────────
 const short      = w  => w ? w.slice(0, 6) + '…' + w.slice(-4) : '—';
 const fmtAge     = s  => { if (s == null) return '—'; if (s < 60) return s + 's'; if (s < 3600) return Math.floor(s / 60) + 'm'; if (s < 86400) return Math.floor(s / 3600) + 'h' + Math.floor((s % 3600) / 60) + 'm'; return Math.floor(s / 86400) + 'd'; };
-const fmtPnl     = v  => v == null ? '—' : (v >= 0 ? '+' : '') + ' $' + Math.abs(v).toFixed(2);
+const fmtPnl     = v  => (v == null || v === 0) ? '—' : (v > 0 ? '+' : '-') + '$' + Math.abs(v).toFixed(2);
 const fmtPct     = (v, d = 1) => ((v || 0) * 100).toFixed(d) + '%';
 const fmtMs      = ms => ms == null ? '—' : ms < 1000 ? `${Math.round(ms)}ms` : `${(ms / 1000).toFixed(1)}s`;
 const fmtNum     = (v, d = 2) => v == null ? '—' : Number(v).toFixed(d);
@@ -200,7 +233,7 @@ const phaseLabel = { 0: 'WARM', 1: 'BETA', 2: 'LOGREG', 3: 'LGBM' };
 const phaseType  = { 0: 'default', 1: 'blue', 2: 'amber', 3: 'green' };
 
 Object.assign(window, {
-  C, S, useLiveStore, ConnBanner,
+  C, S, useLiveStore, usePersistedState, ConnBanner,
   Badge, MiniBar, ScoreBar, Dot, KpiStrip, TH, TD, SectionLabel, Sparkline, ProgressBar,
   short, fmtAge, fmtPnl, fmtPct, fmtMs, fmtNum,
   pnlColor, sideColor, actionType, stratType, phaseLabel, phaseType,

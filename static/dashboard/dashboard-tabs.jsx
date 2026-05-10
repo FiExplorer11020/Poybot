@@ -2,7 +2,7 @@
 
 const { useState: useStateT, useEffect: useEffectT, useMemo: useMemoT } = React;
 const {
-  C, S, useLiveStore, ConnBanner,
+  C, S, useLiveStore, usePersistedState, ConnBanner,
   Badge, MiniBar, ScoreBar, Dot, KpiStrip, TH, TD, SectionLabel, Sparkline, ProgressBar,
   short, fmtAge, fmtPnl, fmtPct, fmtMs, fmtNum,
   pnlColor, sideColor, actionType,
@@ -174,20 +174,31 @@ const AlphaTerminal = () => {
             <div style={{ padding: 20, color: C.dim2, fontSize: 11 }}>{snapshot ? 'No trades yet.' : 'Waiting for data…'}</div>
           ) : (
             <div style={{ flex: 1, overflow: 'auto' }}>
-              {trades.map((t, idx) => (
-                <div key={t.id || idx} style={{
-                  padding: '5px 10px', borderBottom: `1px solid ${C.border}`,
-                  background: idx === 0 ? 'rgba(232,160,32,0.04)' : 'transparent',
-                  display: 'grid', gridTemplateColumns: '52px 32px 1fr 54px 60px',
-                  gap: 6, alignItems: 'center', fontSize: 11,
-                }}>
-                  <span style={{ color: C.dim2, fontSize: 10 }}>{t.timestamp ? new Date(t.timestamp).toLocaleTimeString('en-GB') : '—'}</span>
-                  <span style={{ color: sideColor(t.side), fontWeight: 700, fontSize: 10 }}>{t.side}</span>
-                  <span style={{ color: C.text, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{t.market_title}</span>
-                  <span style={{ color: C.dim2, textAlign: 'right', fontFamily: 'monospace' }}>{fmtNum(t.price, 3)}</span>
-                  <span style={{ color: pnlColor(t.pnl_abs), textAlign: 'right', fontWeight: 600 }}>{fmtPnl(t.pnl_abs)}</span>
-                </div>
-              ))}
+              {trades.map((t, idx) => {
+                const clickable = !!t.wallet_address;
+                return (
+                  <div key={t.id || idx}
+                    onClick={clickable ? () => window.PoybotNav?.selectWallet(t.wallet_address) : undefined}
+                    title={clickable ? `Open ${short(t.wallet_address)} in Wallet Graph` : undefined}
+                    style={{
+                      padding: '5px 10px', borderBottom: `1px solid ${C.border}`,
+                      background: idx === 0 ? 'rgba(232,160,32,0.04)' : 'transparent',
+                      display: 'grid', gridTemplateColumns: '52px 32px 1fr 54px 60px',
+                      gap: 6, alignItems: 'center', fontSize: 11,
+                      cursor: clickable ? 'pointer' : 'default',
+                      transition: 'background 120ms',
+                    }}
+                    onMouseEnter={clickable ? e => e.currentTarget.style.background = 'rgba(120,85,192,0.08)' : undefined}
+                    onMouseLeave={clickable ? e => e.currentTarget.style.background = idx === 0 ? 'rgba(232,160,32,0.04)' : 'transparent' : undefined}
+                  >
+                    <span style={{ color: C.dim2, fontSize: 10 }}>{t.timestamp ? new Date(t.timestamp).toLocaleTimeString('en-GB') : '—'}</span>
+                    <span style={{ color: sideColor(t.side), fontWeight: 700, fontSize: 10 }}>{t.side}</span>
+                    <span style={{ color: C.text, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{t.market_title}</span>
+                    <span style={{ color: C.dim2, textAlign: 'right', fontFamily: 'monospace' }}>{fmtNum(t.price, 3)}</span>
+                    <span style={{ color: pnlColor(t.pnl_abs), textAlign: 'right', fontWeight: 600 }}>{fmtPnl(t.pnl_abs)}</span>
+                  </div>
+                );
+              })}
             </div>
           )}
         </div>
@@ -234,21 +245,47 @@ const PhaseCard = ({ phase, count, target, label, desc, color }) => {
 };
 
 const FollowReadyRow = ({ row }) => {
-  const tradesPct    = (row.trades / row.trades_target) * 100;
-  const resolvedPct  = (row.resolved / row.resolved_target) * 100;
-  const followersPct = (row.followers / row.followers_target) * 100;
+  const tradesPct    = Math.min(100, (row.trades / row.trades_target) * 100);
+  const resolvedPct  = Math.min(100, (row.resolved / row.resolved_target) * 100);
+  const followersPct = Math.min(100, (row.followers / row.followers_target) * 100);
   const eta = row.ready ? 'READY' : (row.eta_h != null ? (row.eta_h < 1 ? '<1h' : row.eta_h < 24 ? `${row.eta_h.toFixed(0)}h` : `${(row.eta_h / 24).toFixed(1)}d`) : '—');
+
+  // 2-line layout: header (wallet · phase · eta) + 3 thin progress dots-bars.
+  // Works in narrow columns (≥ 240 px) without truncating numbers.
+  const tooltip = `Trades ${row.trades}/${row.trades_target} · Resolved ${row.resolved}/${row.resolved_target} · Followers ${row.followers}/${row.followers_target}\n\nClick to open in Wallet Graph`;
+  const onClick = row.wallet_address ? () => window.PoybotNav?.selectWallet(row.wallet_address) : undefined;
   return (
-    <div style={{ display: 'grid', gridTemplateColumns: '120px 1fr 1fr 1fr 80px 70px', gap: 8, padding: '6px 10px', background: C.panel, alignItems: 'center', fontSize: 10 }}>
-      <span style={{ color: C.text, fontFamily: 'monospace', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{short(row.wallet_address)}</span>
-      <ProgressBar value={row.trades} max={row.trades_target} color={tradesPct >= 100 ? C.green : C.blue} height={5} sublabel={`${row.trades}/${row.trades_target}`} />
-      <ProgressBar value={row.resolved} max={row.resolved_target} color={resolvedPct >= 100 ? C.green : C.amber} height={5} sublabel={`${row.resolved}/${row.resolved_target}`} />
-      <ProgressBar value={row.followers} max={row.followers_target} color={followersPct >= 100 ? C.green : C.purple} height={5} sublabel={`${row.followers}/${row.followers_target}`} />
-      <span style={{ textAlign: 'right' }}><Badge type={row.phase === 1 ? 'blue' : row.phase === 2 ? 'amber' : 'green'} size="xs">P{row.phase}</Badge></span>
-      <span style={{ textAlign: 'right', color: row.ready ? C.green : C.amber, fontWeight: 700 }}>{eta}</span>
+    <div title={tooltip} onClick={onClick}
+      style={{ padding: '6px 10px', background: C.panel, fontSize: 10, display: 'flex', flexDirection: 'column', gap: 5,
+        cursor: onClick ? 'pointer' : 'default', transition: 'background 120ms' }}
+      onMouseEnter={onClick ? e => e.currentTarget.style.background = 'rgba(120,85,192,0.06)' : undefined}
+      onMouseLeave={onClick ? e => e.currentTarget.style.background = C.panel : undefined}>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+        <span style={{ color: C.text, fontFamily: 'monospace', flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+          {short(row.wallet_address)}
+        </span>
+        <Badge type={row.phase === 1 ? 'blue' : row.phase === 2 ? 'amber' : 'green'} size="xs">P{row.phase}</Badge>
+        <span style={{ color: row.ready ? C.green : C.amber, fontWeight: 700, fontFamily: 'monospace', minWidth: 36, textAlign: 'right' }}>{eta}</span>
+      </div>
+      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 6, alignItems: 'center' }}>
+        <MicroBar pct={tradesPct}    color={tradesPct >= 100 ? C.green : C.blue}   label={`T ${row.trades}/${row.trades_target}`} />
+        <MicroBar pct={resolvedPct}  color={resolvedPct >= 100 ? C.green : C.amber} label={`R ${row.resolved}/${row.resolved_target}`} />
+        <MicroBar pct={followersPct} color={followersPct >= 100 ? C.green : C.purple} label={`F ${row.followers}/${row.followers_target}`} />
+      </div>
     </div>
   );
 };
+
+// Tiny inline stat: label + thin bar. Replaces the ProgressBar with sublabel
+// pattern in narrow grids where vertical stacking wastes too much space.
+const MicroBar = ({ pct, color, label }) => (
+  <div style={{ display: 'flex', flexDirection: 'column', gap: 2, minWidth: 0 }}>
+    <span style={{ color: C.dim2, fontSize: 9, fontFamily: 'monospace', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{label}</span>
+    <div style={{ height: 3, background: 'rgba(255,255,255,0.06)' }}>
+      <div style={{ width: `${Math.max(0, Math.min(100, pct))}%`, height: '100%', background: color, transition: 'width 0.4s' }} />
+    </div>
+  </div>
+);
 
 const SmallCell = ({ l, v, c }) => (
   <div style={{ background: C.panel2, padding: '8px 10px' }}>
@@ -428,7 +465,7 @@ const MarketScanner = () => {
 // ─── LIVE PORTFOLIO ───────────────────────────────────────────────────────────
 const LivePortfolio = () => {
   const { snapshot, connectionState } = useLiveStore();
-  const [view, setView] = useStateT('open');
+  const [view, setView] = usePersistedState('lp.view', 'open');
   const positions = snapshot?.positions || {};
   const openItems = positions.items     || [];
   const trades    = snapshot?.recent_trades || [];
@@ -511,8 +548,15 @@ const LivePortfolio = () => {
             </thead>
             <tbody>
               {openItems.length === 0 && <tr><td colSpan={9} style={{ padding: '24px', color: C.dim2, textAlign: 'center' }}>{snapshot ? 'No open positions.' : 'Waiting for data…'}</td></tr>}
-              {openItems.map((p, i) => (
-                <tr key={p.trade_id || i}>
+              {openItems.map((p, i) => {
+                const wallet = p.leader_wallet || p.wallet_address;
+                const onClick = wallet ? () => window.PoybotNav?.selectWallet(wallet) : undefined;
+                return (
+                <tr key={p.trade_id || i} onClick={onClick}
+                    title={wallet ? `Open ${short(wallet)} in Wallet Graph` : undefined}
+                    style={{ cursor: wallet ? 'pointer' : 'default', transition: 'background 120ms' }}
+                    onMouseEnter={wallet ? e => e.currentTarget.style.background = 'rgba(120,85,192,0.06)' : undefined}
+                    onMouseLeave={wallet ? e => e.currentTarget.style.background = 'transparent' : undefined}>
                   <TD style={{ maxWidth: 220 }}><div style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', color: C.text }}>{p.market_title}</div></TD>
                   <TD><Badge type={p.side === 'YES' ? 'green' : 'red'} size="xs">{p.side}</Badge></TD>
                   <TD style={{ color: C.dim2, fontFamily: 'monospace' }}>{fmtNum(p.entry_price, 3)}</TD>
@@ -523,7 +567,8 @@ const LivePortfolio = () => {
                   <TD><Badge type={actionType(p.decision_action)}>{p.decision_action || '—'}</Badge></TD>
                   <TD style={{ color: C.dim2, fontSize: 10, maxWidth: 200 }}><div style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{p.decision_summary || '—'}</div></TD>
                 </tr>
-              ))}
+                );
+              })}
             </tbody>
           </table>
         ) : (
@@ -558,9 +603,9 @@ const LivePortfolio = () => {
 // ─── DECISION ENGINE ──────────────────────────────────────────────────────────
 const DecisionEngine = () => {
   const { snapshot, connectionState } = useLiveStore();
-  const [filter, setFilter]     = useStateT('ALL');
-  const [groupBy, setGroupBy]   = useStateT('leader'); // 'leader' | 'flat'
-  const [expanded, setExpanded] = useStateT(new Set());
+  const [filter, setFilter]     = usePersistedState('de.filter', 'ALL');
+  const [groupBy, setGroupBy]   = usePersistedState('de.groupBy', 'leader'); // 'leader' | 'flat'
+  const [expanded, setExpanded] = useStateT(new Set());  // ephemeral — reset on remount
   const de      = snapshot?.decision_engine || {};
   const summary = de.summary || {};
   const ranked  = de.ranked  || [];
@@ -662,7 +707,15 @@ const DecisionsByLeader = ({ byLeader, expanded, toggle, snapshot }) => (
             onMouseLeave={e => { e.currentTarget.style.background = isOpen ? 'rgba(120,85,192,0.04)' : 'transparent'; }}
           >
             <span style={{ color: C.dim2, fontSize: 11 }}>{isOpen ? '▾' : '▸'}</span>
-            <span style={{ color: C.purple, fontFamily: 'monospace', fontSize: 11, fontWeight: 600 }}>{short(g.wallet) || '— unknown —'}</span>
+            <span
+              onClick={g.wallet ? (e) => { e.stopPropagation(); window.PoybotNav?.selectWallet(g.wallet); } : undefined}
+              title={g.wallet ? `Open ${short(g.wallet)} in Wallet Graph` : undefined}
+              style={{
+                color: C.purple, fontFamily: 'monospace', fontSize: 11, fontWeight: 600,
+                cursor: g.wallet ? 'pointer' : 'default',
+                textDecoration: g.wallet ? 'underline dotted rgba(120,85,192,0.3)' : 'none',
+                textUnderlineOffset: 3,
+              }}>{short(g.wallet) || '— unknown —'}</span>
             <span style={{ color: C.dim2, fontSize: 11 }}>{g.decisions.length} markets watched</span>
             <Badge type="green" size="xs">{a.open || 0} open</Badge>
             <Badge type="amber" size="xs">{a.reduce || 0} reduce</Badge>
@@ -677,8 +730,13 @@ const DecisionsByLeader = ({ byLeader, expanded, toggle, snapshot }) => (
                   <tr>{['Market', 'Action', 'Side', 'Confidence', 'Thompson F/F', 'Kelly', 'Exec', 'Summary'].map(h => <TH key={h}>{h}</TH>)}</tr>
                 </thead>
                 <tbody>
-                  {g.decisions.map((d, di) => (
-                    <tr key={di}>
+                  {g.decisions.map((d, di) => {
+                    const onOpen = d.id ? (e) => { e.stopPropagation(); window.PoybotNav?.selectDecision(d); } : undefined;
+                    return (
+                    <tr key={di} onClick={onOpen} title={d.id ? 'Click for full reasoning' : undefined}
+                      style={{ cursor: onOpen ? 'pointer' : 'default', transition: 'background 100ms' }}
+                      onMouseEnter={onOpen ? e => e.currentTarget.style.background = 'rgba(232,160,32,0.04)' : undefined}
+                      onMouseLeave={onOpen ? e => e.currentTarget.style.background = 'transparent' : undefined}>
                       <TD style={{ maxWidth: 250 }}>
                         <div style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', color: C.text }}>{d.title}</div>
                       </TD>
@@ -692,7 +750,8 @@ const DecisionsByLeader = ({ byLeader, expanded, toggle, snapshot }) => (
                       <TD><Badge type={d.executable ? 'green' : 'default'} size="xs">{d.executable ? 'YES' : 'NO'}</Badge></TD>
                       <TD style={{ color: C.dim2, fontSize: 10, maxWidth: 220 }}><div style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{d.summary}</div></TD>
                     </tr>
-                  ))}
+                    );
+                  })}
                 </tbody>
               </table>
             </div>
@@ -720,7 +779,15 @@ const DecisionsFlat = ({ filtered, expanded, toggle, snapshot }) => (
             <React.Fragment key={key}>
               <tr onClick={() => toggle(key)} style={{ cursor: 'pointer', background: isOpen ? 'rgba(232,160,32,0.03)' : 'transparent' }}>
                 <TD style={{ maxWidth: 130 }}>
-                  <span style={{ color: C.purple, fontFamily: 'monospace', fontWeight: 600 }}>{short(d.leader_wallet) || '—'}</span>
+                  <span
+                    onClick={d.leader_wallet ? (e) => { e.stopPropagation(); window.PoybotNav?.selectWallet(d.leader_wallet); } : undefined}
+                    title={d.leader_wallet ? `Open ${short(d.leader_wallet)} in Wallet Graph` : undefined}
+                    style={{
+                      color: C.purple, fontFamily: 'monospace', fontWeight: 600,
+                      cursor: d.leader_wallet ? 'pointer' : 'default',
+                      textDecoration: d.leader_wallet ? 'underline dotted rgba(120,85,192,0.3)' : 'none',
+                      textUnderlineOffset: 3,
+                    }}>{short(d.leader_wallet) || '—'}</span>
                 </TD>
                 <TD style={{ maxWidth: 220 }}><div style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', color: C.text }}>{d.title}</div></TD>
                 <TD><Badge type={actionType(d.action)}>{d.action || '—'}</Badge></TD>
@@ -801,10 +868,23 @@ const RiskConfig = () => {
     try {
       await window.PoybotAPI.updateConfig(edits);
       setEdits({}); setSaveMsg('✓ Saved');
+      refreshAuditLog();
     } catch (e) { setSaveMsg('✗ ' + e.message); }
     setSaving(false);
     setTimeout(() => setSaveMsg(''), 3000);
   };
+
+  // Audit log of recent risk config changes — fetched on mount, refreshed
+  // after each save so the operator sees their change land immediately.
+  const [auditLog, setAuditLog] = useStateT(null);
+  const refreshAuditLog = () => {
+    const base = window.PoybotAPI?.getSettings?.()?.API_BASE || '';
+    fetch(`${base}/api/risk/history?limit=30`)
+      .then(r => r.ok ? r.json() : Promise.reject('HTTP ' + r.status))
+      .then(d => setAuditLog(d))
+      .catch(e => { console.warn('[RiskConfig] audit fetch failed', e); setAuditLog({ items: [], _error: true }); });
+  };
+  useEffectT(() => { refreshAuditLog(); }, []);
 
   const sendCmd = async cmd => {
     setCmdBusy(true); setKillConfirm(false);
@@ -916,6 +996,56 @@ const RiskConfig = () => {
           </div>
         </div>
       </div>
+
+      {/* Audit log — recent runtime config changes (last 30) */}
+      <div style={{ padding: '14px 14px 18px', borderTop: `1px solid ${C.border}`, flexShrink: 0 }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 8 }}>
+          <SectionLabel mb={0}>Audit log · risk config changes</SectionLabel>
+          <span style={{ color: C.dim2, fontSize: 9, fontFamily: 'monospace', marginLeft: 'auto' }}>
+            {auditLog ? `${(auditLog.items || []).length} of ${auditLog.total ?? '—'}` : 'loading…'}
+          </span>
+          <button onClick={refreshAuditLog} title="Refresh"
+            style={{ background: 'transparent', border: `1px solid ${C.border2}`, color: C.dim2, fontSize: 10, padding: '2px 8px', cursor: 'pointer' }}>
+            ↻
+          </button>
+        </div>
+        {!auditLog ? (
+          <div style={{ color: C.dim2, fontSize: 11 }}>Loading…</div>
+        ) : (auditLog.items || []).length === 0 ? (
+          <div style={{ color: C.dim2, fontSize: 11 }}>No config changes recorded yet.</div>
+        ) : (
+          <div style={{ maxHeight: 280, overflow: 'auto', border: `1px solid ${C.border}` }}>
+            <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 11 }}>
+              <thead style={{ position: 'sticky', top: 0, background: C.panel2, zIndex: 1 }}>
+                <tr>
+                  <TH>When</TH>
+                  <TH>Key</TH>
+                  <TH>Old → New</TH>
+                  <TH>Actor</TH>
+                  <TH>Source</TH>
+                </tr>
+              </thead>
+              <tbody>
+                {(auditLog.items || []).map(h => (
+                  <tr key={h.id}>
+                    <TD style={{ color: C.dim2, fontFamily: 'monospace', fontSize: 10, whiteSpace: 'nowrap' }}>
+                      {h.changed_at_iso ? new Date(h.changed_at_iso).toLocaleString('en-GB', { month: 'short', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit' }) : '—'}
+                    </TD>
+                    <TD style={{ color: C.amber, fontFamily: 'monospace' }}>{h.key}</TD>
+                    <TD style={{ fontFamily: 'monospace', fontSize: 10 }}>
+                      <span style={{ color: C.dim2, textDecoration: 'line-through' }}>{h.old_value ?? '—'}</span>
+                      <span style={{ color: C.dim2, margin: '0 6px' }}>→</span>
+                      <span style={{ color: C.green, fontWeight: 600 }}>{h.new_value ?? '—'}</span>
+                    </TD>
+                    <TD style={{ color: C.purple, fontFamily: 'monospace' }}>{h.actor || '—'}</TD>
+                    <TD><Badge type="default" size="xs">{h.source || '—'}</Badge></TD>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </div>
     </div>
   );
 };
@@ -923,7 +1053,7 @@ const RiskConfig = () => {
 // ─── BOT HEALTH ───────────────────────────────────────────────────────────────
 const BotHealth = () => {
   const { snapshot, connectionState } = useLiveStore();
-  const [logFilter, setLogFilter] = useStateT('ALL');
+  const [logFilter, setLogFilter] = usePersistedState('bh.logFilter', 'ALL');
   const ingestion = snapshot?.ingestion || {};
   const bot       = snapshot?.bot       || {};
   const logs      = snapshot?.logs      || [];
@@ -1017,21 +1147,35 @@ const BotHealth = () => {
           <div>
             <SectionLabel>Data Quality Issues · {dqIssues.length} active</SectionLabel>
             <div style={{ display: 'grid', gap: 8 }}>
-              {dqIssues.map((iss, i) => (
-                <div key={i} style={{
-                  border: `1px solid ${iss.severity === 'err' ? C.red : C.amber}`,
-                  background: iss.severity === 'err' ? 'rgba(201,53,69,0.05)' : 'rgba(232,160,32,0.04)',
-                  padding: '10px 12px',
-                }}>
+              {dqIssues.map((iss, i) => {
+                // Issues that map to a drill-down endpoint can be clicked to
+                // open the modal listing the affected items.
+                const drillable = ['unmapped_tokens', 'expired_still_active', 'orphan_market_ids', 'stale_leaders', 'stale_profiles'].includes(iss.key);
+                const onClick = drillable ? () => window.PoybotNav?.showDataQualityIssue(iss.key) : undefined;
+                return (
+                <div key={i} onClick={onClick}
+                  title={drillable ? `Click to see affected items` : undefined}
+                  style={{
+                    border: `1px solid ${iss.severity === 'err' ? C.red : C.amber}`,
+                    background: iss.severity === 'err' ? 'rgba(201,53,69,0.05)' : 'rgba(232,160,32,0.04)',
+                    padding: '10px 12px',
+                    cursor: drillable ? 'pointer' : 'default',
+                    transition: 'background 120ms, border-color 120ms',
+                  }}
+                  onMouseEnter={drillable ? e => { e.currentTarget.style.background = iss.severity === 'err' ? 'rgba(201,53,69,0.1)' : 'rgba(232,160,32,0.1)'; } : undefined}
+                  onMouseLeave={drillable ? e => { e.currentTarget.style.background = iss.severity === 'err' ? 'rgba(201,53,69,0.05)' : 'rgba(232,160,32,0.04)'; } : undefined}
+                >
                   <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 6 }}>
                     <Dot status={iss.severity === 'err' ? 'err' : 'warn'} />
                     <span style={{ color: iss.severity === 'err' ? C.red : C.amber, fontWeight: 700, fontSize: 11 }}>{iss.title}</span>
                     <Badge type={iss.severity === 'err' ? 'red' : 'amber'} size="xs">{iss.key}</Badge>
+                    {drillable && <span style={{ marginLeft: 'auto', color: C.dim2, fontSize: 10 }}>view affected ›</span>}
                   </div>
                   <div style={{ fontSize: 11, color: C.text, marginBottom: 4 }}>{iss.detail}</div>
                   <div style={{ fontSize: 10, color: C.dim2, fontStyle: 'italic' }}>↳ {iss.hint}</div>
                 </div>
-              ))}
+                );
+              })}
             </div>
           </div>
         )}
@@ -1153,10 +1297,51 @@ const MLProgression = () => {
   const timeline = extras.timeline || [];
   const adaptive = snapshot?.adaptive_thresholds || { maturity: 0, values: {}, ranges: {} };
 
+  // Lazy-fetched diagnostics endpoint — refreshes every 60 s.
+  const [diag, setDiag] = useStateT(null);
+  useEffectT(() => {
+    let cancelled = false;
+    const fetchDiag = () => {
+      const base = window.PoybotAPI?.getSettings?.()?.API_BASE || '';
+      fetch(`${base}/api/ml/diagnostics`)
+        .then(r => r.ok ? r.json() : Promise.reject('HTTP ' + r.status))
+        .then(d => { if (!cancelled) setDiag(d); })
+        .catch(e => console.warn('[MLProgression] diagnostics fetch failed', e));
+    };
+    fetchDiag();
+    const id = setInterval(fetchDiag, 60_000);
+    return () => { cancelled = true; clearInterval(id); };
+  }, []);
+
   const totalProfiles = (totals.phase1 || 0) + (totals.phase2 || 0) + (totals.phase3 || 0);
   const tradesSpark    = timeline.map(b => b.trades || 0);
   const positionsSpark = timeline.map(b => b.positions_resolved || 0);
   const edgesSpark     = timeline.map(b => b.edges_active || 0);
+
+  // Format helpers
+  const fmtSec = (s) => {
+    if (!s) return '—';
+    if (s < 60) return `${s}s`;
+    if (s < 3600) return `${Math.round(s / 60)}m`;
+    if (s < 86400) return `${(s / 3600).toFixed(1)}h`;
+    return `${(s / 86400).toFixed(1)}d`;
+  };
+  const closeMethods = diag?.close_methods || [];
+  const sampleEff = diag?.sample_efficiency || {};
+  const holdingByPhase = diag?.holding_by_phase || [];
+  const catCoverage = diag?.category_coverage || [];
+  const decisions24h = diag?.decisions_24h || { total: 0, by_action: [] };
+  const enrichLag = diag?.falcon_enrichment_lag || {};
+  const phaseEta = diag?.phase_eta_top || [];
+
+  // Latest category coverage % for the top KPI strip.
+  const latestCovPct = catCoverage.length ? catCoverage[catCoverage.length - 1].pct : null;
+
+  // Hero status — the one question that matters most: are we trading yet?
+  const followReadyCount = followReady.filter(r => r.ready).length;
+  const isReady = followReadyCount > 0;
+  // Top blocker = the rejection reason with the highest share, or fallback.
+  const topBlocker = rejections.breakdown[0] || null;
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', height: '100%', width: '100%', overflow: 'hidden' }}>
@@ -1164,46 +1349,292 @@ const MLProgression = () => {
       <KpiStrip items={[
         { label: 'Total Profiles', value: totalProfiles, color: C.text },
         { label: 'System Maturity', value: `${(adaptive.maturity * 100).toFixed(1)}%`, color: C.purple },
-        { label: 'Avg Maturity',   value: (totals.avg_maturity ?? 0).toFixed(3), color: C.purple },
-        { label: 'Phase 1',        value: totals.phase1 ?? 0, color: C.blue },
-        { label: 'Phase 2',        value: totals.phase2 ?? 0, color: C.amber },
-        { label: 'Phase 3',        value: totals.phase3 ?? 0, color: C.green },
-        { label: 'Edges Total',    value: totals.edges_total ?? 0, color: C.text },
-        { label: 'Edges Confirmed',value: totals.edges_confirmed ?? 0, color: C.green },
-        { label: 'Follow Ready',   value: followReady.filter(r => r.ready).length, color: C.amber },
+        { label: 'Phase 1 / 2 / 3', value: `${totals.phase1 ?? 0}/${totals.phase2 ?? 0}/${totals.phase3 ?? 0}`, color: C.blue },
+        { label: 'Sample Eff.', value: sampleEff.ratio != null ? `${(sampleEff.ratio * 100).toFixed(1)}%` : '—', color: C.amber, sub: sampleEff.positions_resolved_total ? `${sampleEff.positions_resolved_total} / ${sampleEff.trades_observed_total}` : '' },
+        { label: 'Cat. Coverage', value: latestCovPct != null ? `${(latestCovPct * 100).toFixed(0)}%` : '—', color: latestCovPct >= 0.8 ? C.green : latestCovPct >= 0.5 ? C.amber : C.red },
+        { label: 'Decisions 24h', value: decisions24h.total ?? 0, color: C.text },
+        { label: 'Edges Conf.', value: totals.edges_confirmed ?? 0, color: C.green, sub: `${totals.edges_total ?? 0} total` },
+        { label: 'Follow Ready', value: followReadyCount, color: isReady ? C.green : C.amber },
       ]} />
 
-      <div style={{ flex: 1, overflow: 'auto', padding: 14, display: 'grid', gap: 14, gridTemplateColumns: 'repeat(auto-fit, minmax(380px, 1fr))', width: '100%' }}>
+      <div style={{ flex: 1, overflow: 'auto', padding: 14, display: 'grid', gap: 14, gridTemplateColumns: 'repeat(12, 1fr)', gridAutoRows: 'min-content', width: '100%', alignContent: 'start' }}>
 
-        {/* Training pipeline */}
-        <Panel title="Training Pipeline">
-          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 10 }}>
+        {/* ── HERO — readiness banner spans full width ───────────────────── */}
+        <div style={{
+          gridColumn: 'span 12',
+          background: isReady ? 'rgba(40,168,78,0.06)' : 'rgba(232,160,32,0.05)',
+          border: `1px solid ${isReady ? 'rgba(40,168,78,0.25)' : 'rgba(232,160,32,0.2)'}`,
+          padding: '14px 18px',
+          display: 'grid',
+          gridTemplateColumns: 'minmax(0, 1.3fr) minmax(0, 1.4fr) minmax(0, 1fr)',
+          gap: 28,
+          alignItems: 'center',
+        }}>
+          {/* Status (left) */}
+          <div style={{ minWidth: 0 }}>
+            <div style={{ ...S.label, marginBottom: 4 }}>Trading readiness</div>
+            <div style={{
+              fontSize: 18, fontWeight: 700,
+              color: isReady ? C.green : C.amber,
+              letterSpacing: '-0.01em', lineHeight: 1.2,
+              whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis',
+            }}>
+              {isReady ? `${followReadyCount} leader${followReadyCount > 1 ? 's' : ''} ready to FOLLOW` : 'Bootstrapping — not trading'}
+            </div>
+            <div style={{ fontSize: 10, color: C.dim2, marginTop: 4, fontFamily: 'monospace' }}>
+              {totalProfiles} profiles · {totals.positions_resolved_total ?? 0} resolved
+            </div>
+          </div>
+
+          {/* Top blocker (middle) */}
+          <div style={{ minWidth: 0 }}>
+            <div style={{ ...S.label, marginBottom: 4, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+              Top blocker{topBlocker ? ` · ${topBlocker.reason}` : ''}
+            </div>
+            {topBlocker ? (
+              <>
+                <div style={{ fontSize: 13, color: C.text, fontWeight: 600, fontFamily: 'monospace', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
+                  {topBlocker.pct}% of skips · {topBlocker.count} dec ({topBlocker.uniq_leaders}L)
+                </div>
+                <div style={{ marginTop: 6, height: 4, background: 'rgba(255,255,255,0.05)' }}>
+                  <div style={{ width: `${topBlocker.pct}%`, height: '100%', background: topBlocker.pct > 60 ? C.red : C.amber }} />
+                </div>
+              </>
+            ) : (
+              <div style={{ fontSize: 12, color: C.dim2 }}>No SKIP decisions in the last hour.</div>
+            )}
+          </div>
+
+          {/* Velocity (right) — now in their own labeled grid that won't overflow */}
+          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, minmax(0, 1fr))', gap: 14, minWidth: 0 }}>
+            {[
+              { label: 'Trades 24h', value: totals.trades_total ?? 0, color: C.blue },
+              { label: 'Resolved 24h', value: totals.positions_resolved_total ?? 0, color: C.green },
+              { label: 'Decisions 24h', value: decisions24h.total ?? 0, color: C.text },
+            ].map(s => (
+              <div key={s.label} style={{ minWidth: 0, textAlign: 'right' }}>
+                <div style={{ ...S.label, fontSize: 9 }}>{s.label}</div>
+                <div style={{ color: s.color, fontSize: 16, fontWeight: 700, marginTop: 2, fontFamily: 'monospace', whiteSpace: 'nowrap' }}>
+                  {s.value.toLocaleString()}
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+
+        {/* ── ROW 1 — phase pipeline (4) · trajectory (4) · closest to follow (4) ── */}
+        <Panel title="Training pipeline" span={4}
+          info="Each leader auto-promotes when their resolved-position count crosses the next threshold. Phase 2 fits run nightly, Phase 3 weekly.">
+          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 8 }}>
             <PhaseCard phase={1} count={totals.phase1 ?? 0} target={100} label="Beta-Binomial" desc="0–99 resolved" color={C.blue} />
             <PhaseCard phase={2} count={totals.phase2 ?? 0} target={500} label="Bayesian LogReg" desc="100–499 resolved" color={C.amber} />
             <PhaseCard phase={3} count={totals.phase3 ?? 0} target={null} label="LightGBM + Platt" desc="500+ resolved" color={C.green} />
           </div>
-          <div style={{ marginTop: 12, fontSize: 10, color: C.dim2 }}>
-            Phase auto-promotes when leader hits next threshold. Fits run nightly (LogReg) / weekly (LightGBM).
-          </div>
+          {phaseEta.length > 0 && (
+            <>
+              <div style={{ ...S.label, marginTop: 14, marginBottom: 6, fontSize: 9 }}>Phase progression ETA · top {phaseEta.length} by velocity</div>
+              <div style={{ display: 'grid', gap: 5, fontSize: 10 }}>
+                {phaseEta.map(p => {
+                  const pct = p.target ? Math.min(100, (p.resolved / p.target) * 100) : 100;
+                  return (
+                    <div key={p.wallet} style={{ display: 'grid', gridTemplateColumns: '90px 56px minmax(0, 1fr) 60px 50px', gap: 6, alignItems: 'center', minWidth: 0 }}>
+                      <span style={{ color: C.purple, fontFamily: 'monospace', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{p.label}</span>
+                      <Badge type={p.current_phase === 1 ? 'blue' : 'amber'} size="xs">P{p.current_phase}→P{p.current_phase + 1}</Badge>
+                      <ProgressBar value={pct} max={100} height={4} color={C.purple} />
+                      <span style={{ color: C.dim2, textAlign: 'right', fontFamily: 'monospace' }}>{p.resolved}/{p.target ?? '—'}</span>
+                      <span style={{ color: p.eta_days != null && p.eta_days < 30 ? C.green : C.dim2, fontWeight: 600, textAlign: 'right' }}>
+                        {p.eta_days != null ? `${p.eta_days}d` : '∞'}
+                      </span>
+                    </div>
+                  );
+                })}
+              </div>
+            </>
+          )}
         </Panel>
 
-        {/* Learning trajectory 24h */}
-        <Panel title="Learning Trajectory · 24h">
-          <div style={{ display: 'grid', gap: 8, fontSize: 11 }}>
+        <Panel title="Learning trajectory · 24h" span={4}
+          info="Hourly buckets of trade ingestion, position closure, and active follower edges.">
+          <div style={{ display: 'grid', gap: 10, fontSize: 11 }}>
             <SparkRow label="Trades observed"    color={C.blue}  data={tradesSpark}    total={totals.trades_total ?? 0} />
             <SparkRow label="Positions resolved" color={C.green} data={positionsSpark} total={totals.positions_resolved_total ?? 0} />
             <SparkRow label="Active edges"       color={C.amber} data={edgesSpark}     total={totals.edges_total ?? 0} />
           </div>
+          <div style={{ marginTop: 12, paddingTop: 10, borderTop: `1px solid ${C.border}` }}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline', marginBottom: 4 }}>
+              <span style={S.label}>Decisions split (24h)</span>
+              <span style={{ fontSize: 10, color: C.dim2, fontFamily: 'monospace' }}>{decisions24h.total ?? 0} total</span>
+            </div>
+            {decisions24h.total > 0 ? (
+              <>
+                <div style={{ display: 'flex', height: 8, background: 'rgba(255,255,255,0.04)', overflow: 'hidden' }}>
+                  {decisions24h.by_action.map(a => (
+                    <div key={a.action}
+                      title={`${a.action}: ${a.count} (${(a.pct * 100).toFixed(0)}%)`}
+                      style={{
+                        width: `${a.pct * 100}%`,
+                        background: a.action === 'follow' ? C.green : a.action === 'fade' ? C.amber : C.dim2,
+                      }}
+                    />
+                  ))}
+                </div>
+                <div style={{ display: 'flex', gap: 14, marginTop: 6, fontSize: 10 }}>
+                  {decisions24h.by_action.map(a => (
+                    <span key={a.action} style={{ color: a.action === 'follow' ? C.green : a.action === 'fade' ? C.amber : C.dim2 }}>
+                      ● {a.action} <span style={{ fontFamily: 'monospace' }}>{(a.pct * 100).toFixed(0)}%</span>
+                    </span>
+                  ))}
+                </div>
+              </>
+            ) : (
+              <div style={{ fontSize: 11, color: C.dim2 }}>No decisions logged yet.</div>
+            )}
+          </div>
         </Panel>
 
-        {/* Decision rejections breakdown */}
-        <Panel title={`Rejections Last Hour · ${rejections.total} total`}>
+        <Panel title={`Closest to FOLLOW · top ${Math.min(6, followReady.length)}`} span={4}
+          info={`Adaptive gates @ system maturity ${(adaptive.maturity * 100).toFixed(1)}% require ${(adaptive.values.FOLLOW_MIN_TRADES ?? 25).toFixed(0)} trades · ${(adaptive.values.FOLLOW_MIN_FOLLOWERS ?? 3).toFixed(0)} confirmed followers.`}>
+          {followReady.length === 0 ? (
+            <div style={{ color: C.dim2, fontSize: 11 }}>No leaders profiled yet.</div>
+          ) : (
+            <div style={{ display: 'grid', gap: 1, background: C.border }}>
+              {followReady.map((r, i) => (
+                <FollowReadyRow key={i} row={r} />
+              ))}
+            </div>
+          )}
+        </Panel>
+
+        {/* ── ROW 2 — close mix (4) · holding (4) · category coverage (4) ── */}
+        <Panel title="Position close methods · 30d" span={4}
+          info="Sell vs merge vs resolution distribution. Merge detection validates the bot tracks complementary-token exits — see CLAUDE.md §14.">
+          {closeMethods.length === 0 ? (
+            <div style={{ color: C.dim2, fontSize: 11 }}>No resolved positions yet.</div>
+          ) : (
+            <div style={{ display: 'grid', gap: 8, fontSize: 11 }}>
+              {closeMethods.map(cm => {
+                const color = cm.method === 'sell' ? C.green : cm.method === 'merge' ? C.purple : cm.method === 'resolution' ? C.blue : C.dim2;
+                return (
+                  <div key={cm.method}>
+                    <div style={{ display: 'grid', gridTemplateColumns: 'auto auto 1fr auto', gap: 8, alignItems: 'center', marginBottom: 3 }}>
+                      <span style={{ color, textTransform: 'uppercase', fontWeight: 700, fontSize: 10, letterSpacing: '0.06em' }}>{cm.method}</span>
+                      <span style={{ color: C.dim2, fontFamily: 'monospace', fontSize: 10 }}>{cm.count}</span>
+                      <span /> {/* spacer */}
+                      <span style={{ color: C.dim2, fontSize: 10, fontFamily: 'monospace' }}>{(cm.pct * 100).toFixed(1)}% · med {fmtSec(cm.median_holding_s)}</span>
+                    </div>
+                    <ProgressBar value={cm.pct * 100} max={100} color={color} height={5} />
+                  </div>
+                );
+              })}
+            </div>
+          )}
+        </Panel>
+
+        <Panel title="Holding period · by phase" span={4}
+          info="Median + p90 of the position holding period per phase. Confirms strategy classifications: scalper < 1h, swing 1d–2w, holder > 2w.">
+          {holdingByPhase.length === 0 ? (
+            <div style={{ color: C.dim2, fontSize: 11 }}>No data.</div>
+          ) : (
+            <div style={{ display: 'grid', gap: 10, fontSize: 11 }}>
+              {holdingByPhase.map(hp => {
+                const color = hp.phase === 3 ? C.green : hp.phase === 2 ? C.amber : C.blue;
+                const maxP90 = Math.max(...holdingByPhase.map(x => x.p90_s), 1);
+                return (
+                  <div key={hp.phase}>
+                    <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 4 }}>
+                      <span style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
+                        <Badge type={hp.phase === 3 ? 'green' : hp.phase === 2 ? 'amber' : 'blue'} size="xs">P{hp.phase}</Badge>
+                        <span style={{ color: C.dim2, fontSize: 10 }}>{hp.count} resolved</span>
+                      </span>
+                      <span style={{ color, fontFamily: 'monospace', fontSize: 10 }}>med <b>{fmtSec(hp.median_s)}</b> · p90 {fmtSec(hp.p90_s)}</span>
+                    </div>
+                    {/* Stacked bar: median + p90 */}
+                    <div style={{ position: 'relative', height: 6, background: 'rgba(255,255,255,0.04)' }}>
+                      <div style={{ position: 'absolute', left: 0, top: 0, bottom: 0, width: `${(hp.p90_s / maxP90) * 100}%`, background: color, opacity: 0.25 }} />
+                      <div style={{ position: 'absolute', left: 0, top: 0, bottom: 0, width: `${(hp.median_s / maxP90) * 100}%`, background: color }} />
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          )}
+        </Panel>
+
+        <Panel title="Category coverage · 14d" span={4}
+          info="Stacked bars: full bar = total trades volume that day, colored portion = trades with a known category, grey = still 'unknown'. Re-categorizer runs every registry cycle (≈30 min).">
+          {catCoverage.length === 0 ? (
+            <div style={{ color: C.dim2, fontSize: 11 }}>No data.</div>
+          ) : (() => {
+              const maxVol = Math.max(...catCoverage.map(d => d.total), 1);
+              const totalKnown = catCoverage.reduce((s, d) => s + (d.known || 0), 0);
+              const totalAll = catCoverage.reduce((s, d) => s + (d.total || 0), 0);
+              const periodPct = totalAll > 0 ? totalKnown / totalAll : 0;
+              return (
+                <>
+                  {/* Stacked bars: encode both volume (height) and coverage (color split). */}
+                  <div style={{ display: 'flex', alignItems: 'flex-end', gap: 3, height: 90, marginBottom: 8 }}>
+                    {catCoverage.map(d => {
+                      const heightPct = Math.max(3, (d.total / maxVol) * 100);
+                      const knownPct = d.total > 0 ? (d.known / d.total) * 100 : 0;
+                      const knownColor = d.pct >= 0.8 ? C.green : d.pct >= 0.5 ? C.amber : C.red;
+                      return (
+                        <div key={d.day}
+                          title={`${d.day}\n${d.total} trades · ${d.known} known (${(d.pct * 100).toFixed(1)}%) · ${d.total - d.known} unknown`}
+                          style={{ flex: 1, display: 'flex', flexDirection: 'column', justifyContent: 'flex-end', minWidth: 0, height: '100%', cursor: 'help' }}>
+                          {/* Stacked: known (bottom, colored) + unknown (top, grey) */}
+                          <div style={{ width: '100%', height: `${heightPct}%`, display: 'flex', flexDirection: 'column-reverse', minHeight: 3 }}>
+                            <div style={{ height: `${knownPct}%`, background: knownColor, transition: 'height 0.3s' }} />
+                            <div style={{ height: `${100 - knownPct}%`, background: 'rgba(120,120,150,0.35)', transition: 'height 0.3s' }} />
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                  {/* Footer: x-axis dates + period summary */}
+                  <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 9, color: C.dim2, fontFamily: 'monospace', marginBottom: 8 }}>
+                    <span>{catCoverage[0]?.day}</span>
+                    <span>{catCoverage[catCoverage.length - 1]?.day}</span>
+                  </div>
+                  {/* Numeric summary */}
+                  <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 6, fontSize: 10, paddingTop: 8, borderTop: `1px solid ${C.border}` }}>
+                    <div>
+                      <div style={{ ...S.label, fontSize: 9 }}>Today</div>
+                      <div style={{ color: latestCovPct >= 0.8 ? C.green : latestCovPct >= 0.5 ? C.amber : C.red, fontFamily: 'monospace', fontSize: 13, fontWeight: 700, marginTop: 2 }}>
+                        {latestCovPct != null ? `${(latestCovPct * 100).toFixed(0)}%` : '—'}
+                      </div>
+                      <div style={{ color: C.dim2, fontFamily: 'monospace', fontSize: 9 }}>
+                        {catCoverage[catCoverage.length - 1]?.known || 0} / {catCoverage[catCoverage.length - 1]?.total || 0}
+                      </div>
+                    </div>
+                    <div>
+                      <div style={{ ...S.label, fontSize: 9 }}>14d avg</div>
+                      <div style={{ color: periodPct >= 0.8 ? C.green : periodPct >= 0.5 ? C.amber : C.red, fontFamily: 'monospace', fontSize: 13, fontWeight: 700, marginTop: 2 }}>
+                        {`${(periodPct * 100).toFixed(0)}%`}
+                      </div>
+                      <div style={{ color: C.dim2, fontFamily: 'monospace', fontSize: 9 }}>
+                        {totalKnown.toLocaleString()} / {totalAll.toLocaleString()}
+                      </div>
+                    </div>
+                    <div>
+                      <div style={{ ...S.label, fontSize: 9 }}>Peak vol</div>
+                      <div style={{ color: C.text, fontFamily: 'monospace', fontSize: 13, fontWeight: 700, marginTop: 2 }}>{maxVol.toLocaleString()}</div>
+                      <div style={{ color: C.dim2, fontFamily: 'monospace', fontSize: 9 }}>trades / day</div>
+                    </div>
+                  </div>
+                </>
+              );
+            })()}
+        </Panel>
+
+        {/* ── ROW 3 — rejections (6) · falcon (3) · adaptive cold/mature (3) compact ── */}
+        <Panel title={`Rejections last hour · ${rejections.total} total`} span={6}
+          info="Why the decision engine declined to trade. Heavy 'insufficient_data' is normal during bootstrap; persistent 'low_confidence' once leaders mature signals model conservatism.">
           {rejections.breakdown.length === 0 ? (
             <div style={{ color: C.dim2, fontSize: 11 }}>No SKIP decisions logged this window.</div>
           ) : (
             <div style={{ display: 'grid', gap: 6 }}>
               {rejections.breakdown.map((r, i) => (
-                <div key={i} style={{ display: 'grid', gridTemplateColumns: '180px 1fr 60px 80px', gap: 8, alignItems: 'center', fontSize: 11 }}>
+                <div key={i} style={{ display: 'grid', gridTemplateColumns: 'minmax(120px, 200px) minmax(0, 1fr) 50px 70px', gap: 8, alignItems: 'center', fontSize: 11, minWidth: 0 }}>
                   <span style={{ color: C.text, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{r.reason}</span>
                   <ProgressBar value={r.pct} max={100} color={r.pct > 60 ? C.red : r.pct > 30 ? C.amber : C.blue} height={6} />
                   <span style={{ color: C.dim2, fontSize: 10, textAlign: 'right' }}>{r.pct}%</span>
@@ -1214,44 +1645,47 @@ const MLProgression = () => {
           )}
         </Panel>
 
-        {/* Closest to FOLLOW */}
-        <Panel title={`Closest to FOLLOW Readiness · top ${Math.min(6, followReady.length)}`}>
-          {followReady.length === 0 ? (
-            <div style={{ color: C.dim2, fontSize: 11 }}>No leaders profiled yet.</div>
-          ) : (
-            <div style={{ display: 'grid', gap: 1, background: C.border }}>
-              {followReady.map((r, i) => (
-                <FollowReadyRow key={i} row={r} />
-              ))}
-            </div>
-          )}
-          <div style={{ marginTop: 8, fontSize: 10, color: C.dim2 }}>
-            Adaptive gates · effective right now (system maturity {(adaptive.maturity * 100).toFixed(1)}%): {' '}
-            {(adaptive.values.FOLLOW_MIN_TRADES ?? 25).toFixed(0)} trades · {' '}
-            {(adaptive.values.FOLLOW_MIN_FOLLOWERS ?? 3).toFixed(0)} confirmed followers
+        <Panel title="Falcon enrichment" span={3}
+          info="Time from leader.first_seen → wallet360 populated. P90 spikes typically mean Falcon hasn't indexed the wallet yet — repeated misses get stamped 'falcon_no_data'.">
+          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 6, fontSize: 11 }}>
+            <Stat l="Median lag" v={fmtSec(enrichLag.median_s)} c={C.blue} />
+            <Stat l="P90 lag" v={fmtSec(enrichLag.p90_s)} c={C.amber} />
+            <Stat l="Enriched" v={enrichLag.enriched ?? 0} c={C.green} />
+            <Stat l="Pending" v={enrichLag.pending ?? 0} c={enrichLag.pending > 0 ? C.amber : C.dim2} />
           </div>
         </Panel>
 
-        {/* Adaptive thresholds drill-down */}
-        <Panel title={`Adaptive Thresholds · maturity ${(adaptive.maturity * 100).toFixed(1)}%`}>
-          <div style={{ fontSize: 10, color: C.dim2, marginBottom: 8 }}>
-            Each gate interpolates between cold-start (more permissive) and mature (stricter) values
-            based on accumulated profiles + resolutions + confirmed edges.
+        <Panel title="Sample efficiency" span={3}
+          info="positions_resolved / trades_observed across all profiles. Low ratio = lots of trade activity but few reconstructable cycles (often means partial position tracking or merge exits the bot misses).">
+          <div style={{ fontSize: 28, fontWeight: 700, color: sampleEff.ratio >= 0.1 ? C.green : sampleEff.ratio >= 0.03 ? C.amber : C.red, letterSpacing: '-0.02em', lineHeight: 1 }}>
+            {sampleEff.ratio != null ? `${(sampleEff.ratio * 100).toFixed(1)}%` : '—'}
           </div>
+          <div style={{ marginTop: 6, fontSize: 10, color: C.dim2, fontFamily: 'monospace' }}>
+            {(sampleEff.positions_resolved_total ?? 0).toLocaleString()} resolved / {(sampleEff.trades_observed_total ?? 0).toLocaleString()} trades
+          </div>
+          <div style={{ marginTop: 8, height: 6, background: 'rgba(255,255,255,0.04)' }}>
+            <div style={{ width: `${Math.min(100, (sampleEff.ratio ?? 0) * 1000)}%`, height: '100%', background: sampleEff.ratio >= 0.1 ? C.green : sampleEff.ratio >= 0.03 ? C.amber : C.red, transition: 'width 0.4s' }} />
+          </div>
+          <div style={{ marginTop: 6, fontSize: 9, color: C.dim2 }}>{sampleEff.active_profiles ?? 0} active profiles</div>
+        </Panel>
+
+        {/* ── ROW 4 — adaptive thresholds full width ────────────────────────── */}
+        <Panel title={`Adaptive thresholds · maturity ${(adaptive.maturity * 100).toFixed(1)}%`} span={12}
+          info="Each gate interpolates between cold-start (more permissive) and mature (stricter) values based on accumulated profiles + resolutions + confirmed edges.">
           {Object.keys(adaptive.values).length === 0 ? (
             <div style={{ color: C.dim2, fontSize: 11 }}>No adaptive thresholds reported yet.</div>
           ) : (
-            <div style={{ display: 'grid', gap: 6, fontSize: 10 }}>
+            <div style={{ display: 'grid', gap: 5, gridTemplateColumns: 'repeat(2, minmax(0, 1fr))', columnGap: 24, fontSize: 10 }}>
               {Object.entries(adaptive.values).map(([name, val]) => {
                 const range = adaptive.ranges?.[name] || { cold: val, mature: val };
-                const span = (range.mature - range.cold) || 1;
-                const pct = ((val - range.cold) / span) * 100;
+                const span2 = (range.mature - range.cold) || 1;
+                const pct = ((val - range.cold) / span2) * 100;
                 return (
-                  <div key={name} style={{ display: 'grid', gridTemplateColumns: '230px 50px 1fr 50px', gap: 8, alignItems: 'center' }}>
-                    <span style={{ color: C.text, fontFamily: 'monospace' }}>{name}</span>
-                    <span style={{ color: C.blue, textAlign: 'right' }}>{Number(range.cold).toFixed(2)}</span>
+                  <div key={name} style={{ display: 'grid', gridTemplateColumns: '210px 50px minmax(0, 1fr) 50px', gap: 8, alignItems: 'center', minWidth: 0 }}>
+                    <span style={{ color: C.text, fontFamily: 'monospace', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{name}</span>
+                    <span style={{ color: C.blue, textAlign: 'right', fontFamily: 'monospace' }}>{Number(range.cold).toFixed(2)}</span>
                     <ProgressBar value={pct} max={100} color={C.purple} height={5} sublabel={Number(val).toFixed(2)} />
-                    <span style={{ color: C.green, textAlign: 'right' }}>{Number(range.mature).toFixed(2)}</span>
+                    <span style={{ color: C.green, textAlign: 'right', fontFamily: 'monospace' }}>{Number(range.mature).toFixed(2)}</span>
                   </div>
                 );
               })}
@@ -1263,18 +1697,39 @@ const MLProgression = () => {
   );
 };
 
-const Panel = ({ title, children }) => (
-  <div style={{ background: C.panel2, border: `1px solid ${C.border}`, padding: 12, minWidth: 0 }}>
-    <SectionLabel>{title}</SectionLabel>
-    {children}
+// Panel: minWidth:0 lets long content wrap inside grid cells; overflow:hidden
+// prevents stray descriptions from leaking past the border. The optional
+// `info` prop attaches a "(?)" hover tooltip — keeps the panel visually
+// quiet while still surfacing context on demand.
+const Panel = ({ title, info, children, span }) => (
+  <div style={{
+    background: C.panel2, border: `1px solid ${C.border}`, padding: 12,
+    minWidth: 0, overflow: 'hidden', display: 'flex', flexDirection: 'column',
+    gridColumn: span ? `span ${span}` : undefined,
+  }}>
+    <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 10, paddingBottom: 6, borderBottom: `1px solid ${C.border}` }}>
+      <span style={{ ...S.label, flex: 1 }}>{title}</span>
+      {info && (
+        <span title={info} style={{
+          color: C.dim2, fontSize: 9, cursor: 'help',
+          border: `1px solid ${C.border2}`, borderRadius: '50%',
+          width: 13, height: 13, display: 'inline-flex', alignItems: 'center', justifyContent: 'center', lineHeight: 1,
+        }}>?</span>
+      )}
+    </div>
+    <div style={{ minWidth: 0, overflow: 'hidden' }}>{children}</div>
   </div>
 );
 
+// Fluid sparkline row — the sparkline expands with the container and the total
+// stays right-aligned without ever getting clipped.
 const SparkRow = ({ label, color, data, total }) => (
-  <div style={{ display: 'grid', gridTemplateColumns: '140px 1fr 70px', gap: 8, alignItems: 'center' }}>
-    <span style={{ color: C.dim2, fontSize: 11 }}>{label}</span>
-    <Sparkline data={data} color={color} width={200} height={20} />
-    <span style={{ color: color, textAlign: 'right', fontWeight: 700, fontSize: 13 }}>{total.toLocaleString()}</span>
+  <div style={{ display: 'grid', gridTemplateColumns: '120px minmax(0, 1fr) auto', gap: 8, alignItems: 'center', minWidth: 0 }}>
+    <span style={{ color: C.dim2, fontSize: 11, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{label}</span>
+    <Sparkline data={data} color={color} width={200} height={20} fluid />
+    <span style={{ color: color, textAlign: 'right', fontWeight: 700, fontSize: 13, whiteSpace: 'nowrap', fontFamily: 'monospace' }}>
+      {total.toLocaleString()}
+    </span>
   </div>
 );
 
@@ -1284,12 +1739,29 @@ const WalletGraph = () => {
   const wg     = snapshot?.wallet_graph || { nodes: [], edges: [], stats: {} };
   const stats  = wg.stats || {};
   const [selected, setSelected] = useStateT(null);
-  const [view, setView] = useStateT(() => localStorage.getItem('pmi_wg_view') || 'graph');
-  useEffectT(() => localStorage.setItem('pmi_wg_view', view), [view]);
+  // All persisted via usePersistedState so reload restores the user's filter
+  // and sort context. Only short-lived UI state (search box, hover, zoom/pan)
+  // stays in-memory.
+  const [view, setView]               = usePersistedState('wg.view', 'graph');
+  const [sortKey, setSortKey]         = usePersistedState('wg.sortKey', 'readiness');
+  const [sortDir, setSortDir]         = usePersistedState('wg.sortDir', 'desc');
+  const [search,  setSearch]          = useStateT('');
+  const [activeOnly, setActiveOnly]   = usePersistedState('wg.activeOnly', true);
 
-  const [sortKey, setSortKey] = useStateT('readiness');
-  const [sortDir, setSortDir] = useStateT('desc');
-  const [search,  setSearch]  = useStateT('');
+  // ── Graph interactivity state ────────────────────────────────────────────
+  // Zoom/pan/hover stay in-memory (intentionally non-persistent so reload
+  // resets the camera). Filter intent (phaseMin, confirmedOnly) IS persisted.
+  const [zoom, setZoom] = useStateT(1);
+  const [pan, setPan] = useStateT({ x: 0, y: 0 });
+  const [hover, setHover] = useStateT(null);          // {node, x, y} or null
+  const [graphSearch, setGraphSearch] = useStateT(''); // search inside graph view
+  const [phaseMin, setPhaseMin] = usePersistedState('wg.phaseMin', 1);
+  const [confirmedOnly, setConfirmedOnly] = usePersistedState('wg.confirmedOnly', false);
+  const isPanning = React.useRef(false);
+  const panStart = React.useRef(null);
+  const svgRef = React.useRef(null);
+  const resetView = () => { setZoom(1); setPan({ x: 0, y: 0 }); };
+  const clampZoom = (z) => Math.max(0.3, Math.min(4, z));
   const adaptive  = snapshot?.adaptive_thresholds?.values || {};
   const followMin = adaptive.FOLLOW_MIN_TRADES || 25;
   const fadeMin   = adaptive.FADE_MIN_RESOLVED || 25;
@@ -1300,8 +1772,21 @@ const WalletGraph = () => {
     const resolvedProgress = Math.min(1, (w.positions_resolved || 0) / fadeMin);
     const maturity = Math.max(0, Math.min(1, w.maturity || 0));
     const readiness = (tradesProgress * 0.4 + resolvedProgress * 0.4 + maturity * 0.2);
-    return { ...w, readiness };
+    return {
+      ...w, readiness,
+      _rb: {
+        trades:   tradesProgress * 0.4,
+        resolved: resolvedProgress * 0.4,
+        maturity: maturity * 0.2,
+      },
+    };
   }), [wallets, followMin, fadeMin]);
+
+  // Drop the Strategy column when every leader has the same classification.
+  const allSameStrategy = useMemoT(() => {
+    const set = new Set(enrichedWallets.map(w => w.classification).filter(Boolean));
+    return set.size <= 1;
+  }, [enrichedWallets]);
 
   const sortedWallets = useMemoT(() => {
     const arr = [...enrichedWallets];
@@ -1315,10 +1800,12 @@ const WalletGraph = () => {
     return arr;
   }, [enrichedWallets, sortKey, sortDir]);
 
-  const filteredWallets = useMemoT(() =>
-    search ? sortedWallets.filter(w => (w.id || '').toLowerCase().includes(search.toLowerCase())) : sortedWallets,
-    [sortedWallets, search]
-  );
+  const filteredWallets = useMemoT(() => {
+    let arr = sortedWallets;
+    if (activeOnly) arr = arr.filter(w => (w.trades_24h || 0) > 0 || (w.positions_resolved || 0) > 0);
+    if (search) arr = arr.filter(w => (w.id || '').toLowerCase().includes(search.toLowerCase()));
+    return arr;
+  }, [sortedWallets, search, activeOnly]);
 
   const setSort = (k) => {
     if (sortKey === k) setSortDir(sortDir === 'asc' ? 'desc' : 'asc');
@@ -1326,28 +1813,111 @@ const WalletGraph = () => {
   };
   const sortIndicator = (k) => sortKey === k ? (sortDir === 'asc' ? ' ↑' : ' ↓') : '';
 
-  // Layout — circular for leaders (outer ring), spiral for followers (inner).
-  // Deterministic so position doesn't jump between updates.
+  // Layout: leaders on outer ring, followers placed near the angular barycenter
+  // of the leaders they're connected to (so siblings cluster around their leader).
   const layout = useMemoT(() => {
-    const W = 720, H = 520, cx = W / 2, cy = H / 2;
+    const W = 820, H = 560, cx = W / 2, cy = H / 2;
     const positions = {};
+    const leaderAngle = {};
     const leaders   = wg.nodes.filter(n => n.role === 'leader');
     const followers = wg.nodes.filter(n => n.role === 'follower');
+
     leaders.forEach((n, i) => {
       const a = (i / Math.max(1, leaders.length)) * Math.PI * 2 - Math.PI / 2;
-      const r = 220;
+      leaderAngle[n.id] = a;
+      const r = 230;
       positions[n.id] = { x: cx + Math.cos(a) * r, y: cy + Math.sin(a) * r };
     });
+
     followers.forEach((n, i) => {
-      const a = (i / Math.max(1, followers.length)) * Math.PI * 2 + Math.PI / 4;
-      const r = 90 + (i % 4) * 18;
-      positions[n.id] = { x: cx + Math.cos(a) * r, y: cy + Math.sin(a) * r };
+      const connected = wg.edges
+        .filter(e => e.source === n.id || e.target === n.id)
+        .map(e => e.source === n.id ? e.target : e.source)
+        .filter(id => leaderAngle[id] !== undefined);
+      let a;
+      if (connected.length > 0) {
+        // Angular barycenter via vector sum (handles the −π/π wraparound correctly).
+        const sx = connected.reduce((s, id) => s + Math.cos(leaderAngle[id]), 0);
+        const sy = connected.reduce((s, id) => s + Math.sin(leaderAngle[id]), 0);
+        a = Math.atan2(sy, sx);
+      } else {
+        a = (i / Math.max(1, followers.length)) * Math.PI * 2;
+      }
+      const jitter = ((i % 9) - 4) * 0.05;
+      const r = 95 + (i % 5) * 20;
+      positions[n.id] = { x: cx + Math.cos(a + jitter) * r, y: cy + Math.sin(a + jitter) * r };
     });
-    return { positions, W, H };
-  }, [wg.nodes]);
+    return { positions, W, H, leaderAngle };
+  }, [wg.nodes, wg.edges]);
 
   const sel = selected ? wg.nodes.find(n => n.id === selected) : null;
   const selEdges = selected ? wg.edges.filter(e => e.source === selected || e.target === selected) : [];
+
+  // Cross-module nav listener: another tab can ask the graph to focus on a
+  // specific wallet via window.PoybotNav.selectWallet(addr). When that fires,
+  // switch to the graph view and select the node.
+  useEffectT(() => {
+    const handler = (e) => {
+      const w = e.detail?.wallet;
+      if (!w) return;
+      setSelected(w);
+      if (e.detail?.view === 'list') setView('list');
+      else setView('graph');
+    };
+    window.addEventListener('pmi:select-wallet', handler);
+    return () => window.removeEventListener('pmi:select-wallet', handler);
+  }, []);
+
+  // Publish current selection to the global nav context so the topbar
+  // breadcrumb can surface "wallet: 0xabc…" without prop drilling.
+  useEffectT(() => {
+    if (!selected) { window.PoybotNav?.clearContext?.(); return; }
+    window.PoybotNav?.setContext?.({
+      type: 'wallet',
+      id: selected,
+      label: selected.slice(0, 6) + '…' + selected.slice(-4),
+    });
+  }, [selected]);
+
+  // Per-wallet market drilldown — fetched lazily whenever selection changes.
+  // Cancellation guard via a ref-style closure: if the user clicks another
+  // node before the request lands, we drop the late response.
+  const [walletMarkets, setWalletMarkets] = useStateT(null);
+  const [walletMarketsLoading, setWalletMarketsLoading] = useStateT(false);
+  // Profile drill-down — separate fetch, separate state, fired in parallel.
+  const [walletProfile, setWalletProfile] = useStateT(null);
+  const [walletProfileLoading, setWalletProfileLoading] = useStateT(false);
+  useEffectT(() => {
+    if (!selected) { setWalletMarkets(null); setWalletProfile(null); return; }
+    let cancelled = false;
+    setWalletMarketsLoading(true);
+    setWalletProfileLoading(true);
+    const base = window.PoybotAPI?.getSettings?.()?.API_BASE || '';
+    fetch(`${base}/api/wallet/${selected}/markets?window_days=30&limit=15`)
+      .then(r => { if (!r.ok) throw new Error('HTTP ' + r.status); return r.json(); })
+      .then(d => { if (!cancelled) setWalletMarkets(d); })
+      .catch(e => { if (!cancelled) { console.warn('[WalletGraph] markets fetch failed', e.message); setWalletMarkets({ markets: [], category_breakdown: [], total_trades: 0, distinct_markets: 0, _error: true }); } })
+      .finally(() => { if (!cancelled) setWalletMarketsLoading(false); });
+    fetch(`${base}/api/wallet/${selected}/profile`)
+      .then(r => r.ok ? r.json() : Promise.reject('HTTP ' + r.status))
+      .then(d => { if (!cancelled) setWalletProfile(d); })
+      .catch(e => { if (!cancelled) { console.warn('[WalletGraph] profile fetch failed', e); setWalletProfile({ _error: true }); } })
+      .finally(() => { if (!cancelled) setWalletProfileLoading(false); });
+    return () => { cancelled = true; };
+  }, [selected]);
+
+  // Category filter (toolbar) — multi-select chips backed by the
+  // top_categories present in current leader nodes. Persisted so a deep
+  // analysis session survives reload.
+  const [categoryFilter, setCategoryFilter] = usePersistedState('wg.categoryFilter', []);
+  const availableCategories = useMemoT(() => {
+    const set = new Set();
+    wg.nodes.forEach(n => (n.top_categories || []).forEach(c => c.category && set.add(c.category)));
+    return Array.from(set).sort();
+  }, [wg.nodes]);
+  const toggleCategory = (c) => setCategoryFilter(prev =>
+    prev.includes(c) ? prev.filter(x => x !== c) : [...prev, c]
+  );
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', height: '100%', width: '100%', overflow: 'hidden' }}>
@@ -1372,11 +1942,19 @@ const WalletGraph = () => {
           }}>{label}</button>
         ))}
         {view === 'list' && (
-          <input value={search} onChange={e => setSearch(e.target.value)} placeholder="Filter by wallet…"
-            style={{ background: C.panel2, border: `1px solid ${C.border2}`, color: C.text, padding: '4px 10px', fontSize: 11, flex: 1, maxWidth: 280, outline: 'none', marginLeft: 8 }} />
+          <>
+            <button onClick={() => setActiveOnly(!activeOnly)} title="Show only wallets with 24h activity or resolved positions" style={{
+              background: activeOnly ? 'rgba(40,168,78,0.12)' : 'transparent',
+              border: `1px solid ${activeOnly ? C.green : C.border2}`,
+              color: activeOnly ? C.green : C.dim2,
+              padding: '3px 10px', fontSize: 10, cursor: 'pointer', marginLeft: 4, whiteSpace: 'nowrap',
+            }}>{activeOnly ? '● Active only' : '○ Show all'}</button>
+            <input value={search} onChange={e => setSearch(e.target.value)} placeholder="Filter by wallet…"
+              style={{ background: C.panel2, border: `1px solid ${C.border2}`, color: C.text, padding: '4px 10px', fontSize: 11, flex: 1, maxWidth: 280, outline: 'none', marginLeft: 8 }} />
+          </>
         )}
         <span style={{ fontSize: 10, color: C.dim2, marginLeft: 'auto' }}>
-          {view === 'list' ? `${filteredWallets.length} wallets` : `${stats.leaders ?? 0} leaders · ${stats.edges_total ?? 0} edges`}
+          {view === 'list' ? `${filteredWallets.length} / ${enrichedWallets.length} wallets` : `${stats.leaders ?? 0} leaders · ${stats.edges_total ?? 0} edges`}
         </span>
       </div>
 
@@ -1387,7 +1965,7 @@ const WalletGraph = () => {
               <tr>
                 <TH>Wallet</TH>
                 <TH>Phase</TH>
-                <TH>Strategy</TH>
+                {!allSameStrategy && <TH>Strategy</TH>}
                 <th style={{ ...S.label, fontWeight: 700, padding: '5px 10px', cursor: 'pointer', borderBottom: `1px solid ${C.border2}` }} onClick={() => setSort('falcon_score')}>Falcon{sortIndicator('falcon_score')}</th>
                 <th style={{ ...S.label, fontWeight: 700, padding: '5px 10px', cursor: 'pointer', borderBottom: `1px solid ${C.border2}` }} onClick={() => setSort('trades_24h')}>24h{sortIndicator('trades_24h')}</th>
                 <th style={{ ...S.label, fontWeight: 700, padding: '5px 10px', cursor: 'pointer', borderBottom: `1px solid ${C.border2}` }} onClick={() => setSort('trades_observed')}>Trades{sortIndicator('trades_observed')}</th>
@@ -1395,18 +1973,27 @@ const WalletGraph = () => {
                 <th style={{ ...S.label, fontWeight: 700, padding: '5px 10px', cursor: 'pointer', borderBottom: `1px solid ${C.border2}` }} onClick={() => setSort('win_rate')}>Win%{sortIndicator('win_rate')}</th>
                 <th style={{ ...S.label, fontWeight: 700, padding: '5px 10px', cursor: 'pointer', borderBottom: `1px solid ${C.border2}` }} onClick={() => setSort('pnl_total')}>PnL{sortIndicator('pnl_total')}</th>
                 <th style={{ ...S.label, fontWeight: 700, padding: '5px 10px', cursor: 'pointer', borderBottom: `1px solid ${C.border2}` }} onClick={() => setSort('readiness')}>Readiness{sortIndicator('readiness')}</th>
+                <TH>Top Categories (30d)</TH>
                 <TH>Last Action</TH>
               </tr>
             </thead>
             <tbody>
               {filteredWallets.length === 0 && (
-                <tr><td colSpan={11} style={{ padding: '24px', color: C.dim2, textAlign: 'center', fontSize: 11 }}>{snapshot ? 'No leader wallets profiled yet.' : 'Waiting for data…'}</td></tr>
+                <tr><td colSpan={allSameStrategy ? 11 : 12} style={{ padding: '24px', color: C.dim2, textAlign: 'center', fontSize: 11 }}>{snapshot ? (activeOnly ? 'No active leaders — toggle "Show all" to see the full registry.' : 'No leader wallets profiled yet.') : 'Waiting for data…'}</td></tr>
               )}
-              {filteredWallets.map((w) => (
+              {filteredWallets.map((w) => {
+                const cats = (w.top_categories || []).slice(0, 3);
+                const catTooltip = cats.length
+                  ? cats.map(c => `${c.category}: ${(c.pct * 100).toFixed(0)}% (${c.trades})`).join('\n')
+                  : 'No category data in last 30d';
+                const catLabel = cats.length === 0 ? '—'
+                  : cats.slice(0, 2).map(c => `${c.category} ${(c.pct * 100).toFixed(0)}%`).join(' · ')
+                    + (cats.length > 2 ? ` +${cats.length - 2}` : '');
+                return (
                 <tr key={w.id} style={{ cursor: 'pointer' }} onClick={() => { setSelected(w.id); setView('graph'); }}>
-                  <TD style={{ color: C.purple, fontFamily: 'monospace' }}>{w.label}</TD>
+                  <TD style={{ color: C.purple, fontFamily: 'monospace', whiteSpace: 'nowrap' }}>{w.label}</TD>
                   <TD><Badge type={w.phase >= 3 ? 'green' : w.phase === 2 ? 'amber' : 'blue'}>P{w.phase}</Badge></TD>
-                  <TD style={{ color: C.dim2 }}>{w.classification || '—'}</TD>
+                  {!allSameStrategy && <TD style={{ color: C.dim2 }}>{w.classification || '—'}</TD>}
                   <TD style={{ color: C.amber, fontFamily: 'monospace' }}>{(w.falcon_score || 0).toFixed(2)}</TD>
                   <TD style={{ color: w.trades_24h > 0 ? C.green : C.dim2, fontWeight: 600 }}>{w.trades_24h || 0}</TD>
                   <TD style={{ color: C.text }}>{w.trades_observed || 0}</TD>
@@ -1415,115 +2002,367 @@ const WalletGraph = () => {
                     {w.win_rate != null ? `${(w.win_rate * 100).toFixed(0)}%` : '—'}
                   </TD>
                   <TD style={{ color: pnlColor(w.pnl_total), fontWeight: 600 }}>{fmtPnl(w.pnl_total)}</TD>
-                  <TD style={{ minWidth: 120 }}><ScoreBar value={w.readiness || 0} /></TD>
+                  <TD style={{ minWidth: 120 }}>
+                    <span title={`trades (target ${followMin}): +${w._rb.trades.toFixed(2)} / 0.40\nresolved (target ${fadeMin}): +${w._rb.resolved.toFixed(2)} / 0.40\nmaturity: +${w._rb.maturity.toFixed(2)} / 0.20`}>
+                      <ScoreBar value={w.readiness || 0} />
+                    </span>
+                  </TD>
+                  <TD style={{ color: cats.length ? C.text : C.dim2, whiteSpace: 'nowrap', fontSize: 10, maxWidth: 240, overflow: 'hidden', textOverflow: 'ellipsis' }}>
+                    <span title={catTooltip}>{catLabel}</span>
+                  </TD>
                   <TD>{w.last_action ? <Badge type={actionType(w.last_action)}>{w.last_action}</Badge> : <span style={{ color: C.dim2 }}>—</span>}</TD>
                 </tr>
-              ))}
+                );
+              })}
             </tbody>
           </table>
         </div>
       ) : (
-      <div style={{ flex: 1, display: 'grid', gridTemplateColumns: 'minmax(0, 2fr) minmax(280px, 1fr)', overflow: 'hidden' }}>
+      <div style={{ flex: 1, display: 'grid', gridTemplateColumns: sel ? 'minmax(0, 2fr) minmax(280px, 1fr)' : '1fr', overflow: 'hidden' }}>
 
-        {/* Force-directed graph (circular layout SVG) */}
-        <div style={{ overflow: 'auto', borderRight: `1px solid ${C.border}`, padding: 14 }}>
+        {/* Graph SVG with zoom/pan/filter/search/hover */}
+        <div style={{ overflow: 'hidden', borderRight: sel ? `1px solid ${C.border}` : 'none', padding: 0, display: 'flex', flexDirection: 'column', position: 'relative' }}>
           {wg.nodes.length === 0 ? (
             <div style={{ color: C.dim2, fontSize: 11, padding: 40, textAlign: 'center' }}>
               {snapshot ? 'No leaders profiled yet — graph will populate as leaders accumulate trades.' : 'Waiting for data…'}
             </div>
           ) : (
-            <svg viewBox={`0 0 ${layout.W} ${layout.H}`} width="100%" style={{ display: 'block', maxHeight: '85vh' }}>
-              {/* Edges */}
-              {wg.edges.map((e, i) => {
-                const a = layout.positions[e.source];
-                const b = layout.positions[e.target];
-                if (!a || !b) return null;
-                const stroke = e.confirmed ? C.green : 'rgba(120,120,160,0.25)';
-                const opacity = e.confirmed ? 0.7 : 0.3;
-                return (
-                  <line
-                    key={i}
-                    x1={a.x} y1={a.y} x2={b.x} y2={b.y}
-                    stroke={stroke} strokeWidth={e.confirmed ? 1.5 : 0.6}
-                    opacity={opacity}
-                    strokeDasharray={e.confirmed ? '' : '2 2'}
-                  />
-                );
-              })}
-              {/* Nodes */}
-              {wg.nodes.map(n => {
-                const p = layout.positions[n.id];
-                if (!p) return null;
-                const r = n.role === 'leader' ? 8 + Math.min(8, (n.maturity || 0) * 12) : 4;
-                const phaseColor = n.phase === 3 ? C.green : n.phase === 2 ? C.amber : C.blue;
-                const fill = n.role === 'leader' ? phaseColor : C.purple;
-                const isSel = selected === n.id;
-                return (
-                  <g key={n.id} style={{ cursor: 'pointer' }} onClick={() => setSelected(isSel ? null : n.id)}>
-                    <circle cx={p.x} cy={p.y} r={r + (isSel ? 4 : 0)} fill={fill}
-                      stroke={isSel ? C.white : 'transparent'} strokeWidth={2} opacity={0.9} />
-                    {n.role === 'leader' && (
-                      <text x={p.x} y={p.y - r - 4} fill={C.dim2} fontSize="9"
-                        textAnchor="middle" fontFamily="monospace">{n.label}</text>
-                    )}
-                  </g>
-                );
-              })}
-            </svg>
-          )}
-
-          <div style={{ marginTop: 16, fontSize: 10, color: C.dim2, display: 'flex', gap: 16 }}>
-            <span><span style={{ color: C.blue }}>●</span> phase 1</span>
-            <span><span style={{ color: C.amber }}>●</span> phase 2</span>
-            <span><span style={{ color: C.green }}>●</span> phase 3</span>
-            <span><span style={{ color: C.purple }}>●</span> follower</span>
-            <span style={{ marginLeft: 'auto' }}>━ confirmed edge   ┄ pending</span>
-          </div>
-        </div>
-
-        {/* Inspector */}
-        <div style={{ overflow: 'auto', padding: 14, display: 'flex', flexDirection: 'column', gap: 10 }}>
-          {!sel ? (
-            <div style={{ color: C.dim2, fontSize: 11, textAlign: 'center', paddingTop: 40 }}>
-              Click a node to inspect.
-            </div>
-          ) : (
             <>
-              <SectionLabel>{sel.role === 'leader' ? 'Leader' : 'Follower'} · {sel.label}</SectionLabel>
-              <div style={{ fontFamily: 'monospace', fontSize: 10, color: C.dim2, wordBreak: 'break-all' }}>{sel.id}</div>
-
-              <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 6, marginTop: 8 }}>
-                <Stat l="Falcon Score" v={(sel.falcon_score || 0).toFixed(3)} c={C.amber} />
-                <Stat l="Phase" v={`P${sel.phase}`} c={sel.phase === 3 ? C.green : sel.phase === 2 ? C.amber : C.blue} />
-                <Stat l="Maturity" v={(sel.maturity || 0).toFixed(3)} c={C.purple} />
-                <Stat l="Trades" v={(sel.trades_observed || 0).toLocaleString()} c={C.text} />
-                <Stat l="Resolved" v={(sel.positions_resolved || 0)} c={C.green} />
-                <Stat l="Strategy" v={sel.classification || '—'} c={C.blue} />
+              {/* Toolbar */}
+              <div style={{ position: 'absolute', top: 8, left: 8, right: 8, zIndex: 5, display: 'flex', gap: 6, flexWrap: 'wrap', alignItems: 'center', pointerEvents: 'none' }}>
+                <div style={{ display: 'flex', gap: 4, pointerEvents: 'auto' }}>
+                  <button onClick={() => setZoom(z => clampZoom(z * 1.25))} title="Zoom in"
+                    style={{ background: C.panel, border: `1px solid ${C.border2}`, color: C.text, padding: '3px 9px', fontSize: 12, cursor: 'pointer', fontFamily: 'monospace' }}>+</button>
+                  <button onClick={() => setZoom(z => clampZoom(z / 1.25))} title="Zoom out"
+                    style={{ background: C.panel, border: `1px solid ${C.border2}`, color: C.text, padding: '3px 9px', fontSize: 12, cursor: 'pointer', fontFamily: 'monospace' }}>−</button>
+                  <button onClick={resetView} title="Reset view (1:1)"
+                    style={{ background: C.panel, border: `1px solid ${C.border2}`, color: C.dim2, padding: '3px 9px', fontSize: 10, cursor: 'pointer' }}>⟳</button>
+                  <span style={{ color: C.dim2, fontSize: 10, alignSelf: 'center', marginLeft: 4, fontFamily: 'monospace' }}>{(zoom * 100).toFixed(0)}%</span>
+                </div>
+                <div style={{ display: 'flex', gap: 4, pointerEvents: 'auto' }}>
+                  {[1, 2, 3].map(p => (
+                    <button key={p} onClick={() => setPhaseMin(p)} title={`Show only Phase ≥ ${p}`}
+                      style={{
+                        background: phaseMin === p ? 'rgba(120,85,192,0.18)' : C.panel,
+                        border: `1px solid ${phaseMin === p ? C.purple : C.border2}`,
+                        color: phaseMin === p ? C.purple : C.dim2,
+                        padding: '3px 8px', fontSize: 10, cursor: 'pointer',
+                      }}>P≥{p}</button>
+                  ))}
+                  <button onClick={() => setConfirmedOnly(!confirmedOnly)} title="Show only confirmed edges"
+                    style={{
+                      background: confirmedOnly ? 'rgba(40,168,78,0.15)' : C.panel,
+                      border: `1px solid ${confirmedOnly ? C.green : C.border2}`,
+                      color: confirmedOnly ? C.green : C.dim2,
+                      padding: '3px 8px', fontSize: 10, cursor: 'pointer',
+                    }}>{confirmedOnly ? '✓ confirmed' : '○ all edges'}</button>
+                </div>
+                {availableCategories.length > 0 && (
+                  <div style={{ display: 'flex', gap: 3, pointerEvents: 'auto', flexWrap: 'wrap', maxWidth: 360 }}>
+                    {availableCategories.map(cat => {
+                      const active = categoryFilter.includes(cat);
+                      return (
+                        <button key={cat} onClick={() => toggleCategory(cat)}
+                          title={`Toggle ${cat} filter`}
+                          style={{
+                            background: active ? 'rgba(61,125,200,0.18)' : C.panel,
+                            border: `1px solid ${active ? C.blue : C.border2}`,
+                            color: active ? C.blue : C.dim2,
+                            padding: '3px 7px', fontSize: 9, cursor: 'pointer',
+                            textTransform: 'lowercase',
+                          }}>{cat}</button>
+                      );
+                    })}
+                    {categoryFilter.length > 0 && (
+                      <button onClick={() => setCategoryFilter([])} title="Clear category filter"
+                        style={{ background: 'transparent', border: 'none', color: C.dim2, fontSize: 9, cursor: 'pointer', padding: '3px 4px' }}>
+                        ✕ clear
+                      </button>
+                    )}
+                  </div>
+                )}
+                <input value={graphSearch} onChange={e => setGraphSearch(e.target.value)} placeholder="Search wallet…"
+                  style={{ background: C.panel2, border: `1px solid ${C.border2}`, color: C.text, padding: '3px 8px', fontSize: 10, width: 150, outline: 'none', pointerEvents: 'auto', fontFamily: 'monospace' }} />
+                <span style={{ color: C.dim2, fontSize: 9, marginLeft: 'auto', alignSelf: 'center', pointerEvents: 'none' }}>
+                  scroll = zoom · drag = pan · click = inspect
+                </span>
               </div>
 
-              <SectionLabel mb={6}>Edges ({selEdges.length})</SectionLabel>
-              {selEdges.length === 0 ? (
-                <div style={{ color: C.dim2, fontSize: 11 }}>No edges.</div>
-              ) : (
-                <div style={{ display: 'grid', gap: 4, fontSize: 10 }}>
-                  {selEdges.map((e, i) => (
-                    <div key={i} style={{ background: C.panel, padding: '6px 8px', borderLeft: `2px solid ${e.confirmed ? C.green : C.dim}` }}>
-                      <div style={{ color: C.text, fontFamily: 'monospace', overflow: 'hidden', textOverflow: 'ellipsis' }}>
-                        {short(e.source === sel.id ? e.target : e.source)}
-                      </div>
-                      <div style={{ display: 'flex', gap: 8, marginTop: 2, color: C.dim2 }}>
-                        <span>p={e.p_follow?.toFixed(2)}</span>
-                        <span>α/μ={e.hawkes_alpha_mu != null ? e.hawkes_alpha_mu.toFixed(2) : '—'}</span>
-                        <span>{e.delay_s != null ? `${Math.round(e.delay_s)}s` : '—'}</span>
-                        <span style={{ marginLeft: 'auto' }}>{e.co_occurrences} obs</span>
-                      </div>
-                    </div>
-                  ))}
+              <svg
+                ref={svgRef}
+                viewBox={`0 0 ${layout.W} ${layout.H}`}
+                width="100%"
+                preserveAspectRatio="xMidYMid meet"
+                style={{ display: 'block', flex: 1, minHeight: 0, cursor: isPanning.current ? 'grabbing' : 'grab', touchAction: 'none' }}
+                onWheel={(e) => {
+                  e.preventDefault();
+                  const delta = e.deltaY < 0 ? 1.12 : 1 / 1.12;
+                  setZoom(z => clampZoom(z * delta));
+                }}
+                onMouseDown={(e) => {
+                  if (e.button !== 0) return;
+                  // Don't pan when clicking on a node (handled in node onClick).
+                  if (e.target && e.target.tagName === 'circle') return;
+                  isPanning.current = true;
+                  panStart.current = { x: e.clientX, y: e.clientY, panX: pan.x, panY: pan.y };
+                }}
+                onMouseMove={(e) => {
+                  if (!isPanning.current || !panStart.current || !svgRef.current) return;
+                  const rect = svgRef.current.getBoundingClientRect();
+                  const scale = layout.W / rect.width;  // viewBox units per CSS pixel
+                  setPan({
+                    x: panStart.current.panX + (e.clientX - panStart.current.x) * scale / zoom,
+                    y: panStart.current.panY + (e.clientY - panStart.current.y) * scale / zoom,
+                  });
+                }}
+                onMouseUp={() => { isPanning.current = false; panStart.current = null; }}
+                onMouseLeave={() => { isPanning.current = false; panStart.current = null; setHover(null); }}
+              >
+                <g transform={`translate(${layout.W / 2} ${layout.H / 2}) scale(${zoom}) translate(${-layout.W / 2 + pan.x} ${-layout.H / 2 + pan.y})`}>
+                  {/* Edges (filtered) */}
+                  {wg.edges.map((e, i) => {
+                    if (confirmedOnly && !e.confirmed) return null;
+                    const a = layout.positions[e.source];
+                    const b = layout.positions[e.target];
+                    if (!a || !b) return null;
+                    // Apply phase filter via the source-leader (target may be follower).
+                    const sourceNode = wg.nodes.find(n => n.id === e.source);
+                    if (sourceNode?.role === 'leader' && (sourceNode.phase || 1) < phaseMin) return null;
+                    // Search highlight: dim non-matching edges.
+                    const matchesSearch = !graphSearch || (e.source + e.target).toLowerCase().includes(graphSearch.toLowerCase());
+                    const stroke = e.confirmed ? C.green : 'rgba(140,140,180,0.55)';
+                    return (
+                      <line
+                        key={i}
+                        x1={a.x} y1={a.y} x2={b.x} y2={b.y}
+                        stroke={stroke}
+                        strokeWidth={(e.confirmed ? 2 : 0.9) / Math.max(0.5, zoom)}
+                        opacity={(matchesSearch ? (e.confirmed ? 0.9 : 0.55) : 0.1)}
+                        strokeDasharray={e.confirmed ? '' : `${3 / zoom} ${2 / zoom}`}
+                      />
+                    );
+                  })}
+                  {/* Nodes (filtered) */}
+                  {wg.nodes.map(n => {
+                    const p = layout.positions[n.id];
+                    if (!p) return null;
+                    // Phase filter — only filters leaders, followers stay visible.
+                    if (n.role === 'leader' && (n.phase || 1) < phaseMin) return null;
+                    // Category filter — leaders whose top categories don't intersect get dimmed/hidden.
+                    if (categoryFilter.length && n.role === 'leader') {
+                      const cats = (n.top_categories || []).map(c => c.category);
+                      if (!cats.some(c => categoryFilter.includes(c))) return null;
+                    }
+                    const activitySize = (n.trades_24h || 0) > 0
+                      ? Math.sqrt(n.trades_24h) * 1.7
+                      : (n.maturity || 0) * 8;
+                    const r = n.role === 'leader' ? 7 + Math.min(11, activitySize) : 4;
+                    const phaseColor = n.phase === 3 ? C.green : n.phase === 2 ? C.amber : C.blue;
+                    const fill = n.role === 'leader' ? phaseColor : C.purple;
+                    const isSel = selected === n.id;
+                    // Search match: dim non-matching nodes; keep selected always full opacity.
+                    const matchesSearch = !graphSearch || n.id.toLowerCase().includes(graphSearch.toLowerCase());
+                    const opacity = isSel || matchesSearch ? 0.95 : 0.18;
+                    // Auto-hide labels at low zoom unless leader is interesting (Phase ≥2 / active / selected / hover / search match).
+                    const isInteresting = n.role === 'leader' && (
+                      (n.phase || 1) >= 2 || (n.trades_24h || 0) > 0 || isSel || hover?.node?.id === n.id || (graphSearch && matchesSearch)
+                    );
+                    const showLabel = isInteresting && zoom > 0.55;
+                    const ang = layout.leaderAngle[n.id];
+                    let lx = p.x, ly = p.y - r - 5, anchor = 'middle';
+                    if (showLabel && ang !== undefined) {
+                      lx = p.x + Math.cos(ang) * (r + 12);
+                      ly = p.y + Math.sin(ang) * (r + 12) + 3;
+                      anchor = Math.cos(ang) < -0.3 ? 'end' : Math.cos(ang) > 0.3 ? 'start' : 'middle';
+                    }
+                    return (
+                      <g key={n.id} style={{ cursor: 'pointer' }}
+                         onClick={(e) => { e.stopPropagation(); setSelected(isSel ? null : n.id); }}
+                         onMouseEnter={(e) => {
+                           if (!svgRef.current) return;
+                           const rect = svgRef.current.getBoundingClientRect();
+                           const scale = rect.width / layout.W;
+                           // Convert SVG-space (p.x,p.y) → CSS px relative to container.
+                           const tx = (p.x + pan.x - layout.W / 2) * zoom + layout.W / 2;
+                           const ty = (p.y + pan.y - layout.H / 2) * zoom + layout.H / 2;
+                           setHover({ node: n, x: tx * scale, y: ty * scale });
+                         }}
+                         onMouseLeave={() => setHover(null)}
+                      >
+                        <circle cx={p.x} cy={p.y} r={(r + (isSel ? 4 : 0)) / Math.max(0.7, zoom * 0.85)}
+                          fill={fill}
+                          stroke={isSel ? C.white : (hover?.node?.id === n.id ? C.text : 'transparent')}
+                          strokeWidth={2 / Math.max(0.5, zoom)}
+                          opacity={opacity} />
+                        {showLabel && (
+                          <text x={lx} y={ly} fill={isSel ? C.white : C.dim2}
+                            fontSize={9 / Math.max(0.6, zoom * 0.7)}
+                            textAnchor={anchor} fontFamily="monospace" opacity={opacity}>
+                            {n.label}
+                          </text>
+                        )}
+                      </g>
+                    );
+                  })}
+                </g>
+              </svg>
+
+              {/* Hover tooltip — positioned in CSS-px overlay */}
+              {hover && hover.node && (
+                <div style={{
+                  position: 'absolute',
+                  left: Math.min(Math.max(hover.x + 14, 8), 300),
+                  top: Math.min(Math.max(hover.y - 10, 8), 600),
+                  background: C.panel,
+                  border: `1px solid ${C.border2}`,
+                  padding: '6px 10px',
+                  fontSize: 10,
+                  pointerEvents: 'none',
+                  zIndex: 10,
+                  minWidth: 180,
+                  fontFamily: 'monospace',
+                }}>
+                  <div style={{ color: C.text, fontWeight: 600 }}>{hover.node.label}</div>
+                  <div style={{ color: C.dim2, marginTop: 3, display: 'grid', gap: 2 }}>
+                    <div>{hover.node.role === 'leader' ? `Leader · P${hover.node.phase}` : 'Follower'}</div>
+                    {hover.node.role === 'leader' && (
+                      <>
+                        <div>Falcon <span style={{ color: C.amber }}>{(hover.node.falcon_score || 0).toFixed(2)}</span> · Mat <span style={{ color: C.purple }}>{(hover.node.maturity || 0).toFixed(2)}</span></div>
+                        <div>{hover.node.trades_observed || 0} trades · {hover.node.positions_resolved || 0} resolved</div>
+                        <div style={{ color: hover.node.trades_24h > 0 ? C.green : C.dim2 }}>{hover.node.trades_24h || 0} trades 24h</div>
+                        {hover.node.top_categories && hover.node.top_categories.length > 0 && (
+                          <div style={{ color: C.blue, fontSize: 9 }}>
+                            {hover.node.top_categories.slice(0, 2).map(c => `${c.category} ${(c.pct * 100).toFixed(0)}%`).join(' · ')}
+                          </div>
+                        )}
+                      </>
+                    )}
+                    <div style={{ color: C.dim2, fontSize: 9, marginTop: 2 }}>click to inspect</div>
+                  </div>
                 </div>
               )}
             </>
           )}
+
+          <div style={{ padding: '6px 10px', fontSize: 10, color: C.dim2, display: 'flex', gap: 14, flexWrap: 'wrap', flexShrink: 0, borderTop: `1px solid ${C.border}`, background: C.panel }}>
+            <span><span style={{ color: C.blue }}>●</span> phase 1</span>
+            <span><span style={{ color: C.amber }}>●</span> phase 2</span>
+            <span><span style={{ color: C.green }}>●</span> phase 3</span>
+            <span><span style={{ color: C.purple }}>●</span> follower</span>
+            <span style={{ color: C.dim2, fontStyle: 'italic' }}>node size = 24h activity</span>
+            <span style={{ marginLeft: 'auto' }}>━ confirmed edge   ┄ pending</span>
+          </div>
         </div>
+
+        {/* Inspector — only render when a node is selected (otherwise the graph
+            takes the full width). */}
+        {sel && (
+          <div style={{ overflow: 'auto', padding: 14, display: 'flex', flexDirection: 'column', gap: 10 }}>
+            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8 }}>
+              <SectionLabel>{sel.role === 'leader' ? 'Leader' : 'Follower'} · {sel.label}</SectionLabel>
+              <button onClick={() => setSelected(null)} title="Close inspector"
+                style={{ background: 'transparent', border: `1px solid ${C.border2}`, color: C.dim2, fontSize: 11, padding: '1px 8px', cursor: 'pointer', lineHeight: 1.4 }}>✕</button>
+            </div>
+            <div style={{ fontFamily: 'monospace', fontSize: 10, color: C.dim2, wordBreak: 'break-all' }}>{sel.id}</div>
+
+            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 6, marginTop: 8 }}>
+              <Stat l="Falcon Score" v={(sel.falcon_score || 0).toFixed(3)} c={C.amber} />
+              <Stat l="Phase" v={`P${sel.phase}`} c={sel.phase === 3 ? C.green : sel.phase === 2 ? C.amber : C.blue} />
+              <Stat l="Maturity" v={(sel.maturity || 0).toFixed(3)} c={C.purple} />
+              <Stat l="Trades" v={(sel.trades_observed || 0).toLocaleString()} c={C.text} />
+              <Stat l="Resolved" v={(sel.positions_resolved || 0)} c={C.green} />
+              <Stat l="Strategy" v={sel.classification || '—'} c={C.blue} />
+            </div>
+
+            {/* Profile drilldown — Dirichlet categories, Beta accuracy, sizing,
+                wallet360 highlights. Lazy-loaded; collapsible to keep the
+                drawer scannable. */}
+            <WalletProfileSection
+              loading={walletProfileLoading}
+              profile={walletProfile}
+            />
+
+            <SectionLabel mb={6}>Edges ({selEdges.length})</SectionLabel>
+            {selEdges.length === 0 ? (
+              <div style={{ color: C.dim2, fontSize: 11 }}>No edges.</div>
+            ) : (
+              <div style={{ display: 'grid', gap: 4, fontSize: 10 }}>
+                {selEdges.map((e, i) => (
+                  <div key={i} style={{ background: C.panel, padding: '6px 8px', borderLeft: `2px solid ${e.confirmed ? C.green : C.dim}` }}>
+                    <div style={{ color: C.text, fontFamily: 'monospace', overflow: 'hidden', textOverflow: 'ellipsis' }}>
+                      {short(e.source === sel.id ? e.target : e.source)}
+                    </div>
+                    <div style={{ display: 'flex', gap: 8, marginTop: 2, color: C.dim2 }}>
+                      <span>p={e.p_follow?.toFixed(2)}</span>
+                      <span>α/μ={e.hawkes_alpha_mu != null ? e.hawkes_alpha_mu.toFixed(2) : '—'}</span>
+                      <span>{e.delay_s != null ? `${Math.round(e.delay_s)}s` : '—'}</span>
+                      <span style={{ marginLeft: 'auto' }}>{e.co_occurrences} obs</span>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
+
+            {/* Markets traded by this wallet (last 30 days). Lazily fetched
+                from /api/wallet/{addr}/markets on selection. */}
+            <SectionLabel mb={6}>
+              Markets traded (30d)
+              {walletMarkets && (
+                <span style={{ color: C.dim2, fontWeight: 400, marginLeft: 6, textTransform: 'none', letterSpacing: 0 }}>
+                  · {walletMarkets.distinct_markets || 0} distinct · {walletMarkets.total_trades || 0} trades
+                </span>
+              )}
+            </SectionLabel>
+            {walletMarketsLoading && !walletMarkets ? (
+              <div style={{ color: C.dim2, fontSize: 11 }}>Loading…</div>
+            ) : !walletMarkets || walletMarkets._error ? (
+              <div style={{ color: walletMarkets?._error ? C.red : C.dim2, fontSize: 11 }}>
+                {walletMarkets?._error ? 'Failed to load markets.' : 'No data.'}
+              </div>
+            ) : (walletMarkets.markets || []).length === 0 ? (
+              <div style={{ color: C.dim2, fontSize: 11 }}>No markets traded in the last 30 days.</div>
+            ) : (
+              <>
+                {/* Category breakdown summary */}
+                {(walletMarkets.category_breakdown || []).length > 0 && (
+                  <div style={{ display: 'flex', flexWrap: 'wrap', gap: 4, marginBottom: 6 }}>
+                    {walletMarkets.category_breakdown.slice(0, 5).map(cb => (
+                      <span key={cb.category}
+                        title={`${cb.trades} trades · $${(cb.volume_usdc || 0).toFixed(0)} volume`}
+                        style={{ background: C.panel, padding: '2px 6px', fontSize: 9, color: C.dim2, border: `1px solid ${C.border2}` }}>
+                        {cb.category} <span style={{ color: C.amber, fontWeight: 600 }}>{(cb.pct * 100).toFixed(0)}%</span>
+                      </span>
+                    ))}
+                  </div>
+                )}
+                {/* Top markets table */}
+                <div style={{ display: 'grid', gap: 3, fontSize: 10, maxHeight: 280, overflowY: 'auto' }}>
+                  {walletMarkets.markets.map(m => {
+                    const isExpired = m.end_date_iso && new Date(m.end_date_iso) < new Date();
+                    return (
+                      <div key={m.market_id}
+                        style={{ background: C.panel, padding: '5px 7px', borderLeft: `2px solid ${m.pnl_usdc > 0 ? C.green : m.pnl_usdc < 0 ? C.red : C.border2}` }}
+                        title={m.market_id}>
+                        <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                          <span style={{ color: C.text, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', flex: 1 }}>{m.question}</span>
+                          {isExpired && <span style={{ fontSize: 8, color: C.dim2, fontStyle: 'italic' }}>resolved</span>}
+                        </div>
+                        <div style={{ display: 'flex', gap: 8, marginTop: 2, color: C.dim2, fontSize: 9 }}>
+                          <span style={{ color: C.blue }}>{m.category}</span>
+                          <span>{m.n_trades} trades ({m.n_buys}b / {m.n_sells}s)</span>
+                          <span>${(m.volume_usdc || 0).toFixed(0)}</span>
+                          {m.resolved_positions > 0 && (
+                            <span style={{ marginLeft: 'auto', color: pnlColor(m.pnl_usdc), fontWeight: 600 }}>{fmtPnl(m.pnl_usdc)}</span>
+                          )}
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              </>
+            )}
+          </div>
+        )}
       </div>
       )}
     </div>
@@ -1537,6 +2376,166 @@ const Stat = ({ l, v, c }) => (
   </div>
 );
 
+// ── WalletProfileSection ─────────────────────────────────────────────────
+// Renders the rich profile drilldown returned by /api/wallet/{addr}/profile
+// inside the Wallet Graph inspector drawer. Three collapsible sub-sections:
+// behavioural (categories + sizing + entry), accuracy (overall + by_category),
+// wallet360 (Falcon highlights). Designed for narrow ~360px drawer.
+const WalletProfileSection = ({ loading, profile }) => {
+  const [open, setOpen] = useStateT({ behaviour: true, accuracy: true, w360: false });
+  const toggle = (k) => setOpen(o => ({ ...o, [k]: !o[k] }));
+
+  if (loading && !profile) {
+    return (
+      <>
+        <SectionLabel mb={6}>Profile</SectionLabel>
+        <div style={{ color: C.dim2, fontSize: 11 }}>Loading profile…</div>
+      </>
+    );
+  }
+  if (!profile || profile._error) {
+    return (
+      <>
+        <SectionLabel mb={6}>Profile</SectionLabel>
+        <div style={{ color: profile?._error ? C.red : C.dim2, fontSize: 11 }}>
+          {profile?._error ? 'Profile unavailable for this wallet.' : '—'}
+        </div>
+      </>
+    );
+  }
+
+  const cats = profile.preferred_categories || [];
+  const acc = profile.accuracy || { by_category: [] };
+  const sizing = profile.sizing || {};
+  const entry = profile.entry_patterns || {};
+  const w360 = profile.wallet360 || {};
+  const dec = profile.decisions_30d || {};
+  const edges = profile.edges || {};
+
+  const SubHeader = ({ k, title, count }) => (
+    <div onClick={() => toggle(k)} style={{
+      cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 6,
+      padding: '4px 6px', background: C.panel, marginBottom: 3,
+      transition: 'background 100ms',
+    }}
+      onMouseEnter={e => e.currentTarget.style.background = C.panel2}
+      onMouseLeave={e => e.currentTarget.style.background = C.panel}
+    >
+      <span style={{ color: C.dim2, fontSize: 9, width: 8 }}>{open[k] ? '▾' : '▸'}</span>
+      <span style={{ ...S.label, fontSize: 9, flex: 1 }}>{title}</span>
+      {count != null && <span style={{ color: C.dim2, fontSize: 9, fontFamily: 'monospace' }}>{count}</span>}
+    </div>
+  );
+
+  return (
+    <>
+      <SectionLabel mb={6}>
+        Profile
+        <span style={{ color: C.dim2, fontWeight: 400, marginLeft: 6, textTransform: 'none', letterSpacing: 0, fontSize: 9 }}>
+          · {edges.confirmed_followers || 0} confirmed followers · {dec.total || 0} decisions 30d
+        </span>
+      </SectionLabel>
+
+      {/* Behavioural — categories, sizing, entry */}
+      <SubHeader k="behaviour" title="Behavioural" count={cats.length ? `${cats.length} cats` : null} />
+      {open.behaviour && (
+        <div style={{ display: 'grid', gap: 8, fontSize: 10, marginBottom: 8 }}>
+          {/* Preferred categories — Dirichlet */}
+          {cats.length > 0 ? (
+            <div style={{ display: 'grid', gap: 3 }}>
+              {cats.map(c => (
+                <div key={c.category} style={{ display: 'grid', gridTemplateColumns: '70px 1fr 36px', gap: 6, alignItems: 'center' }}>
+                  <span style={{ color: C.blue, fontSize: 9, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{c.category}</span>
+                  <div style={{ height: 4, background: 'rgba(255,255,255,0.05)' }}>
+                    <div style={{ width: `${c.pct * 100}%`, height: '100%', background: C.blue }} />
+                  </div>
+                  <span style={{ color: C.text, fontSize: 9, fontFamily: 'monospace', textAlign: 'right' }}>{(c.pct * 100).toFixed(0)}%</span>
+                </div>
+              ))}
+            </div>
+          ) : (
+            <div style={{ color: C.dim2, fontSize: 10 }}>No category data yet (Dirichlet uninformed).</div>
+          )}
+          {/* Sizing + entry */}
+          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 6, paddingTop: 6, borderTop: `1px solid ${C.border}` }}>
+            <div>
+              <div style={{ ...S.label, fontSize: 8 }}>Avg size</div>
+              <div style={{ color: C.text, fontFamily: 'monospace', fontSize: 11 }}>{sizing.avg_size_usdc != null ? `$${sizing.avg_size_usdc.toFixed(0)}` : '—'}</div>
+            </div>
+            <div>
+              <div style={{ ...S.label, fontSize: 8 }}>EWMA size</div>
+              <div style={{ color: C.text, fontFamily: 'monospace', fontSize: 11 }}>{sizing.ewma_size_usdc != null ? `$${sizing.ewma_size_usdc.toFixed(0)}` : '—'}</div>
+            </div>
+            <div>
+              <div style={{ ...S.label, fontSize: 8 }}>Contrarian rate</div>
+              <div style={{ color: C.amber, fontFamily: 'monospace', fontSize: 11 }}>{entry.contrarian_rate != null ? `${(entry.contrarian_rate * 100).toFixed(0)}%` : '—'}</div>
+            </div>
+            <div>
+              <div style={{ ...S.label, fontSize: 8 }}>Momentum rate</div>
+              <div style={{ color: C.blue, fontFamily: 'monospace', fontSize: 11 }}>{entry.momentum_rate != null ? `${(entry.momentum_rate * 100).toFixed(0)}%` : '—'}</div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Accuracy — overall + by_category Beta posteriors */}
+      <SubHeader k="accuracy" title="Accuracy" count={acc.resolved_count ? `${acc.resolved_count} resolved` : null} />
+      {open.accuracy && (
+        <div style={{ marginBottom: 8 }}>
+          {acc.overall != null && (
+            <div style={{ marginBottom: 6, display: 'flex', alignItems: 'baseline', gap: 6 }}>
+              <span style={{ ...S.label, fontSize: 9, flex: 1 }}>Overall</span>
+              <span style={{ color: acc.overall >= 0.55 ? C.green : acc.overall >= 0.45 ? C.amber : C.red, fontSize: 13, fontWeight: 700, fontFamily: 'monospace' }}>
+                {(acc.overall * 100).toFixed(1)}%
+              </span>
+            </div>
+          )}
+          {acc.by_category && acc.by_category.length > 0 ? (
+            <div style={{ display: 'grid', gap: 3, fontSize: 10 }}>
+              {acc.by_category.slice(0, 6).map(a => (
+                <div key={a.category}
+                  title={`Beta(${a.beta_a.toFixed(1)}, ${a.beta_b.toFixed(1)}) · ${a.wins}W / ${a.losses}L`}
+                  style={{ display: 'grid', gridTemplateColumns: '70px 1fr 50px', gap: 6, alignItems: 'center' }}>
+                  <span style={{ color: C.dim2, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', fontSize: 9 }}>{a.category}</span>
+                  <div style={{ height: 4, background: 'rgba(255,255,255,0.05)' }}>
+                    <div style={{ width: `${(a.win_rate || 0) * 100}%`, height: '100%', background: a.win_rate >= 0.55 ? C.green : a.win_rate >= 0.45 ? C.amber : C.red }} />
+                  </div>
+                  <span style={{ color: C.text, fontFamily: 'monospace', textAlign: 'right', fontSize: 9 }}>
+                    {a.win_rate != null ? `${(a.win_rate * 100).toFixed(0)}%` : '—'} <span style={{ color: C.dim2 }}>({a.n})</span>
+                  </span>
+                </div>
+              ))}
+            </div>
+          ) : (
+            <div style={{ color: C.dim2, fontSize: 10 }}>No resolved positions in any category yet.</div>
+          )}
+        </div>
+      )}
+
+      {/* Wallet 360 — Falcon highlights */}
+      <SubHeader k="w360" title="Wallet 360 (Falcon)" count={Object.keys(w360).length ? `${Object.keys(w360).length} fields` : null} />
+      {open.w360 && (
+        <div style={{ marginBottom: 8 }}>
+          {Object.keys(w360).length === 0 ? (
+            <div style={{ color: C.dim2, fontSize: 10 }}>Falcon wallet360 not populated for this wallet.</div>
+          ) : (
+            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 4, fontSize: 10 }}>
+              {Object.entries(w360).map(([k, v]) => (
+                <div key={k} style={{ display: 'flex', justifyContent: 'space-between', gap: 4, background: C.panel, padding: '3px 6px' }}>
+                  <span style={{ color: C.dim2, fontSize: 9, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{k}</span>
+                  <span style={{ color: C.text, fontFamily: 'monospace', fontSize: 9, whiteSpace: 'nowrap' }}>
+                    {typeof v === 'number' ? (Math.abs(v) < 1 ? v.toFixed(3) : v.toFixed(2)) : (typeof v === 'boolean' ? (v ? '✓' : '✗') : String(v).slice(0, 18))}
+                  </span>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
+    </>
+  );
+};
+
 // ─── INSPECTOR ────────────────────────────────────────────────────────────────
 // Pipeline observability tab — surfaces what the server is actually
 // receiving and what it's deciding, so operators can debug attribution
@@ -1544,9 +2543,9 @@ const Stat = ({ l, v, c }) => (
 const Inspector = () => {
   const { connectionState } = useLiveStore();
   const [snap, setSnap] = useStateT(null);
-  const [filter, setFilter] = useStateT('all');     // all | leader | non-leader
-  const [sourceFilter, setSourceFilter] = useStateT('all');
-  const [autoRefresh, setAutoRefresh] = useStateT(true);
+  const [filter, setFilter] = usePersistedState('insp.filter', 'all');     // all | leader | non-leader
+  const [sourceFilter, setSourceFilter] = usePersistedState('insp.source', 'all');
+  const [autoRefresh, setAutoRefresh] = usePersistedState('insp.autoRefresh', true);
   const [lastFetched, setLastFetched] = useStateT(null);
 
   const refresh = async () => {
@@ -1644,7 +2643,13 @@ const Inspector = () => {
                 {filteredTrades.map((t) => (
                   <tr key={t.id}>
                     <TD style={{ color: C.dim2 }}>{t.time ? new Date(t.time).toLocaleTimeString('en-GB') : '—'}</TD>
-                    <TD style={{ color: t.is_leader ? C.amber : C.dim2 }}>{short(t.wallet_address)}</TD>
+                    <TD style={{ color: t.is_leader ? C.amber : C.dim2 }}>
+                      <span
+                        onClick={t.wallet_address ? (e) => { e.stopPropagation(); window.PoybotNav?.selectWallet(t.wallet_address); } : undefined}
+                        title={t.wallet_address ? `Open ${short(t.wallet_address)} in Wallet Graph` : undefined}
+                        style={{ cursor: t.wallet_address ? 'pointer' : 'default', textDecoration: t.wallet_address ? 'underline dotted rgba(255,255,255,0.15)' : 'none', textUnderlineOffset: 3 }}
+                      >{short(t.wallet_address)}</span>
+                    </TD>
                     <TD>{t.is_leader ? <Badge type="amber" size="xs">L</Badge> : <span style={{ color: C.dim }}>·</span>}</TD>
                     <TD style={{ color: sideColor(t.side), fontWeight: 700 }}>{t.side}</TD>
                     <TD style={{ color: C.text }}>{t.price?.toFixed(3)}</TD>
@@ -1703,7 +2708,11 @@ const Inspector = () => {
                     <div style={{ display: 'flex', gap: 6, alignItems: 'center', marginBottom: 2 }}>
                       <span style={{ color: C.dim2 }}>{d.time ? new Date(d.time).toLocaleTimeString('en-GB') : '—'}</span>
                       <Badge type={d.action === 'follow' ? 'green' : d.action === 'fade' ? 'amber' : 'default'} size="xs">{d.action}</Badge>
-                      <span style={{ color: C.purple, fontFamily: 'monospace' }}>{short(d.leader_wallet)}</span>
+                      <span
+                        onClick={d.leader_wallet ? () => window.PoybotNav?.selectWallet(d.leader_wallet) : undefined}
+                        title={d.leader_wallet ? `Open ${short(d.leader_wallet)} in Wallet Graph` : undefined}
+                        style={{ color: C.purple, fontFamily: 'monospace', cursor: d.leader_wallet ? 'pointer' : 'default', textDecoration: d.leader_wallet ? 'underline dotted rgba(120,85,192,0.3)' : 'none', textUnderlineOffset: 3 }}
+                      >{short(d.leader_wallet)}</span>
                       {d.confidence != null && <span style={{ color: C.amber, marginLeft: 'auto' }}>c={d.confidence.toFixed(2)}</span>}
                     </div>
                     {d.reason && <div style={{ color: C.dim2, fontSize: 9, lineHeight: 1.4 }}>{d.reason}</div>}

@@ -19,7 +19,11 @@
         trade.time || trade.timestamp || Date.now(),
       ].join(':'),
       timestamp: trade.timestamp || trade.time || null,
+      market_id: trade.market_id || null,
       market_title: trade.market_title || trade.market_question || trade.question || trade.market_id || 'Unknown market',
+      market_category: trade.market_category || trade.category || null,
+      wallet_address: trade.wallet_address || null,
+      is_leader: !!trade.is_leader,
       side: trade.side || '—',
       price: trade.price != null ? Number(trade.price) : null,
       notional: trade.notional != null ? Number(trade.notional) : (trade.size_usdc != null ? Number(trade.size_usdc) : null),
@@ -75,6 +79,10 @@
     return h;
   };
 
+  // ETag cache for /api/v1/live-summary so the 5s poll can return 304 when
+  // nothing changed — saves a 50-200 KB payload + JSON parse on the hot path.
+  let _liveSummaryEtag = null;
+
   const apiFetch = async (path, opts = {}) => {
     const r = await fetch(`${API_BASE}${path}`, { headers: hdrs(opts.headers || {}), ...opts });
     if (!r.ok) throw new Error(`HTTP ${r.status}`);
@@ -82,10 +90,24 @@
   };
 
   // ── Snapshot poll ──────────────────────────────────────────────────────────
+  // Uses HTTP conditional-GET: send If-None-Match with the previous ETag.
+  // On 304, no body is parsed — just refresh the lastUpdate timestamp.
+  // On 200, store the new ETag for the next request.
   const loadSnap = async () => {
     try {
-      const { data } = await apiFetch('/api/v1/live-summary');
-      if (data) store.processBootstrap(data);
+      const headers = hdrs();
+      if (_liveSummaryEtag) headers['If-None-Match'] = _liveSummaryEtag;
+      const r = await fetch(`${API_BASE}/api/v1/live-summary`, { headers });
+      if (r.status === 304) {
+        // Nothing changed — only bump lastUpdate so the UI knows the link is alive.
+        store._set({ lastUpdate: Date.now() });
+        return;
+      }
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      const newEtag = r.headers.get('etag');
+      if (newEtag) _liveSummaryEtag = newEtag;
+      const body = await r.json();
+      if (body && body.data) store.processBootstrap(body.data);
     } catch (e) {
       console.warn('[Poybot] poll failed:', e.message);
     }
