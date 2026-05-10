@@ -6,22 +6,15 @@ sur le VM Hetzner.
 
 ## TL;DR — déploiement
 
+Cette session livre 15 patches plus le script SQL one-shot. La procédure
+de déploiement standard (rsync Mac → Hetzner + rebuild + verifs) est
+documentée dans **[DEPLOY.md](DEPLOY.md)** — c'est le single source of
+truth qu'il faut suivre.
+
+Étapes spécifiques à cette session après le deploy normal :
+
 ```bash
-# Sur ta machine locale
-cd "Polymarket trading bot/polymarket-bot"
-git add -A && git commit -m "Session 2026-05-10: DQ + risk cockpit + wallet scanner + inspector + size-weighted profile + dockerfile fix"
-git push
-
-# Sur le VM Hetzner (89.167.23.215)
-ssh polymarket@89.167.23.215
-cd ~/polymarket-bot
-git pull
-docker compose -f docker-compose.yml -f docker-compose.prod.yml build
-docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d --force-recreate
-
-# One-shot DQ cleanup (existing 158 leaders stamped 'falcon_no_data')
-# NB: the postgres role in the container is "polymarket" (not "postgres"),
-# matching POSTGRES_USER in docker-compose.yml.
+# Cleanup one-shot des leaders 'falcon_no_data' déjà stampés avant le patch
 docker exec -i polymarket_db psql -U polymarket -d polymarket \
   < scripts/cleanup_falcon_no_data_leaders.sql
 ```

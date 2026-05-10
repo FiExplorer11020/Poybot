@@ -80,24 +80,11 @@ docker compose logs -f engine
 
 ## Production deployment (Hetzner Helsinki)
 
-Le VM `polymarket-prod` (89.167.23.215) tourne `/opt/polymarket-bot/` avec docker-compose. Le déploiement actuel est un workflow rsync + rebuild :
+Le VM `polymarket-prod` (89.167.23.215) tourne `/opt/polymarket-bot/` avec docker-compose. Le déploiement courant est un workflow rsync + rebuild côté VM.
 
-```bash
-# Sur le Mac local
-rsync -avz --delete \
-  --exclude '.git/' --exclude '__pycache__/' --exclude '.venv/' \
-  --exclude '.env' --exclude '*.log' --exclude 'data_cache/' \
-  -e "ssh -i ~/.ssh/hetzner_polymarket" \
-  ./ polymarket@89.167.23.215:/opt/polymarket-bot/
+**Procédure complète, troubleshooting, rollback : [docs/DEPLOY.md](docs/DEPLOY.md)** — c'est le single source of truth pour pousser des modifs en prod.
 
-# Sur le VM
-ssh -i ~/.ssh/hetzner_polymarket polymarket@89.167.23.215
-cd /opt/polymarket-bot
-docker compose -f docker-compose.yml -f docker-compose.prod.yml build
-docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d --force-recreate
-```
-
-Détails infra dans [docs/INFRA.md](docs/INFRA.md).
+Détails infra (specs VM, memory map, healthchecks) : [docs/INFRA.md](docs/INFRA.md).
 
 ## Useful commands
 
@@ -116,6 +103,7 @@ docker exec -i polymarket_db psql -U polymarket -d polymarket \
 ## Documentation
 
 - [CLAUDE.md](CLAUDE.md) : master architecture context (lis avant de coder)
+- **[docs/DEPLOY.md](docs/DEPLOY.md)** : manuel de déploiement Mac → Hetzner (rsync + rebuild + verifs + rollback)
 - [docs/INFRA.md](docs/INFRA.md) : infra Hetzner + Docker + memory budgets
 - [docs/docker-setup.md](docs/docker-setup.md) : Dockerfile / compose / healthchecks
 - [docs/backups.md](docs/backups.md) : Postgres -> Cloudflare R2 (currently idle)

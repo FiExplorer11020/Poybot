@@ -572,31 +572,13 @@ docker compose logs -f engine
 
 The bot lives at `/opt/polymarket-bot/` on `polymarket-prod`
 (89.167.23.215). The deploy workflow is rsync (the prod path is **not**
-a git checkout):
+a git checkout). Postgres user/db are `polymarket` (NOT `postgres`).
 
-```bash
-# From the local Mac
-rsync -avz --delete \
-  --exclude '.git/' --exclude '__pycache__/' --exclude '.venv/' \
-  --exclude '.env' --exclude '*.log' --exclude 'data_cache/' \
-  -e "ssh -i ~/.ssh/hetzner_polymarket" \
-  ./ polymarket@89.167.23.215:/opt/polymarket-bot/
+→ **Single source of truth for the deploy procedure: [docs/DEPLOY.md](docs/DEPLOY.md).**
+   Pre-flight, rsync command with the right excludes, rebuild rules,
+   verification commands, rollback options, troubleshooting.
 
-# Then on the VM
-ssh -i ~/.ssh/hetzner_polymarket polymarket@89.167.23.215
-cd /opt/polymarket-bot
-docker compose -f docker-compose.yml -f docker-compose.prod.yml build
-docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d --force-recreate
-```
-
-Postgres user/db are `polymarket` (NOT `postgres`). Connecting to the
-DB:
-
-```bash
-docker exec -it polymarket_db psql -U polymarket -d polymarket
-```
-
-Full infra reference: [docs/INFRA.md](docs/INFRA.md).
+→ Infrastructure (specs, memory map, healthchecks): [docs/INFRA.md](docs/INFRA.md).
 
 ---
 

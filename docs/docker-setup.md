@@ -39,22 +39,9 @@ overridden in `docker-compose.yml` to use service DNS
 
 ## Production (Hetzner Helsinki — `/opt/polymarket-bot/`)
 
-```bash
-ssh -i ~/.ssh/hetzner_polymarket polymarket@89.167.23.215
-cd /opt/polymarket-bot
-docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d --build
-```
-
-The deployment workflow on the Mac side is rsync-based (the VM does
-**not** track a git remote in `/opt/polymarket-bot/`):
-
-```bash
-rsync -avz --delete \
-  --exclude '.git/' --exclude '__pycache__/' --exclude '.venv/' \
-  --exclude '.env' --exclude '*.log' --exclude 'data_cache/' \
-  -e "ssh -i ~/.ssh/hetzner_polymarket" \
-  ./ polymarket@89.167.23.215:/opt/polymarket-bot/
-```
+→ **Deploy procedure: [DEPLOY.md](DEPLOY.md).** Pre-flight, rsync
+   command with the right excludes, rebuild rules per type of change,
+   verification commands, rollback options, troubleshooting.
 
 The prod overlay adds:
 
