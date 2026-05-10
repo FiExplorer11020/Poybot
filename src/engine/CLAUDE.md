@@ -10,19 +10,48 @@ See parent [CLAUDE.md](../CLAUDE.md) for full context.
 
 ## Components
 
-- **confidence_engine.py**: Thompson Sampling for leader credibility. Maintains per-leader (α_follow, β_fade)
-  Beta posteriors. Samples from both; higher sampled value → action. Includes exploration floor.
-  Readiness checks: FOLLOW needs 50 trades + 5 followers; FADE needs 50 resolved + high error confidence.
+- **confidence_engine.py** : Thompson Sampling for leader credibility. Maintains per-leader
+  `(α_follow, β_follow)` and `(α_fade, β_fade)` Beta posteriors. Samples from both; higher
+  sampled value → action. Includes exploration floor. Readiness checks: FOLLOW needs
+  `FOLLOW_MIN_TRADES` (default 50) + `FOLLOW_MIN_FOLLOWERS` (default 5); FADE needs
+  `FADE_MIN_RESOLVED` (default 50) + `FADE_MIN_CONFIDENCE` (default 0.65). All thresholds
+  are interpolated by the system maturity (cold-start → mature) via the adaptive layer.
 
-- **paper_trader.py**: Simulated portfolio. On FOLLOW/FADE signal, calculates Kelly-sized position,
-  opens paper trade in DB. On leader exit (detected by observer module), closes paper trade, calculates PnL
-  including fees. Maintains full OPEN → CLOSE cycle. Returns close reason: "leader_exit", "market_resolved", etc.
+- **decision_router.py** : in-memory router that dispatches each decision to the paper
+  trader, the live trader, or both, based on `TRADING_MODE` env + a Redis runtime override.
 
-- **risk_manager.py**: Position sizing via Bayesian Kelly. Shrinkage for uncertainty.
-  Hard caps: 2% of bankroll per trade, FADE sizing = 50% of FOLLOW max, no single market > 25% exposure.
-  Circuit breakers: if daily loss > 5%, skip all trades next 1h.
+- **paper_trader.py** : simulated portfolio. On FOLLOW/FADE signal, gets Kelly size from
+  RiskManager, opens paper trade in DB. On leader exit (detected by observer +
+  position_tracker), closes paper trade, calculates PnL including fees. Maintains full
+  OPEN → CLOSE cycle. Close reason: `leader_exit`, `market_resolved`, `manual`, etc.
 
-- **models.py**: Signal, PaperTrade, Decision dataclasses.
+- **live_trader.py** : `py-clob-client` wrapper. Gated by both
+  `LIVE_TRADING_DRY_RUN` (env-driven) and the killswitch's `real_execution_enabled`
+  flag (DB-backed, Redis-cached). When either is false, writes a `live_trades` row
+  with `status='shadow'` and never sends an order.
+
+- **risk_manager.py** : pre-trade circuit breakers + Kelly sizing. **Reads thresholds
+  from `src/control/runtime_config.py`** (Redis-backed mutable layer) so the dashboard
+  cockpit can flip values at runtime. Falls back to env-driven `settings.*` defaults
+  on miss. Checks (in order): killswitch, drawdown, consecutive losses, recent same-market
+  losses, open count, market exposure. `apply_size_async()` is the runtime-aware path;
+  the legacy synchronous `apply_size()` is kept for compatibility.
+
+- **scheduler.py** + **jobs/** : APScheduler wiring for the cron jobs running inside
+  the engine container — `nightly_batch` (03:00 UTC), `redis_cleanup` (04:00 UTC),
+  `killswitch_sync` (5 min), `watchdog` (30 s), `refresh_thresholds` (5 min).
+
+- **watchdog.py** : supervises long-running coroutines (profiler, confidence_engine,
+  paper_trader, graph_engine, telegram_bot). Each coroutine writes a heartbeat key
+  in Redis; the watchdog restarts a coroutine whose heartbeat exceeds threshold.
+
+- **neural_readiness.py** : computes per-market readiness scores for the dashboard's
+  market belief panel. Inputs come from health, activation, risk, and ML state.
+
+- **portfolio_state.py** : tracks bankroll, peak capital, drawdown. Persisted to the
+  `portfolio_state` singleton row (id=1) so RiskManager survives container restarts.
+
+- **models.py** : Signal, PaperTrade, Decision dataclasses.
 
 ---
 

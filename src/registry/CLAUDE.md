@@ -9,13 +9,20 @@ See parent [CLAUDE.md](../CLAUDE.md) for full context.
 
 ## Components
 
-- **falcon_client.py**: Unified async client for all Falcon agents (584, 581, 556, 579, 574).
-  Handles pagination, retry logic, rate limiting, and Redis caching (48h TTL).
+- **falcon_client.py** : Unified async client for all Falcon agents (584, 581, 556, 569,
+  574, 575, 568, 572, 579, 585). Handles pagination, retry logic, rate limiting, and
+  Redis caching (48h TTL).
 
-- **leader_registry.py**: Maintains `leaders` table. Pulls top N leaders from Falcon agent 584
-  (Falcon Score Leaderboard), enriches with agent 581 (Wallet 360), auto-classifies by strategy/influence/horizon/copiability.
+- **leader_registry.py** : Maintains the `leaders` table. The `run()` loop performs three
+  steps per cycle: (1) `refresh_leaderboard` pulls top N from agent 584 (Falcon Score)
+  with PnL leaderboard fallback, (2) `enrich_leaders` calls agent 581 on stale wallets and
+  stamps `excluded=TRUE, on_watchlist=FALSE, exclude_reason='falcon_no_data'` for wallets
+  Falcon doesn't recognise (so they stop bloating the active pool and the DQ counters),
+  and (3) `sync_markets` fills in missing market metadata via agents 574 + Gamma fallback,
+  skipping markets whose `end_date` is more than 24h in the past.
 
-- **models.py**: Pydantic dataclasses for Falcon responses, Classification enum, Leader schema.
+- **models.py** : Pydantic dataclasses for Falcon responses, Classification enum,
+  Leader schema.
 
 ---
 
@@ -39,10 +46,16 @@ classification_json: {
 ```
 
 ### Exclusion Rules (EXCLUDE from trading signals)
-1. Structural/bot traders: avg execution speed < 1s consistently → copiable = false
-2. Wallets with < 10 trades observed → insufficient_data (observe only, no signals)
+1. Structural/bot traders: avg execution speed < 1s consistently → `copiable=false`
+2. Wallets with < 10 trades observed → `insufficient_data` (observe only, no signals)
 3. Falcon Score ≤ 0 → skip entirely
 4. Wallet 360 "bot_detected" flag = true → exclude (from agent 581 metrics)
+5. **`falcon_no_data`** → permanent exclusion stamp set by `enrich_leaders` when Falcon
+   agent 581 returns no metrics. This typically happens for fresh wallets injected via the
+   profiler's FK upsert that Falcon's pipeline hasn't picked up yet. The flip to
+   `excluded=TRUE, on_watchlist=FALSE` is irreversible by the runtime — recovery requires
+   manual SQL (the `cleanup_falcon_no_data_leaders.sql` script does the catch-up for the
+   inverse case where rows were stamped before the patch landed).
 
 ---
 

@@ -5,10 +5,10 @@ les variables d'environnement pour faire passer le bot du mode paper-only au mod
 live (S2.6).
 
 > **Avertissement légal** : Polymarket n'est pas autorisé en France pour les
-> résidents français au moment de la rédaction. Le bot doit être hébergé sur
-> une VM hors juridiction française (cf. tâche S5.13 — VM Oracle Cloud). Le mode
-> `LIVE_TRADING_DRY_RUN=true` reste le défaut tant que cette migration n'est pas
-> faite.
+> résidents français au moment de la rédaction. Le bot tourne déjà sur une
+> VM hors juridiction française (Hetzner Helsinki / HEL1, cf.
+> [INFRA.md](INFRA.md)). Le mode `LIVE_TRADING_DRY_RUN=true` reste le défaut
+> tant que la procédure ci-dessous n'est pas déroulée intégralement.
 
 ---
 
@@ -137,8 +137,10 @@ prime), mais il sera prêt à basculer en `false` quand tout sera validé.
 - **Ne jamais** mettre `POLYMARKET_PRIVATE_KEY` dans git, dans un Dockerfile,
   ou dans une URL.
 - Stocker la clé dans un secret manager (Doppler, AWS SM, GCP SM,
-  Hashicorp Vault). Pour la VM Oracle Cloud, on utilisera les secrets
-  systemd avec `LoadCredential=`.
+  Hashicorp Vault). Sur le VM Hetzner actuel, la clé est lue depuis
+  `/opt/polymarket-bot/.env` (mode 600, owner `polymarket`). Migrer vers
+  Docker secrets ou systemd `LoadCredential=` avant de monter le capital
+  alloué au bot.
 - Limiter le solde sur le funder à ce qui est nécessaire pour 24–48 h de
   trading. Ce n'est pas un wallet de stockage.
 - Le killswitch (`src/control/killswitch.py`) doit être en `ON` avant tout

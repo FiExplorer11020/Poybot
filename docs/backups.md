@@ -1,4 +1,13 @@
-# Postgres → Cloudflare R2 backups (S4.12)
+# Postgres → Cloudflare R2 backups
+
+> **Status (May 2026): the `backups` service is wired but idle.**
+> `BACKUPS_ENABLED=false` in the prod `.env` until the Cloudflare R2
+> bucket and credentials are provisioned. The container starts, the
+> APScheduler cron is registered, but `make_backup_job` returns early
+> because the master flag is off. Switch the flag to `true` AFTER
+> populating `R2_*` env vars (see "Configuration" below). No data is
+> being archived off-site at the moment — the prod VM's 40 GB SSD is
+> the only persistence layer right now.
 
 Nightly `pg_dump` archives uploaded to a Cloudflare R2 bucket, with
 GFS-style retention (7 daily + 4 weekly + 3 monthly). Lives in its

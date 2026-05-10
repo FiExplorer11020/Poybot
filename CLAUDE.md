@@ -75,40 +75,66 @@ Copiability:       copiable | not_copiable                (from avg execution sp
 src/
 ├── registry/            # Leader identification and enrichment (Falcon API)
 │   ├── falcon_client.py        # Unified Falcon API client (all agent_ids)
-│   ├── leader_registry.py      # Maintains leader watchlist from Falcon
+│   ├── leader_registry.py      # Leaderboard refresh, enrichment, sync_markets;
+│   │                           # stamps falcon_no_data leaders excluded=TRUE
 │   └── models.py               # Pydantic models for Falcon responses
 │
-├── observer/            # Real-time trade observation
-│   ├── websocket_client.py     # Polymarket WS with auto-reconnect
-│   ├── trade_observer.py       # Tracks trades on leader-active markets
+├── observer/            # Real-time trade observation (dual-source)
+│   ├── websocket_client.py     # Polymarket WS with auto-reconnect + ping/pong
+│   ├── trade_observer.py       # WS + REST polling, dedup Redis + DB UNIQUE INDEX,
+│   │                           # publishes trades:observed on Redis pub/sub
 │   ├── position_tracker.py     # Reconstructs OPEN→CLOSE position cycles
 │   └── models.py               # Trade/Position dataclasses
 │
 ├── graph/               # Leader→Follower social graph
-│   ├── graph_engine.py         # Builds/updates weighted follower edges
-│   ├── hawkes_fitter.py        # Hawkes process for causal link detection
-│   └── models.py               # Edge/Graph dataclasses
+│   ├── graph_engine.py         # Hot path: Beta-Binomial follower edges
+│   ├── hawkes_fitter.py        # Cold path: Hawkes MLE batch nightly
+│   └── models.py
 │
 ├── profiler/            # Behavioral profiling + error modeling
-│   ├── behavior_profiler.py    # Per-leader behavioral profile (Dirichlet, KDE, EWMA)
-│   ├── error_model.py          # Predicts P(leader loses) in context (Beta→LogReg→LightGBM)
-│   └── models.py               # Profile/ErrorPrediction dataclasses
+│   ├── behavior_profiler.py    # Dirichlet (size-weighted), EWMA, KDE,
+│   │                           # accuracy Beta posteriors (size-weighted)
+│   ├── error_model.py          # 3 phases: Beta-Binomial → BayesianRidge → LightGBM+Platt
+│   └── models.py
 │
 ├── engine/              # Decision and execution
 │   ├── confidence_engine.py    # Thompson Sampling: FOLLOW vs FADE vs SKIP
-│   ├── paper_trader.py         # Virtual portfolio, tracks positions
-│   ├── risk_manager.py         # Kelly sizing, circuit breakers
-│   └── models.py               # Signal/Trade dataclasses
+│   ├── decision_router.py      # Routes decisions to paper / live / dual
+│   ├── paper_trader.py         # Virtual portfolio + RiskManager integration
+│   ├── live_trader.py          # py-clob-client wrapper (gated by killswitch)
+│   ├── risk_manager.py         # Reads thresholds from RuntimeConfig (mutable)
+│   ├── scheduler.py            # APScheduler wrapper
+│   ├── watchdog.py             # Supervises long-running coroutines
+│   ├── neural_readiness.py     # Per-market readiness score for the dashboard
+│   ├── portfolio_state.py      # Tracks bankroll + peak + drawdown
+│   ├── jobs/                   # Cron job factories
+│   └── main.py                 # Engine entry point
 │
-├── database/            # All DB interaction
-│   ├── connection.py           # asyncpg pool, get_db() context manager
-│   ├── models.py               # Dataclass models matching DB schema
-│   └── queries.py              # Parameterized SQL queries (no inline SQL)
+├── control/             # Cross-cutting runtime control
+│   ├── killswitch.py           # Global execution gate (DB + Redis cache)
+│   └── runtime_config.py       # Mutable risk knobs (Redis-backed, validated)
 │
-├── monitoring/          # Metrics and logging
-│   └── metrics.py              # Structured logging + health checks
+├── api/                 # FastAPI dashboard
+│   ├── main.py                 # Lifespan + endpoints + WS bridge wiring
+│   ├── queries.py              # SQL builders for the snapshot
+│   ├── terminal_snapshot.py    # Composes the live JSON snapshot
+│   ├── ws_bridge.py            # WebSocket fan-out for /ws/live
+│   └── readiness_persistence.py
 │
-└── config.py            # Pydantic settings, all constants
+├── execution/           # Order routing helpers (used by live_trader)
+│
+├── economics/           # Versioning of the model + paper-trade filters
+│
+├── database/            # asyncpg pool + queries shared by services
+│
+├── backups/             # pg_dump → Cloudflare R2 (idle if BACKUPS_ENABLED=false)
+│
+├── telegram_bot/        # Notifier (sortant) + Bot (commandes /status, /pnl, ...)
+│
+├── monitoring/          # Health checks + metrics
+│
+├── logging_setup.py     # Loguru sinks (stdout JSON + file)
+└── config.py            # Pydantic settings, env-driven defaults
 ```
 
 ---
@@ -343,29 +369,48 @@ reduce position sizes, accumulate fresh data.
 ## 8. TECH STACK (exact versions)
 
 ```
-Python          3.11+
-asyncpg         0.29.0      # PostgreSQL async driver
-aiohttp         3.9.3       # HTTP client for Falcon API + Polymarket REST
-websockets      12.0        # Polymarket WebSocket client
-pydantic        2.6.0       # Data validation & settings
-numpy           1.26.4      # Numerical operations
-scipy           1.12.0      # Hawkes process MLE fitting
-numpyro         0.14.0      # Bayesian logistic regression (optional, fallback: sklearn)
-lightgbm        4.3.0       # Error model phase 3 (gradient boosted trees)
-scikit-learn    1.4.0       # Calibration, preprocessing, BayesianRidge fallback
-redis           5.0.1       # Cache + pub/sub between modules
-loguru          0.7.2       # Structured logging
-python-dotenv   1.0.1       # .env loading
-pytest          8.1.0       # Testing
-pytest-asyncio  0.23.5      # Async test support
+Python              3.11+
+PostgreSQL          15           (asyncpg, no TimescaleDB)
+Redis               7.2-alpine   (cache + pub/sub)
+asyncpg             0.29.0
+aiohttp             3.9.3        # Falcon API + Polymarket REST
+websockets          12.0         # Polymarket CLOB WS client
+pydantic            2.6.0        # Validation
+pydantic-settings                # .env loading
+numpy               1.26.4
+scipy               1.12.0       # Hawkes MLE
+numpyro             0.14.0       # Bayesian LogReg phase 2
+lightgbm            4.3.0        # Error model phase 3
+scikit-learn        1.4.0        # Calibrated classifier, BayesianRidge fallback
+redis               5.0.1        # Async client
+loguru              0.7.2        # Structured logging
+APScheduler         3.10.4       # Cron jobs in the engine container
+python-telegram-bot              # Telegram alerts + commands
+py-clob-client                   # Live trading CLOB wrapper
+boto3                            # Cloudflare R2 (S3-compat)
+FastAPI + uvicorn                # Dashboard backend
+React               18.3         # Dashboard frontend (Babel-on-the-fly via CDN)
+pytest              8.1.0
+pytest-asyncio      0.23.5
 ```
 
 Removed from old stack: TimescaleDB extension, hdbscan, pandas, polars, prometheus-client.
-Added: scipy, numpyro, lightgbm.
 
 ---
 
 ## 9. KEY CONSTANTS (src/config.py, overridable via .env)
+
+> Two layers of config: env-driven defaults (immutable at runtime, listed
+> below) and runtime-mutable overrides for risk knobs in
+> `src/control/runtime_config.py`. The dashboard's RISK & CONFIG cockpit
+> writes to the runtime layer via `POST /api/risk/update`; values are
+> validated against `BOUNDS` and persisted in Redis. Currently mutable:
+> `risk_per_trade_pct`, `max_total_exposure_pct`, `kelly_fraction`,
+> `max_drawdown_stop_pct`, `min_signal_strength`, `max_concurrent_positions`,
+> `cooldown_seconds`, `max_consecutive_losses`,
+> `max_recent_losses_per_market`, `fade_size_ratio`. RiskManager reads
+> from the runtime layer first, falls back to settings on miss.
+
 
 ```python
 # Falcon API
@@ -497,21 +542,61 @@ PAPER_TRADING         true
 ## 13. RUNNING LOCALLY
 
 ```bash
-# Start infrastructure
-docker-compose up -d
+# Backends only (postgres + redis)
+docker compose up -d postgres redis
 
 # Apply DB migrations
 python scripts/setup_db.py
 
-# Start leader registry (pulls from Falcon)
+# Start leader registry (pulls from Falcon, sync_markets every cycle)
 python -m src.registry.main
 
-# Start trade observer (WebSocket + Falcon backfill)
+# Start trade observer (WS + REST polling, dual-source dedup)
 python -m src.observer.main
 
-# Start intelligence engine (graph + profiler + decisions)
+# Start intelligence engine (graph + profiler + decisions + scheduler + watchdog)
 python -m src.engine.main
+
+# Start dashboard API
+python -m uvicorn src.api.main:app --host 127.0.0.1 --port 8000
 ```
+
+Or full stack in Docker (recommended for verifying compose wiring):
+
+```bash
+docker compose up -d --build
+docker compose logs -f engine
+```
+
+## 13b. PRODUCTION (Hetzner Helsinki)
+
+The bot lives at `/opt/polymarket-bot/` on `polymarket-prod`
+(89.167.23.215). The deploy workflow is rsync (the prod path is **not**
+a git checkout):
+
+```bash
+# From the local Mac
+rsync -avz --delete \
+  --exclude '.git/' --exclude '__pycache__/' --exclude '.venv/' \
+  --exclude '.env' --exclude '*.log' --exclude 'data_cache/' \
+  -e "ssh -i ~/.ssh/hetzner_polymarket" \
+  ./ polymarket@89.167.23.215:/opt/polymarket-bot/
+
+# Then on the VM
+ssh -i ~/.ssh/hetzner_polymarket polymarket@89.167.23.215
+cd /opt/polymarket-bot
+docker compose -f docker-compose.yml -f docker-compose.prod.yml build
+docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d --force-recreate
+```
+
+Postgres user/db are `polymarket` (NOT `postgres`). Connecting to the
+DB:
+
+```bash
+docker exec -it polymarket_db psql -U polymarket -d polymarket
+```
+
+Full infra reference: [docs/INFRA.md](docs/INFRA.md).
 
 ---
 
@@ -536,21 +621,69 @@ python -m src.engine.main
 
 > Keep this section aligned with the actual repo, not the original build plan.
 
-| Module | Status | Notes |
-|--------|--------|-------|
-| database/connection | IMPLEMENTED | asyncpg pool used by runtime and API |
-| database/models | IMPLEMENTED | dataclasses and row mapping present |
-| database/queries | PARTIAL | SQL is still split across services; not fully centralized |
-| registry/falcon_client | IMPLEMENTED | Falcon auth, caching, retry, normalization |
-| registry/leader_registry | IMPLEMENTED | leaderboard refresh, enrichment, classification |
-| observer/websocket_client | IMPLEMENTED | live subscriptions, reconnects, metrics |
-| observer/trade_observer | IMPLEMENTED | WebSocket + backfill ingestion, labeling, publishing |
-| observer/position_tracker | IMPLEMENTED | open/close reconstruction and close events |
-| graph/graph_engine | IMPLEMENTED | follower edges, replay, beta updates |
-| graph/hawkes_fitter | IMPLEMENTED | batch Hawkes fitting for confirmed edges |
-| profiler/behavior_profiler | IMPLEMENTED | behavior profiling and decision-learning state |
-| profiler/error_model | IMPLEMENTED | phase progression, prediction, drift runtime |
-| engine/confidence_engine | IMPLEMENTED | follow/fade/skip decisions and sizing |
-| engine/paper_trader | IMPLEMENTED | paper portfolio, monitoring, feedback loop |
-| engine/risk_manager | IMPLEMENTED | sizing guards and portfolio constraints |
-| monitoring/metrics | IMPLEMENTED | health and runtime support utilities |
+| Module                       | Status     | Notes                                                                                     |
+|-----------------------------|------------|-------------------------------------------------------------------------------------------|
+| database/connection         | IMPLEMENTED | asyncpg pool used by runtime and API                                                      |
+| database/models             | IMPLEMENTED | dataclasses and row mapping present                                                       |
+| database/queries            | PARTIAL    | SQL still split across services; api/queries.py is the canonical place for snapshot SQL |
+| registry/falcon_client      | IMPLEMENTED | Falcon auth, caching (48h TTL), retry, normalization                                      |
+| registry/leader_registry    | IMPLEMENTED | refresh_leaderboard, enrich_leaders (excludes falcon_no_data), sync_markets (skips expired) |
+| observer/websocket_client   | IMPLEMENTED | live subscriptions, reconnects with exp backoff, ping/pong, metrics                       |
+| observer/trade_observer     | IMPLEMENTED | WS + REST polling, dedup Redis 7d TTL + DB UNIQUE INDEX, publish trades:observed          |
+| observer/position_tracker   | IMPLEMENTED | open/close reconstruction, sell/merge/resolution close methods                            |
+| graph/graph_engine          | IMPLEMENTED | follower edges hot path, replay, Beta posterior updates                                   |
+| graph/hawkes_fitter         | IMPLEMENTED | batch Hawkes MLE fitting for confirmed edges                                              |
+| profiler/behavior_profiler  | IMPLEMENTED | size-weighted Dirichlet, EWMA sizing, KDE timing, size-weighted Beta accuracy             |
+| profiler/error_model        | IMPLEMENTED | phase progression Beta → BayesianRidge → LightGBM, drift detection                        |
+| engine/confidence_engine    | IMPLEMENTED | Thompson Sampling + Bayesian Kelly with shrinkage                                         |
+| engine/decision_router      | IMPLEMENTED | paper / live / dual routing                                                               |
+| engine/paper_trader         | IMPLEMENTED | paper portfolio, monitoring, feedback loop, RiskManager integration                       |
+| engine/live_trader          | IMPLEMENTED | py-clob-client wrapper, gated by killswitch + LIVE_TRADING_DRY_RUN flags                  |
+| engine/risk_manager         | IMPLEMENTED | reads thresholds from runtime_config (mutable), warm + hard breakers                      |
+| engine/scheduler            | IMPLEMENTED | APScheduler: nightly_batch, redis_cleanup, killswitch_sync, watchdog, refresh_thresholds  |
+| engine/watchdog             | IMPLEMENTED | supervises long-running coroutines, restart on heartbeat miss                             |
+| engine/neural_readiness     | IMPLEMENTED | per-market readiness scoring for the dashboard                                            |
+| control/killswitch          | IMPLEMENTED | DB singleton + Redis cache, propagation < 5 min                                           |
+| control/runtime_config      | IMPLEMENTED | mutable risk knobs in Redis with validation + pub/sub propagation                         |
+| api/main                    | IMPLEMENTED | 22 endpoints + WS bridge, terminal snapshot cache 1 s TTL                                 |
+| api/queries                 | IMPLEMENTED | SQL builders (~2500 LOC) for all dashboard sections                                       |
+| api/terminal_snapshot       | IMPLEMENTED | composes the live JSON snapshot from query outputs                                        |
+| api/inspector               | IMPLEMENTED | /api/inspector/snapshot exposes raw trades + decisions + source mix + pipeline metrics    |
+| backups/dumper              | IMPLEMENTED | wired but idle until BACKUPS_ENABLED=true and R2 creds populated                          |
+| telegram_bot/notifier       | IMPLEMENTED | sortant: alerts opening/closing/killswitch/crash                                          |
+| telegram_bot/bot            | IMPLEMENTED | entrant: /status, /pnl, /positions, /mode, /killswitch, /pause, /resume                   |
+| monitoring/metrics          | IMPLEMENTED | health and runtime support utilities                                                      |
+| Frontend (8 tabs)           | IMPLEMENTED | Alpha Terminal, ML Progression, Wallet Graph (incl. Wallet Scanner table), Live Portfolio, Decision Engine, Inspector, Risk & Config, Bot Health |
+
+---
+
+## 16. RECENT CHANGES (May 10, 2026 session)
+
+The following items were delivered this session and are reflected in the
+sections above. Keep this changelog concise — old entries get pruned
+when they become "the way it has always worked".
+
+- **Data quality** : `enrich_leaders` now stamps `excluded=TRUE,
+  on_watchlist=FALSE` for `falcon_no_data` wallets. `sync_markets` skips
+  expired markets (`end_date < NOW() - 24h`). `data_quality()` only
+  counts unmapped tokens for live markets. New `unmapped_expired_skipped`
+  field exposes the silent-skip count.
+- **Wallet Scanner** : the Market Scanner tab was removed from nav. The
+  Wallet Graph tab now hosts a Graph / Wallet Scanner toggle. The
+  scanner table is leader-centric (phase, strategy, falcon, trades 24h,
+  resolved, win rate, PnL, readiness composite, last action).
+- **Risk & Config cockpit** : new `src/control/runtime_config.py`,
+  `POST /api/risk/update` endpoint, RiskManager reads from runtime
+  layer. Frontend inputs are no longer disabled.
+- **Pipeline coherence** : Dirichlet category and Beta accuracy
+  posteriors are now size-weighted via
+  `_size_weight(size_usdc, ewma_size)` (sqrt scaling, clamped to
+  [0.5, 3.0]).
+- **Inspector tab** : new tab + `GET /api/inspector/snapshot` exposes
+  raw trades, decisions, source mix, pipeline health (Redis reachable,
+  WS lag, msgs/min, pubsub subscribers).
+- **Full-width UI** : dashboard-app.jsx wraps the active tab in an
+  absolutely-positioned container so all tabs fill the viewport.
+- **Dockerfile + .dockerignore** : `docs/migrations/` is now copied
+  into the runtime image so `setup_db.py` can apply pending schema
+  changes inside the container.

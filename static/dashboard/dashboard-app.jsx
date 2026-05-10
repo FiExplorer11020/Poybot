@@ -197,11 +197,17 @@ const App = () => {
           <span style={{ marginLeft: 'auto', fontSize: 10, color: C.dim2, fontFamily: 'monospace' }}>UTC {utc}</span>
         </div>
 
-        {/* Active tab — explicit `display: flex` + `width: 100%` ensures every
-            tab fills the available width identically, regardless of whether the
-            tab's own root uses grid, flex column, or simple block layout. */}
-        <div style={{ flex: 1, overflow: 'hidden', display: 'flex', width: '100%', minWidth: 0 }}>
-          <div style={{ flex: 1, minWidth: 0, display: 'flex', flexDirection: 'column' }}>
+        {/* Active tab — absolutely-positioned inner container guarantees the
+            tab content fills the parent regardless of its own layout (flex,
+            grid, block). Using `flex: 1` alone would let some tabs shrink to
+            content width when they don't have a forcing grid template. */}
+        <div style={{ flex: 1, overflow: 'hidden', position: 'relative', minWidth: 0 }}>
+          <div style={{
+            position: 'absolute',
+            top: 0, left: 0, right: 0, bottom: 0,
+            display: 'flex',
+            flexDirection: 'column',
+          }}>
             <ActiveTab />
           </div>
         </div>

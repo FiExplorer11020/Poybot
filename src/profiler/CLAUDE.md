@@ -29,15 +29,24 @@ See parent [CLAUDE.md](../CLAUDE.md) for full context.
 
 ### Behavioral Profile (Real-time, O(1) update)
 
-**Dirichlet for category preference** (non-negative, sums to 1):
+**Dirichlet for category preference** (size-weighted):
 ```
-α_category[i] = count of profitable trades in category_i
-On new resolved position in category j: α_category[j] += 1
+α_category[i] = pseudo-count for category_i
+On new resolved position in category j:
+  weight = _size_weight(size_usdc, profile.sizing.ewma_size)
+  α_category[j] += weight
 P(next trade in category_j) = α_category[j] / Σ α
 ```
-Uninformed prior: all α = 1 (uniform).
 
-**EWMA for position sizing**:
+`_size_weight` returns a value in `[0.5, 3.0]` via `sqrt(size / ewma_size)`,
+clamped. Larger trades carry more weight in the leader's preferences (a
+$50k trade indicates more conviction than a $50 one), but the
+sub-linear scaling prevents a single whale trade from dominating the
+prior. A trade with `size_usdc <= 0` or no baseline yet falls back to
+weight `1.0`. Uninformed prior: all α = 1 (uniform).
+
+**EWMA for position sizing** (updated FIRST, before the size-weighted
+posteriors that depend on it):
 ```
 μ_size_ewma = λ · μ_size_ewma_prev + (1 - λ) · size_new
 λ = 0.94 (half-life ≈ 10-15 days)
@@ -123,8 +132,8 @@ Avoid stale profiles.
    Don't skip behavioral feature extraction.
 
 2. **deviation_score is KEY**: How much does this trade deviate from the leader's EWMA sizing?
-   deviation_score = |size_actual - μ_size_ewma| / μ_size_ewma
-   High deviation → leader is unsure → higher error risk. Must include in Phase 2+.
+   `deviation_score = |size_actual - μ_size_ewma| / μ_size_ewma`. High deviation → leader is
+   unsure → higher error risk. Must include in Phase 2+.
 
 3. **Don't re-fit Phase 2+ too often**: Re-fit every 24h max. More frequent refits → overfitting.
    Phase 3 (LightGBM) re-fit every 7 days only.
@@ -134,6 +143,11 @@ Avoid stale profiles.
 
 5. **Drift detection DOWNGRADES, not resets**: If drift detected, downgrade phase (e.g., 3→2),
    keep historical data, but start fresh learning. Don't delete old profiles.
+
+6. **Update `_update_sizing` BEFORE the size-weighted posteriors**: `_update_dirichlet` and
+   `_update_accuracy` both call `_size_weight(size_usdc, ewma_size)`. If you swap that order,
+   the first trade for a new leader will use a stale (zero) baseline and weight wrong.
+   The `on_position_closed` path enforces this ordering explicitly.
 
 ---
 

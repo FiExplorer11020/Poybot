@@ -1,7 +1,16 @@
 # Observer Module — Real-time Trade Observation + Position Reconstruction
 
-**Purpose**: Track every trade by leaders in real-time via WebSocket, backfill with Falcon agent 556,
-deduplicate, and reconstruct position cycles (OPEN → CLOSE) including merge exits.
+**Purpose**: Track every trade by leaders in real-time via dual-source ingestion
+(Polymarket WebSocket CLOB + REST polling on data-api every 30 s), deduplicate
+across both sources via a Redis 7-day TTL set + a DB-level `UNIQUE INDEX` on
+`(wallet, market, time, side, price, size_usdc)`, and reconstruct position cycles
+(OPEN → CLOSE) including merge exits. Trades attributed to leaders are
+re-published on the `trades:observed` Redis pub/sub channel for downstream
+consumers (profiler, graph, confidence engine).
+
+The WS market channel does **not** contain wallet addresses — wallet attribution
+comes exclusively from the REST data-api polling. The WS feed informs pricing
+and book quality only.
 
 See parent [CLAUDE.md](../CLAUDE.md) for full context.
 
@@ -9,18 +18,28 @@ See parent [CLAUDE.md](../CLAUDE.md) for full context.
 
 ## Components
 
-- **websocket_client.py**: Polymarket CLOB WebSocket client with auto-reconnect, ping/pong,
-  market filtering (top N most active). Subscribe to leader-active markets only.
+- **websocket_client.py** : Polymarket CLOB WebSocket client with auto-reconnect (exp
+  backoff), ping/pong watchdog (drops the connection if no pong in 10 s), market
+  filtering (top N most active). Subscribes to the `Market` channel for leader-active
+  markets only. Publishes book / price_change / last_trade_price events as Redis pub/sub
+  side effects so downstream consumers can stay in sync without each one keeping its
+  own WS connection.
 
-- **trade_observer.py**: Receives WebSocket trades + Falcon agent 556 backfill. Deduplicates
-  by (wallet, market, time, side, price, size). Inserts into `trades_observed` table.
-  Triggers position_tracker on new trades.
+- **trade_observer.py** : The ingestion heart. Receives trades from two sources —
+  WebSocket (`source='websocket'`) and REST polling on Polymarket's data-api
+  (`source='api_market'` for market-scoped polls, `source='api_wallet'` for
+  per-wallet polls). Deduplicates first via Redis (7-day TTL set keyed on
+  `wallet:market:bucket:side:price:size`), then via a DB-level `UNIQUE INDEX` as a
+  safety net (covers Redis flushes / cold starts). Inserts into `trades_observed`
+  with the source preserved, then publishes `trades:observed` events on Redis pub/sub.
 
-- **position_tracker.py**: Reconstructs OPEN → CLOSE position cycles. Detects merge exits
-  (buy complementary token, cancel existing position). Tracks partial closes, fees.
-  Inserts into `positions_reconstructed` table on close.
+- **position_tracker.py** : Reconstructs OPEN → CLOSE position cycles per `(wallet,
+  market, token)`. Detects merge exits (when a leader buys the complementary token
+  to merge YES + NO → $1 USDC). Tracks partial closes — the same position may close
+  via several SELL orders. Writes resolved positions into `positions_reconstructed`
+  with the `close_method` field set (`sell`, `merge`, or `resolution`).
 
-- **models.py**: Trade, Position, PositionClose dataclasses.
+- **models.py** : Trade, Position, PositionClose dataclasses.
 
 ---
 
