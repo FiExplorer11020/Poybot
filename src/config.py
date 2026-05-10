@@ -106,6 +106,17 @@ class Settings(BaseSettings):
     WEBSOCKET_PONG_TIMEOUT_S: int = 10
 
     # ------------------------------------------------------------------ #
+    # Position Tracker — persistent state cap (Phase 2 Task C)            #
+    # ------------------------------------------------------------------ #
+    # Hard upper bound on the in-memory _open_positions dict. Persistent
+    # state in `position_tracker_state` makes the dict unbounded across
+    # restarts; this cap defends against runaway growth in a single
+    # process (e.g. a leader watchlist explosion or a corrupted state
+    # row that prevents CLOSE matching). On overflow we evict the OLDEST
+    # OpenPosition by open_time and log a warning so ops can investigate.
+    MAX_OPEN_POSITIONS_TRACKED: int = 10_000
+
+    # ------------------------------------------------------------------ #
     # Graph Engine (CLAUDE.md § 9)                                        #
     # ------------------------------------------------------------------ #
     FOLLOWER_WINDOW_S: int = 300

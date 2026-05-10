@@ -10,7 +10,7 @@ from loguru import logger
 
 from src.config import settings
 from src.control.killswitch import get_killswitch
-from src.control.runtime_config import init_runtime_config
+from src.control.runtime_config import get_runtime_config, init_runtime_config
 from src.database.connection import close_pool, initialize_pool
 from src.engine.confidence_engine import ConfidenceEngine
 from src.engine.decision_router import DecisionRouter
@@ -70,8 +70,13 @@ async def main() -> None:
     killswitch = get_killswitch(redis_client=redis_client)
     # Runtime config (Risk & Config Option 2). Reads/writes share the
     # same Redis key as the API service so dashboard edits propagate
-    # to the engine within the 30s cache TTL.
+    # to the engine within the 30s cache TTL — or now <100ms via the
+    # runtime_config:changed pub/sub channel below.
     init_runtime_config(redis_client=redis_client)
+    # Phase 2 Task D: push-invalidate the local override cache whenever
+    # the API publishes a change on runtime_config:changed (audit Red
+    # Flag #6). Without this every RiskManager check ate the 30s TTL.
+    await get_runtime_config().start_pubsub()
 
     error_model = ErrorModel()
     profiler = BehaviorProfiler(redis_client=redis_client, error_model=error_model)
@@ -183,6 +188,10 @@ async def main() -> None:
         await paper_trader.stop()
         await graph.stop()
         await telegram_bot.stop()
+        try:
+            await get_runtime_config().stop_pubsub()
+        except Exception:
+            pass
         await close_pool()
         await redis_client.aclose()
         logger.info("Intelligence Engine stopped")

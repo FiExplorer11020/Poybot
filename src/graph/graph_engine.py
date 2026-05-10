@@ -4,7 +4,6 @@ Subscribes to trades:observed, detects follower patterns, updates follower_edges
 """
 
 import asyncio
-import json
 from collections import defaultdict, deque
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
@@ -12,6 +11,7 @@ from decimal import Decimal
 from loguru import logger
 
 from src.config import settings
+from src.control.redis_pubsub import Subscriber
 from src.database.connection import get_db
 
 REDIS_TRADES_CHANNEL = "trades:observed"
@@ -25,33 +25,41 @@ class GraphEngine:
         # Buffer: market_id → deque of recent trades (for window lookup)
         # Each entry: {"time": datetime, "wallet": str, "side": str, "is_leader": bool}
         self._market_trades: dict[str, deque] = defaultdict(lambda: deque(maxlen=1000))
+        # F-04: dedicated pub/sub client with reconnect+resubscribe. The
+        # previous code shared `self._redis` with command callers and
+        # silently lost subscriptions on disconnect.
+        self._subscriber = Subscriber(settings.REDIS_URL, name="graph.engine")
+        self._subscriber.register(REDIS_TRADES_CHANNEL, self._on_trade_message)
 
     async def start(self) -> None:
         self._running = True
         self._stop_event.clear()
         await self._hydrate_recent_trades()
-        await self._subscribe_loop()
+        await self._subscriber.start()
+        # Keep the coroutine alive so the watchdog's restart-on-completion
+        # contract still holds. We sleep on the stop_event; the subscriber
+        # owns its own task and reconnect loop.
+        try:
+            await self._stop_event.wait()
+        except asyncio.CancelledError:
+            pass
 
     async def stop(self) -> None:
         self._running = False
         self._stop_event.set()
+        await self._subscriber.stop()
 
-    async def _subscribe_loop(self) -> None:
-        pubsub = self._redis.pubsub()
-        await pubsub.subscribe(REDIS_TRADES_CHANNEL)
+    async def _on_trade_message(self, trade: dict, _channel: str) -> None:
+        """Subscriber handler — payload is already JSON-decoded."""
+        if not self._running:
+            return
         try:
-            async for message in pubsub.listen():
-                if not self._running:
-                    break
-                if message["type"] != "message":
-                    continue
-                try:
-                    trade = json.loads(message["data"])
-                    await self.on_trade(trade)
-                except Exception as e:
-                    logger.error(f"GraphEngine error: {e}")
-        finally:
-            await pubsub.unsubscribe(REDIS_TRADES_CHANNEL)
+            await self.on_trade(trade)
+        except Exception as e:
+            # Subscriber catches handler exceptions, but keep the existing
+            # log site so debug noise stays consistent.
+            logger.error(f"GraphEngine error: {e}")
+            raise
 
     async def _hydrate_recent_trades(self) -> None:
         """Prime the in-memory buffer so follower detection survives process restarts."""

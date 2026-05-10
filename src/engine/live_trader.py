@@ -37,6 +37,7 @@ from loguru import logger
 
 from src.config import settings
 from src.control.killswitch import get_killswitch
+from src.control.redis_pubsub import Subscriber
 from src.database.connection import get_db
 from src.economics.fees import calculate_polymarket_fee
 from src.economics.models import ECONOMIC_MODEL_VERSION, LiquidityRole, StrategyTrack
@@ -95,6 +96,13 @@ class LiveTrader:
         self._running = False
         self._stop_event = asyncio.Event()
         self._open_trades: list[OpenLiveTrade] = []
+        # F-04: dedicated pub/sub client with reconnect+resubscribe.
+        self._subscriber = Subscriber(
+            settings.REDIS_URL, name="engine.live_trader"
+        )
+        self._subscriber.register(
+            REDIS_DECISIONS_LIVE_CHANNEL, self._on_decision_message
+        )
 
     @property
     def dry_run(self) -> bool:
@@ -118,15 +126,23 @@ class LiveTrader:
             f"LiveTrader started "
             f"(dry_run={self.dry_run}, open_positions={len(self._open_trades)})"
         )
-        await asyncio.gather(
-            self._subscribe_loop(),
-            self._monitor_loop(),
-            return_exceptions=True,
-        )
+        await self._subscriber.start()
+        monitor = asyncio.create_task(self._monitor_loop())
+        try:
+            await self._stop_event.wait()
+        except asyncio.CancelledError:
+            pass
+        finally:
+            monitor.cancel()
+            try:
+                await monitor
+            except (asyncio.CancelledError, Exception):
+                pass
 
     async def stop(self) -> None:
         self._running = False
         self._stop_event.set()
+        await self._subscriber.stop()
 
     # ------------------------------------------------------------------ #
     # Persistence                                                         #
@@ -168,26 +184,16 @@ class LiveTrader:
     # Decision subscriber                                                 #
     # ------------------------------------------------------------------ #
 
-    async def _subscribe_loop(self) -> None:
-        pubsub = self._redis.pubsub()
-        await pubsub.subscribe(REDIS_DECISIONS_LIVE_CHANNEL)
+    async def _on_decision_message(self, payload: dict, _channel: str) -> None:
+        """Subscriber handler — payload is already JSON-decoded by the
+        Subscriber, with handler exceptions caught and counted."""
+        if not self._running:
+            return
         try:
-            while self._running:
-                msg = await pubsub.get_message(ignore_subscribe_messages=True, timeout=1.0)
-                if msg is None:
-                    continue
-                try:
-                    payload = json.loads(msg["data"])
-                except Exception as e:
-                    logger.warning(f"LiveTrader: bad decision payload: {e}")
-                    continue
-                try:
-                    await self.open_trade(payload)
-                except Exception:
-                    logger.exception("LiveTrader: open_trade crashed")
-        finally:
-            await pubsub.unsubscribe(REDIS_DECISIONS_LIVE_CHANNEL)
-            await pubsub.aclose()
+            await self.open_trade(payload)
+        except Exception:
+            logger.exception("LiveTrader: open_trade crashed")
+            raise
 
     # ------------------------------------------------------------------ #
     # Open trade                                                          #

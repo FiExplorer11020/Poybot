@@ -23,7 +23,6 @@ us rate-limited just when we need the alerts most).
 from __future__ import annotations
 
 import asyncio
-import json
 import time
 from collections import deque
 from typing import Callable, Optional
@@ -31,9 +30,9 @@ from typing import Callable, Optional
 from loguru import logger
 
 from src.config import settings
+from src.control.redis_pubsub import Subscriber
 from src.telegram_bot import formatters
 from src.telegram_bot.auth import authorized_chat_ids
-
 
 # Channel constants — duplicated here so the notifier doesn't have to
 # import every producer module.
@@ -61,7 +60,20 @@ SendFn = Callable[[int, str], "asyncio.Future"]
 
 
 class TelegramNotifier:
-    """Subscribes to Redis pub/sub and pushes alerts to Telegram."""
+    """Subscribes to Redis pub/sub and pushes alerts to Telegram.
+
+    F-04: prior to Phase 2 Task D this class used ``get_message`` against
+    the shared command client, which made it the only existing subscriber
+    that survived single message bursts cleanly — but it still lost its
+    subscription on a real disconnect. It now delegates to ``Subscriber``
+    for parity with every other subscriber site.
+
+    The constructor still accepts ``redis_client`` for backwards-compat
+    with bot wiring and tests. When provided, that client drives the
+    pub/sub (test fixtures use a fakeredis instance shared with the
+    publisher). When ``None``, a dedicated client is opened from
+    ``settings.REDIS_URL``.
+    """
 
     def __init__(
         self,
@@ -79,8 +91,8 @@ class TelegramNotifier:
         )
         self._sent_timestamps: deque[float] = deque(maxlen=self._max_per_minute or 1)
         self._running = False
-        self._task: Optional[asyncio.Task] = None
         self._stop_event = asyncio.Event()
+        self._subscriber: Subscriber | None = None
 
     # ------------------------------------------------------------------ #
     # Lifecycle                                                           #
@@ -91,64 +103,38 @@ class TelegramNotifier:
             return
         self._running = True
         self._stop_event.clear()
-        self._task = asyncio.create_task(self._run())
+        self._subscriber = Subscriber(
+            settings.REDIS_URL, name="telegram.notifier"
+        )
+        for channel in ALL_CHANNELS:
+            self._subscriber.register(channel, self._on_message)
+        # Tests pass a fakeredis instance via ``redis_client``; production
+        # passes a real ``redis.asyncio.Redis``. Either way, Subscriber
+        # uses it directly instead of opening a fresh URL connection,
+        # because pub/sub in fakeredis only works between handles
+        # spawned from the same FakeRedis() instance.
+        await self._subscriber.start(redis_client=self._redis)
         logger.info("TelegramNotifier started")
 
     async def stop(self) -> None:
         self._running = False
         self._stop_event.set()
-        if self._task:
-            self._task.cancel()
-            try:
-                await self._task
-            except (asyncio.CancelledError, Exception):
-                pass
+        if self._subscriber is not None:
+            await self._subscriber.stop()
+            self._subscriber = None
         logger.info("TelegramNotifier stopped")
 
     # ------------------------------------------------------------------ #
-    # Main loop                                                           #
+    # Subscriber callback                                                 #
     # ------------------------------------------------------------------ #
 
-    async def _run(self) -> None:
-        pubsub = self._redis.pubsub()
-        try:
-            await pubsub.subscribe(*ALL_CHANNELS)
-        except Exception as e:
-            logger.error(f"TelegramNotifier: failed to subscribe: {e}")
-            return
-        try:
-            while self._running:
-                msg = await pubsub.get_message(
-                    ignore_subscribe_messages=True, timeout=1.0
-                )
-                if msg is None:
-                    continue
-                if msg.get("type") != "message":
-                    continue
-                channel = msg.get("channel")
-                if isinstance(channel, bytes):
-                    channel = channel.decode()
-                raw = msg.get("data")
-                if isinstance(raw, bytes):
-                    raw = raw.decode()
-                try:
-                    payload = json.loads(raw) if raw else {}
-                except Exception as e:
-                    logger.warning(
-                        f"TelegramNotifier: bad JSON on {channel}: {e}"
-                    )
-                    continue
-                await self._handle(channel, payload)
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            logger.exception("TelegramNotifier: subscribe loop crashed")
-        finally:
-            try:
-                await pubsub.unsubscribe(*ALL_CHANNELS)
-                await pubsub.aclose()
-            except Exception:
-                pass
+    async def _on_message(self, payload, channel: str) -> None:
+        # Subscriber decodes JSON for us, but if it failed to parse it
+        # would have skipped this handler entirely. Defensive: tolerate
+        # non-dict payloads by coercing.
+        if not isinstance(payload, dict):
+            payload = {}
+        await self._handle(channel, payload)
 
     # ------------------------------------------------------------------ #
     # Routing per-channel                                                 #

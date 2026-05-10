@@ -109,6 +109,50 @@ killswitch_strict_path_total = Counter(
     ["result"],  # enabled|disabled|error
 )
 
+# === Position Tracker persistence (Phase 2 Task C) ===
+# These three are emitted from src/observer/position_tracker.py. The gauge
+# is `set()` after every OPEN / CLOSE; the warm-start counter increments
+# once at boot per row loaded from `position_tracker_state`; the eviction
+# counter fires when MAX_OPEN_POSITIONS_TRACKED is hit and we drop the
+# oldest open by open_time.
+position_tracker_open_count = Gauge(
+    "polybot_position_tracker_open_count",
+    "Current number of positions tracked as OPEN",
+)
+position_tracker_warm_start_loaded_total = Counter(
+    "polybot_position_tracker_warm_start_loaded_total",
+    "Positions loaded into PositionTracker on warm-start",
+)
+position_tracker_evictions_total = Counter(
+    "polybot_position_tracker_evictions_total",
+    "Positions evicted from PositionTracker due to MAX_OPEN_POSITIONS_TRACKED",
+)
+
+# === Redis pub/sub subscribers (Phase 2 Task D — audit F-04) ===
+# Owned by ``src/control/redis_pubsub.py``. Every subscriber site that
+# previously shared the project-wide Redis client and re-iterated
+# silently on disconnect is now wrapped in a Subscriber that bumps
+# these counters on reconnect / message / handler-error.
+redis_subscribers_active = Gauge(
+    "polybot_redis_subscribers_active",
+    "Currently-running Subscriber instances",
+)
+redis_subscriber_reconnects_total = Counter(
+    "polybot_redis_subscriber_reconnects_total",
+    "Subscriber reconnect events",
+    ["subscriber", "reason"],  # reason: timeout|conn_error|other
+)
+redis_subscriber_messages_total = Counter(
+    "polybot_redis_subscriber_messages_total",
+    "Messages received by a subscriber",
+    ["subscriber", "channel"],
+)
+redis_subscriber_handler_errors_total = Counter(
+    "polybot_redis_subscriber_handler_errors_total",
+    "Handler-raised exceptions inside a subscriber",
+    ["subscriber", "channel"],
+)
+
 
 # ---------------------------------------------------------------------------
 # Build info — best-effort. Surfaces version + git short-SHA on /metrics so a

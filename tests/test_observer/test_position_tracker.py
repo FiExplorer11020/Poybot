@@ -29,6 +29,26 @@ _T1 = datetime(2024, 6, 1, 11, 0, 0, tzinfo=timezone.utc)  # T0 + 1 hour
 
 
 # ---------------------------------------------------------------------------
+# Phase 2 Task C: PositionTracker now writes to position_tracker_state too.
+# Each `conn.execute(...)` no longer corresponds 1:1 to a positions_reconstructed
+# INSERT — tests that introspect call args need to filter for the INSERT call
+# specifically. These helpers keep the existing assertions readable.
+# ---------------------------------------------------------------------------
+
+
+_CLOSE_INSERT_SQL_FRAGMENT = "INSERT INTO positions_reconstructed"
+
+
+def _close_insert_calls(conn):
+    """Return only the execute() calls that wrote to positions_reconstructed."""
+    return [
+        c for c in conn.execute.call_args_list
+        if c.args and isinstance(c.args[0], str)
+        and _CLOSE_INSERT_SQL_FRAGMENT in c.args[0]
+    ]
+
+
+# ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
@@ -162,10 +182,12 @@ async def test_sell_closes_position():
     key = (_WALLET, _MARKET, _TOKEN_YES)
     assert key not in tracker._open_positions
 
-    # DB insert called once for the close
-    conn.execute.assert_awaited_once()
-    # Verify close_method arg ($13) while V1 audit columns are appended after it.
-    args = conn.execute.call_args[0]
+    # Exactly one positions_reconstructed INSERT for the close (the OPEN
+    # UPSERT and the same-tx state DELETE add extra execute() calls — see
+    # Phase 2 Task C).
+    inserts = _close_insert_calls(conn)
+    assert len(inserts) == 1
+    args = inserts[0].args
     assert args[13] == "sell"
 
 
@@ -188,8 +210,9 @@ async def test_partial_close_splits_position():
     remaining_pos = tracker._open_positions[key][0]
     assert remaining_pos.shares_remaining == Decimal("600")
 
-    # Exactly one DB execute for the partial close
-    conn.execute.assert_awaited_once()
+    # Exactly one positions_reconstructed INSERT for the partial close.
+    inserts = _close_insert_calls(conn)
+    assert len(inserts) == 1
 
 
 # ---------------------------------------------------------------------------
@@ -200,12 +223,13 @@ async def test_partial_close_splits_position():
 @pytest.mark.asyncio
 async def test_pnl_calculation_profit():
     tracker, _ = _make_tracker(fee_rate=0)
-    captured_args: list = []
+    # Capture (sql, args) tuples so we can pick out the close INSERT.
+    captured: list[tuple[str, tuple]] = []
 
     conn = _make_conn()
 
     async def capture_execute(sql, *args):
-        captured_args.extend(args)
+        captured.append((sql, args))
 
     conn.execute = AsyncMock(side_effect=capture_execute)
 
@@ -215,12 +239,13 @@ async def test_pnl_calculation_profit():
         # SELL at 0.70 for 600 USDC
         await tracker.on_trade(_sell_trade(price="0.70", size_usdc="600"))
 
-    # pnl_usdc is the 10th positional arg (index 9, 0-based)
-    # INSERT params: wallet, market, token, direction, open_time, close_time,
-    #                entry_price, exit_price, size_usdc, pnl_usdc, pnl_pct, holding_s, method
-    # Indices:       0       1       2      3          4          5           6           7
-    #                8           9         10       11          12
-    pnl_usdc = captured_args[9]
+    # Find the positions_reconstructed INSERT (Phase 2 Task C also UPSERTs
+    # `position_tracker_state` and DELETEs it inside the same close tx).
+    insert_args = next(
+        a for s, a in captured if _CLOSE_INSERT_SQL_FRAGMENT in s
+    )
+    # pnl_usdc is the 10th positional arg (index 9, 0-based).
+    pnl_usdc = insert_args[9]
 
     # shares=1000; gross = (0.70 - 0.60) * 1000 = 100 USDC
     assert abs(float(pnl_usdc) - 100.0) < 0.02
@@ -234,12 +259,12 @@ async def test_pnl_calculation_profit():
 @pytest.mark.asyncio
 async def test_fee_deduction_in_pnl():
     tracker, _ = _make_tracker(fee_rate=0.01)  # 1% fee as decimal rate
-    captured_args: list = []
+    captured: list[tuple[str, tuple]] = []
 
     conn = _make_conn()
 
     async def capture_execute(sql, *args):
-        captured_args.extend(args)
+        captured.append((sql, args))
 
     conn.execute = AsyncMock(side_effect=capture_execute)
 
@@ -247,7 +272,10 @@ async def test_fee_deduction_in_pnl():
         await tracker.on_trade(_buy_trade(price="0.60", size_usdc="600"))
         await tracker.on_trade(_sell_trade(price="0.70", size_usdc="600"))
 
-    pnl_usdc = captured_args[9]
+    insert_args = next(
+        a for s, a in captured if _CLOSE_INSERT_SQL_FRAGMENT in s
+    )
+    pnl_usdc = insert_args[9]
 
     # gross = (0.70 - 0.60) * 1000 = 100
     # entry_fee = 1000 * 0.01 * 0.60 * 0.40 = 2.40
@@ -264,12 +292,12 @@ async def test_fee_deduction_in_pnl():
 @pytest.mark.asyncio
 async def test_holding_period_calculated():
     tracker, _ = _make_tracker()
-    captured_args: list = []
+    captured: list[tuple[str, tuple]] = []
 
     conn = _make_conn()
 
     async def capture_execute(sql, *args):
-        captured_args.extend(args)
+        captured.append((sql, args))
 
     conn.execute = AsyncMock(side_effect=capture_execute)
 
@@ -280,8 +308,11 @@ async def test_holding_period_calculated():
         await tracker.on_trade(_buy_trade(time=open_time))
         await tracker.on_trade(_sell_trade(time=close_time))
 
-    # holding_period_s is the 12th positional arg (index 11)
-    holding_s = captured_args[11]
+    insert_args = next(
+        a for s, a in captured if _CLOSE_INSERT_SQL_FRAGMENT in s
+    )
+    # holding_period_s is the 12th positional arg (index 11).
+    holding_s = insert_args[11]
     assert holding_s == 3600
 
 
@@ -306,10 +337,13 @@ async def test_market_resolution_closes_all():
     remaining = [k for k in tracker._open_positions if k[1] == _MARKET]
     assert remaining == []
 
-    # Two DB inserts, both with close_method='resolution'
-    assert conn.execute.await_count == 2
-    for c in conn.execute.call_args_list:
-        method = c[0][13]
+    # Exactly two positions_reconstructed INSERTs (one per close), both
+    # with close_method='resolution'. The OPEN UPSERTs and same-tx DELETEs
+    # add extra execute() calls — see Phase 2 Task C.
+    inserts = _close_insert_calls(conn)
+    assert len(inserts) == 2
+    for c in inserts:
+        method = c.args[13]
         assert method == "resolution"
 
 
@@ -368,10 +402,10 @@ async def test_merge_exit_closes_sibling_position():
     tracker._market_tokens[_MARKET] = (_TOKEN_YES, _TOKEN_NO)
     conn = _make_conn()
 
-    captured_args: list = []
+    captured: list[tuple[str, tuple]] = []
 
     async def capture_execute(sql, *args):
-        captured_args.append(args)
+        captured.append((sql, args))
 
     conn.execute = AsyncMock(side_effect=capture_execute)
 
@@ -394,9 +428,14 @@ async def test_merge_exit_closes_sibling_position():
     assert (_WALLET, _MARKET, _TOKEN_YES) not in tracker._open_positions
     assert (_WALLET, _MARKET, _TOKEN_NO) not in tracker._open_positions
 
-    # Exactly one INSERT for the merged close
-    assert len(captured_args) == 1
-    close_args = captured_args[0]
+    # Filter for the positions_reconstructed INSERT — Phase 2 Task C now
+    # also UPSERTs `position_tracker_state` on the OPEN and DELETEs it
+    # inside the close tx, so total execute() calls > 1.
+    close_inserts = [
+        a for s, a in captured if _CLOSE_INSERT_SQL_FRAGMENT in s
+    ]
+    assert len(close_inserts) == 1
+    close_args = close_inserts[0]
     # close_method is $13 → index 12
     assert close_args[12] == "merge"
     # exit_price $8 → index 7 should be 1 - 0.40 = 0.60
@@ -429,7 +468,11 @@ async def test_merge_skipped_outside_window():
     # Both positions remain open (no merge)
     assert (_WALLET, _MARKET, _TOKEN_YES) in tracker._open_positions
     assert (_WALLET, _MARKET, _TOKEN_NO) in tracker._open_positions
-    conn.execute.assert_not_awaited()
+    # No positions_reconstructed INSERT was issued — the OPEN UPSERTs into
+    # `position_tracker_state` still fire (Phase 2 Task C) so we can't
+    # claim `assert_not_awaited()` anymore. The contract here is "no close
+    # was recorded".
+    assert _close_insert_calls(conn) == []
 
 
 @pytest.mark.asyncio

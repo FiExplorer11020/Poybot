@@ -15,6 +15,7 @@ import numpy as np
 from loguru import logger
 
 from src.config import settings
+from src.control.redis_pubsub import Subscriber
 from src.database.connection import get_db
 from src.economics.gates import BookSnapshotRef, evaluate_signal_gate
 from src.economics.models import ECONOMIC_MODEL_VERSION, FeeSnapshot, StrategyTrack
@@ -77,39 +78,43 @@ class ConfidenceEngine:
         self._stop_event = asyncio.Event()
         # Per-wallet Thompson state: {wallet: {"follow": [a, b], "fade": [a, b]}}
         self._thompson: dict[str, dict] = {}
+        # F-04: dedicated pub/sub client with reconnect+resubscribe.
+        self._subscriber = Subscriber(
+            settings.REDIS_URL, name="engine.confidence"
+        )
+        self._subscriber.register(
+            REDIS_TRADES_CHANNEL, self._on_trade_message
+        )
 
     async def start(self) -> None:
         self._running = True
         self._stop_event.clear()
-        await self._subscribe_loop()
+        await self._subscriber.start()
+        try:
+            await self._stop_event.wait()
+        except asyncio.CancelledError:
+            pass
 
     async def stop(self) -> None:
         self._running = False
         self._stop_event.set()
+        await self._subscriber.stop()
 
-    async def _subscribe_loop(self) -> None:
-        pubsub = self._redis.pubsub()
-        await pubsub.subscribe(REDIS_TRADES_CHANNEL)
+    async def _on_trade_message(self, trade: dict, _channel: str) -> None:
+        if not self._running:
+            return
         try:
-            async for message in pubsub.listen():
-                if not self._running:
-                    break
-                if message["type"] != "message":
-                    continue
-                try:
-                    trade = json.loads(message["data"])
-                    if not trade.get("is_leader"):
-                        continue
-                    decision = await self.evaluate(trade)
-                    if decision:
-                        if self._router is not None:
-                            await self._router.route(decision)
-                        else:
-                            await self._emit(decision)
-                except Exception as e:
-                    logger.error(f"ConfidenceEngine error: {e}")
-        finally:
-            await pubsub.unsubscribe(REDIS_TRADES_CHANNEL)
+            if not trade.get("is_leader"):
+                return
+            decision = await self.evaluate(trade)
+            if decision:
+                if self._router is not None:
+                    await self._router.route(decision)
+                else:
+                    await self._emit(decision)
+        except Exception as e:
+            logger.error(f"ConfidenceEngine error: {e}")
+            raise
 
     def _parse_trade_time(self, trade: dict) -> datetime:
         ts = trade.get("time")

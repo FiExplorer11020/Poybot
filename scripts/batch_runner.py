@@ -134,14 +134,153 @@ async def step_backfill_decision_learning() -> None:
 
 
 async def step_cleanup_old_trades() -> None:
-    """Step H: Delete trades older than RETENTION_TRADES_DAYS."""
+    """Step H: Drop trades_observed partitions older than RETENTION_TRADES_DAYS.
+
+    Migration 013 (Phase 2 Task A) converted trades_observed to native PG
+    declarative range partitioning by `time`. Retention is therefore now:
+
+      1. For each child partition whose upper-bound is older than cutoff,
+         DROP PARTITION (instant, no vacuum churn — the architect's #1 ROI
+         move per docs/audit/03_schema_evolution.md M11).
+      2. For the trades_observed_default partition (catches out-of-range
+         rows that should normally be empty), fall back to a bounded DELETE.
+         If the default ever accumulates rows, the maintenance script has
+         fallen behind: log a warning and clean up by row.
+
+    Backwards compatibility:
+      * If trades_observed is NOT yet partitioned (migration 013 not
+        applied), fall back to the legacy `DELETE FROM trades_observed
+        WHERE time < cutoff` path. This keeps dev environments and CI
+        with older schema snapshots working.
+
+    The two paths are mutually exclusive: pg_class.relkind tells us which
+    one to take. Both honour RETENTION_TRADES_DAYS exactly.
+    """
     cutoff = datetime.now(tz=timezone.utc) - timedelta(days=settings.RETENTION_TRADES_DAYS)
+
     async with get_db() as conn:
-        await conn.execute(
-            "DELETE FROM trades_observed WHERE time < $1",
-            cutoff,
+        relkind = await conn.fetchval(
+            "SELECT relkind FROM pg_class WHERE relname = 'trades_observed'"
         )
-    logger.info(f"Cleanup: deleted old trades before {cutoff.date()}")
+
+        if relkind != "p":
+            # Legacy path — non-partitioned table. Keep the old DELETE.
+            tag = await conn.execute(
+                "DELETE FROM trades_observed WHERE time < $1",
+                cutoff,
+            )
+            try:
+                deleted = int(tag.split()[-1])
+            except (AttributeError, ValueError, IndexError):
+                deleted = 0
+            logger.info(
+                f"Cleanup (legacy/non-partitioned): deleted {deleted} trades "
+                f"before {cutoff.date()}"
+            )
+            return
+
+        # Partitioned path — DROP PARTITION for fully-aged-out children.
+        # pg_partition_bounds gives us "FROM ('2026-04-01') TO ('2026-05-01')"
+        # as a string; we parse the TO bound and drop only partitions whose
+        # upper bound is <= cutoff (the whole partition is past retention).
+        children = await conn.fetch(
+            """
+            SELECT
+                c.relname AS partition_name,
+                pg_get_expr(c.relpartbound, c.oid) AS bound_expr
+            FROM pg_inherits i
+            JOIN pg_class p   ON p.oid = i.inhparent
+            JOIN pg_class c   ON c.oid = i.inhrelid
+            WHERE p.relname = 'trades_observed'
+              AND c.relkind = 'r'
+            ORDER BY c.relname
+            """
+        )
+
+        dropped: list[str] = []
+        default_partition: str | None = None
+
+        for row in children:
+            name = row["partition_name"]
+            bound = row["bound_expr"] or ""
+            if "DEFAULT" in bound.upper():
+                default_partition = name
+                continue
+            upper = _parse_partition_upper_bound(bound)
+            if upper is None:
+                logger.warning(
+                    f"Cleanup: could not parse bound for partition {name!r}: "
+                    f"{bound!r}. Skipping."
+                )
+                continue
+            if upper <= cutoff:
+                # Whole partition is older than retention — drop it.
+                # Quoted identifier defensively (partitions are always
+                # snake-case from our maintenance script, but be safe).
+                await conn.execute(f'DROP TABLE IF EXISTS "{name}"')
+                dropped.append(name)
+
+        # Sweep the default partition by row, if any rows leaked in.
+        default_deleted = 0
+        if default_partition is not None:
+            tag = await conn.execute(
+                f'DELETE FROM "{default_partition}" WHERE time < $1',
+                cutoff,
+            )
+            try:
+                default_deleted = int(tag.split()[-1])
+            except (AttributeError, ValueError, IndexError):
+                default_deleted = 0
+            if default_deleted > 0:
+                logger.warning(
+                    f"Cleanup: deleted {default_deleted} row(s) from "
+                    f"{default_partition!r} — the rolling partition creator "
+                    f"may be falling behind. Investigate "
+                    f"scripts/maintenance/create_trades_partitions.py cron."
+                )
+
+    if dropped:
+        logger.info(
+            f"Cleanup (partitioned): dropped {len(dropped)} partition(s) "
+            f"older than {cutoff.date()}: {', '.join(dropped)}"
+        )
+    else:
+        logger.info(
+            f"Cleanup (partitioned): nothing to drop before {cutoff.date()} "
+            f"(default partition delta: {default_deleted})"
+        )
+
+
+def _parse_partition_upper_bound(bound_expr: str) -> datetime | None:
+    """
+    Extract the upper bound from a partition bound expression like:
+
+        FOR VALUES FROM ('2026-04-01 00:00:00+00') TO ('2026-05-01 00:00:00+00')
+
+    Returns the upper bound as an aware UTC datetime, or None if parsing
+    fails (which we treat as "skip this partition" — never as "drop it").
+
+    Intentionally regex-free for clarity; the format is fixed by PG.
+    """
+    if not bound_expr:
+        return None
+    marker = "TO ("
+    idx = bound_expr.find(marker)
+    if idx < 0:
+        return None
+    rest = bound_expr[idx + len(marker):]
+    # Trim trailing ")" and surrounding quotes.
+    end = rest.rfind(")")
+    if end < 0:
+        return None
+    inner = rest[:end].strip().strip("'").strip('"').strip()
+    try:
+        dt = datetime.fromisoformat(inner)
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt
 
 
 # --------------------------------------------------------------------------- #

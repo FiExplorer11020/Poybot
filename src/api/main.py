@@ -104,12 +104,24 @@ async def lifespan(app: FastAPI):
     get_killswitch(redis_client=_redis)
     # Initialise runtime config (Risk & Config Option 2: mutable params).
     init_runtime_config(redis_client=_redis)
+    # Phase 2 Task D: push-invalidate local cache on runtime_config:changed.
+    # The API publishes here from `set_overrides`; subscribing here as
+    # well means a curl-driven override picked up by another API replica
+    # invalidates this one immediately rather than 30s later.
+    try:
+        await get_runtime_config().start_pubsub()
+    except Exception as exc:
+        logger.warning(f"runtime_config pub/sub init failed: {exc}")
     await _bridge.start()
     _schedule_falcon_probe()
     push_task = asyncio.create_task(_stats_push_loop())
     logger.info("Dashboard API started")
     yield
     push_task.cancel()
+    try:
+        await get_runtime_config().stop_pubsub()
+    except Exception:
+        pass
     await _bridge.stop()
     if created_pool and _pool:
         await _pool.close()

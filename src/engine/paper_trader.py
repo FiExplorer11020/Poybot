@@ -22,6 +22,7 @@ from datetime import datetime, timedelta, timezone
 from loguru import logger
 
 from src.config import settings
+from src.control.redis_pubsub import Subscriber
 from src.database.connection import get_db
 from src.economics.fees import calculate_polymarket_fee
 from src.economics.models import ECONOMIC_MODEL_VERSION, LiquidityRole, StrategyTrack
@@ -79,6 +80,13 @@ class PaperTrader:
         self._peak_capital = settings.PAPER_CAPITAL_USDC
         self._realized_pnl_cum: float = 0.0
         self._state_loaded: bool = False
+        # F-04: dedicated pub/sub client with reconnect+resubscribe.
+        self._subscriber = Subscriber(
+            settings.REDIS_URL, name="engine.paper_trader"
+        )
+        self._subscriber.register(
+            REDIS_DECISIONS_CHANNEL, self._on_decision_message
+        )
 
     @property
     def capital(self) -> float:
@@ -131,14 +139,22 @@ class PaperTrader:
         self._running = True
         self._stop_event.clear()
         await self.load_persisted_state()
-        tasks = [
-            asyncio.create_task(self._subscribe_loop()),
-            asyncio.create_task(self._monitor_loop()),
-        ]
+        # Kick off the dedicated reconnect-safe subscriber for the
+        # decisions channel. The monitor loop stays in the main task so
+        # `await start()` blocks until shutdown — same external contract
+        # as before.
+        await self._subscriber.start()
+        monitor = asyncio.create_task(self._monitor_loop())
         try:
-            await asyncio.gather(*tasks)
+            await self._stop_event.wait()
         except asyncio.CancelledError:
             pass
+        finally:
+            monitor.cancel()
+            try:
+                await monitor
+            except (asyncio.CancelledError, Exception):
+                pass
 
     async def load_persisted_state(self) -> None:
         """Hydrate capital, peak, and the in-memory open-trade list from DB.
@@ -283,24 +299,18 @@ class PaperTrader:
     async def stop(self) -> None:
         self._running = False
         self._stop_event.set()
+        await self._subscriber.stop()
 
-    async def _subscribe_loop(self) -> None:
-        pubsub = self._redis.pubsub()
-        await pubsub.subscribe(REDIS_DECISIONS_CHANNEL)
+    async def _on_decision_message(self, decision: dict, _channel: str) -> None:
+        """Subscriber handler — payload is already JSON-decoded."""
+        if not self._running:
+            return
         try:
-            async for message in pubsub.listen():
-                if not self._running:
-                    break
-                if message["type"] != "message":
-                    continue
-                try:
-                    decision = json.loads(message["data"])
-                    if decision.get("action") in ("follow", "fade"):
-                        await self.open_trade(decision)
-                except Exception as e:
-                    logger.error(f"PaperTrader subscribe error: {e}")
-        finally:
-            await pubsub.unsubscribe(REDIS_DECISIONS_CHANNEL)
+            if decision.get("action") in ("follow", "fade"):
+                await self.open_trade(decision)
+        except Exception as e:
+            logger.error(f"PaperTrader subscribe error: {e}")
+            raise
 
     async def _monitor_loop(self) -> None:
         """Check open positions every 60s for stop-loss / take-profit / other triggers."""

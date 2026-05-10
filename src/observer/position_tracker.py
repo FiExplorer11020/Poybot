@@ -1,6 +1,13 @@
 """
 Position Tracker — reconstructs OPEN→CLOSE position cycles from trades_observed.
 Subscribes to Redis trades:observed, maintains in-memory state, writes to positions_reconstructed.
+
+Phase 2 Task C: in-memory `_open_positions` is now mirrored into the
+`position_tracker_state` table. Every OPEN UPSERTs; every CLOSE DELETEs
+inside the SAME transaction as the `positions_reconstructed` INSERT, so a
+state-table row never outlives its close. `warm_start(conn)` rehydrates on
+engine boot. `MAX_OPEN_POSITIONS_TRACKED` (env-overridable) caps the dict;
+overflow evicts the oldest open by `open_time`.
 """
 
 import asyncio
@@ -11,10 +18,17 @@ from decimal import Decimal
 
 from loguru import logger
 
+from src.config import settings
+from src.control.redis_pubsub import Subscriber
 from src.database.connection import get_db
 from src.economics.fees import calculate_polymarket_fee
 from src.economics.models import ECONOMIC_MODEL_VERSION, LiquidityRole
 from src.economics.pnl import calculate_long_pnl
+from src.monitoring.metrics import (
+    position_tracker_evictions_total,
+    position_tracker_open_count,
+    position_tracker_warm_start_loaded_total,
+)
 
 REDIS_TRADES_CHANNEL = "trades:observed"
 REDIS_POSITIONS_CHANNEL = "positions:closed"
@@ -47,32 +61,39 @@ class PositionTracker:
         self._market_tokens: dict[str, tuple[str | None, str | None]] = {}
         self._running = False
         self._stop_event = asyncio.Event()
+        # F-04: dedicated pub/sub client with reconnect+resubscribe. The
+        # previous code shared `self._redis` (the command-issuing client)
+        # and silently lost subscriptions on disconnect.
+        self._subscriber = Subscriber(
+            settings.REDIS_URL, name="observer.position_tracker"
+        )
+        self._subscriber.register(REDIS_TRADES_CHANNEL, self._on_trade_message)
 
     async def start(self) -> None:
         self._running = True
         self._stop_event.clear()
-        await self._subscribe_loop()
+        await self._subscriber.start()
+        try:
+            await self._stop_event.wait()
+        except asyncio.CancelledError:
+            pass
 
     async def stop(self) -> None:
         self._running = False
         self._stop_event.set()
+        await self._subscriber.stop()
 
-    async def _subscribe_loop(self) -> None:
-        pubsub = self._redis.pubsub()
-        await pubsub.subscribe(REDIS_TRADES_CHANNEL)
+    async def _on_trade_message(self, trade: dict, _channel: str) -> None:
+        """Subscriber handler — payload is already JSON-decoded."""
+        if not self._running:
+            return
         try:
-            async for message in pubsub.listen():
-                if not self._running:
-                    break
-                if message["type"] != "message":
-                    continue
-                try:
-                    trade = json.loads(message["data"])
-                    await self.on_trade(trade)
-                except Exception as e:
-                    logger.error(f"PositionTracker error processing message: {e}")
-        finally:
-            await pubsub.unsubscribe(REDIS_TRADES_CHANNEL)
+            await self.on_trade(trade)
+        except Exception as e:
+            # Subscriber bumps handler-error metric; keep the existing
+            # log site for continuity with pre-fix debug noise.
+            logger.error(f"PositionTracker error processing message: {e}")
+            raise
 
     async def on_trade(self, trade: dict) -> None:
         """Process a single trade dict. Called by _subscribe_loop or directly in tests."""
@@ -210,6 +231,18 @@ class PositionTracker:
         )
         key = (wallet, market_id, token_id)
         self._open_positions.setdefault(key, []).append(pos)
+
+        # Persist to position_tracker_state so the OPEN survives restart.
+        # The primary key is (wallet, market, token, direction); FIFO slots
+        # for the same key collapse onto one row whose typed columns reflect
+        # the HEAD slot. That's a small loss of fidelity vs the in-memory
+        # list of slots, but the alternative (per-slot rows) would need a
+        # synthetic slot_id and the data audit only cared about not losing
+        # in-flight opens — losing the per-slot breakdown is acceptable.
+        # See docs/audit/phase2/C_position_tracker_state.md.
+        await self._persist_open_state(pos)
+        self._recompute_open_gauge()
+        await self._enforce_capacity()
 
     async def _handle_sell(
         self,
@@ -373,9 +406,37 @@ class PositionTracker:
                         ECONOMIC_MODEL_VERSION,
                         category,
                     )
+                    # Same-tx state-row delete (Phase 2 Task C).
+                    # The transaction wraps BOTH writes — if either raises
+                    # everything rolls back, and a leftover state row can't
+                    # outlive its positions_reconstructed close. The row
+                    # may not exist (a CLOSE for a slot that was never
+                    # persisted, e.g. a stale unit test); DELETE is a no-op
+                    # in that case.
+                    await conn.execute(
+                        """
+                        DELETE FROM position_tracker_state
+                        WHERE wallet_address = $1
+                          AND market_id = $2
+                          AND token_id = $3
+                          AND direction = $4
+                        """,
+                        pos.wallet_address,
+                        pos.market_id,
+                        pos.token_id,
+                        pos.direction,
+                    )
         except Exception as e:
             logger.error(f"Failed to insert closed position: {e}")
             return
+
+        # Outside the tx: if any slots remain for this (wallet, market,
+        # token, direction) the state-row needs to come back. _close_position
+        # is invoked with a slot in hand BEFORE the caller mutates the list,
+        # so we re-check via the live FIFO queue and re-persist the HEAD if
+        # anything is still open. This keeps the table consistent with the
+        # in-memory FIFO under partial closes / multi-slot keys.
+        await self._sync_state_after_close(pos)
 
         event = {
             "wallet_address": pos.wallet_address,
@@ -400,6 +461,8 @@ class PositionTracker:
             await self._redis.publish(REDIS_POSITIONS_CHANNEL, json.dumps(event))
         except Exception as e:
             logger.warning(f"Failed to publish position close: {e}")
+
+        self._recompute_open_gauge()
 
     async def close_market_positions(self, market_id: str, resolution_price: Decimal) -> None:
         """Close all open positions for a resolved market at the resolution price."""
@@ -482,3 +545,288 @@ class PositionTracker:
             return "no"
         # If yes is known and matches, or if neither token is known, default to 'yes'.
         return "yes"
+
+    # ------------------------------------------------------------------ #
+    # Persistence (Phase 2 Task C)                                        #
+    # ------------------------------------------------------------------ #
+
+    def _recompute_open_gauge(self) -> None:
+        """Sync the polybot_position_tracker_open_count gauge with reality.
+        Counts SLOTS (sum of list lengths), not unique keys — one key may
+        hold multiple FIFO slots when a wallet opens, partially closes,
+        then re-opens the same (market, token) leg."""
+        total = sum(len(v) for v in self._open_positions.values())
+        try:
+            position_tracker_open_count.set(total)
+        except Exception:
+            # Metrics must never break the hot path.
+            pass
+
+    def _aggregate_for_persistence(self, key: tuple) -> OpenPosition | None:
+        """Collapse the FIFO list for `key` into a single OpenPosition row.
+
+        The DB primary key is (wallet, market, token, direction) so we can't
+        store one row per FIFO slot without inventing a synthetic ordinal.
+        We pick the HEAD slot (oldest open_time, the next to close) — that's
+        the slot whose open_time we need on warm-start to make merge-window
+        and holding-period calculations correct. The aggregate's
+        shares_remaining / size_shares / size_usdc sum across all slots so
+        the captured exposure is faithful even if we only re-create the
+        head slot on warm-start.
+
+        Returns None when the key has no slots (caller should delete the
+        row instead of UPSERTing).
+        """
+        positions = self._open_positions.get(key)
+        if not positions:
+            return None
+        head = positions[0]
+        total_shares = sum((p.size_shares for p in positions), Decimal("0"))
+        total_remaining = sum((p.shares_remaining for p in positions), Decimal("0"))
+        total_usdc = sum((p.size_usdc for p in positions), Decimal("0"))
+        return OpenPosition(
+            wallet_address=head.wallet_address,
+            market_id=head.market_id,
+            token_id=head.token_id,
+            direction=head.direction,
+            open_time=head.open_time,
+            entry_price=head.entry_price,
+            size_usdc=total_usdc,
+            size_shares=total_shares,
+            shares_remaining=total_remaining,
+            fee_rate_pct=head.fee_rate_pct,
+        )
+
+    async def _persist_open_state(self, pos: OpenPosition) -> None:
+        """UPSERT the aggregate row for pos's (wallet, market, token, dir).
+
+        Called from `_handle_buy` after appending to the in-memory list,
+        so the aggregate reflects ALL slots (including the one we just
+        added). Failure is logged but not raised — the in-memory state is
+        authoritative for the running process; the DB copy is a restart
+        safety-net. A persistence error must NOT cause us to mis-report a
+        position as not open."""
+        key = (pos.wallet_address, pos.market_id, pos.token_id)
+        agg = self._aggregate_for_persistence(key) or pos
+        try:
+            async with get_db() as conn:
+                async with conn.transaction():
+                    await conn.execute(
+                        """
+                        INSERT INTO position_tracker_state
+                            (wallet_address, market_id, token_id, direction,
+                             open_time, entry_price, size_usdc, size_shares,
+                             shares_remaining, fee_rate_pct, state_json,
+                             updated_at)
+                        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11::jsonb,NOW())
+                        ON CONFLICT (wallet_address, market_id, token_id, direction)
+                        DO UPDATE SET
+                            open_time        = EXCLUDED.open_time,
+                            entry_price      = EXCLUDED.entry_price,
+                            size_usdc        = EXCLUDED.size_usdc,
+                            size_shares      = EXCLUDED.size_shares,
+                            shares_remaining = EXCLUDED.shares_remaining,
+                            fee_rate_pct     = EXCLUDED.fee_rate_pct,
+                            state_json       = EXCLUDED.state_json,
+                            updated_at       = NOW()
+                        """,
+                        agg.wallet_address,
+                        agg.market_id,
+                        agg.token_id,
+                        agg.direction,
+                        agg.open_time,
+                        agg.entry_price,
+                        agg.size_usdc,
+                        agg.size_shares,
+                        agg.shares_remaining,
+                        agg.fee_rate_pct,
+                        "{}",
+                    )
+        except Exception as e:
+            logger.warning(
+                f"position_tracker_state UPSERT failed "
+                f"(wallet={pos.wallet_address}, market={pos.market_id}, "
+                f"token={pos.token_id}): {e}"
+            )
+
+    async def _sync_state_after_close(self, pos: OpenPosition) -> None:
+        """After a CLOSE, reconcile the state row with the in-memory FIFO.
+
+        `_close_position` already DELETEd the row inside the same tx that
+        wrote `positions_reconstructed`. If any slots remain for this key
+        (partial close on a multi-slot key, or one FIFO slot consumed of
+        many), we need to UPSERT a fresh aggregate so warm-start can
+        rehydrate the residual exposure.
+
+        Implementation note: we run this OUTSIDE the close transaction.
+        The DELETE-then-UPSERT pattern means a crash between the two
+        leaves the in-memory state ahead of the DB by one slot — the
+        next OPEN / CLOSE on the same key will re-converge them. A
+        single-tx UPSERT-OR-DELETE would be cleaner but requires another
+        round-trip BEFORE the positions_reconstructed insert (we don't
+        know the post-close shares_remaining until the slot is consumed),
+        and the audit only required the DELETE to be inside the tx."""
+        key = (pos.wallet_address, pos.market_id, pos.token_id)
+        # If the caller already popped the slot (`_handle_sell`), the list
+        # for this key may be empty — leave the DB row deleted.
+        if self._open_positions.get(key):
+            agg = self._aggregate_for_persistence(key)
+            if agg is not None and agg.shares_remaining > Decimal("0"):
+                await self._persist_open_state(agg)
+
+    async def _enforce_capacity(self) -> None:
+        """Evict the OLDEST open by open_time when SLOT count exceeds
+        MAX_OPEN_POSITIONS_TRACKED.
+
+        The audit flagged unbounded growth as the root cause of the red
+        flag we're addressing — with persistence in place we also need a
+        ceiling. Eviction is best-effort: we drop the in-memory slot, then
+        attempt to DELETE the matching row from position_tracker_state.
+        If the DB delete fails the next restart could re-hydrate the
+        evicted slot from `position_tracker_state` — log loudly so ops
+        can clean up manually.
+        """
+        cap = getattr(settings, "MAX_OPEN_POSITIONS_TRACKED", 10_000)
+        if cap <= 0:
+            return
+        total = sum(len(v) for v in self._open_positions.values())
+        while total > cap:
+            # Find the oldest slot across all keys.
+            oldest_key: tuple | None = None
+            oldest_pos: OpenPosition | None = None
+            for k, slots in self._open_positions.items():
+                for slot in slots:
+                    if oldest_pos is None or slot.open_time < oldest_pos.open_time:
+                        oldest_key = k
+                        oldest_pos = slot
+            if oldest_key is None or oldest_pos is None:
+                break
+            slots = self._open_positions.get(oldest_key) or []
+            try:
+                slots.remove(oldest_pos)
+            except ValueError:
+                # Shouldn't happen (we just found it) — protect the loop
+                # from getting stuck.
+                break
+            if not slots and oldest_key in self._open_positions:
+                del self._open_positions[oldest_key]
+            try:
+                position_tracker_evictions_total.inc()
+            except Exception:
+                pass
+            logger.warning(
+                f"PositionTracker eviction (over {cap} open slots): "
+                f"dropped wallet={oldest_pos.wallet_address} "
+                f"market={oldest_pos.market_id} token={oldest_pos.token_id} "
+                f"opened={oldest_pos.open_time.isoformat()}"
+            )
+            # Re-sync the DB row for this key. If the key now has zero
+            # slots → DELETE; otherwise UPSERT a fresh aggregate.
+            await self._sync_state_after_eviction(oldest_pos)
+            total = sum(len(v) for v in self._open_positions.values())
+        self._recompute_open_gauge()
+
+    async def _sync_state_after_eviction(self, evicted: OpenPosition) -> None:
+        """Mirror the eviction in position_tracker_state."""
+        key = (evicted.wallet_address, evicted.market_id, evicted.token_id)
+        if self._open_positions.get(key):
+            await self._persist_open_state(evicted)
+            return
+        try:
+            async with get_db() as conn:
+                async with conn.transaction():
+                    await conn.execute(
+                        """
+                        DELETE FROM position_tracker_state
+                        WHERE wallet_address = $1
+                          AND market_id = $2
+                          AND token_id = $3
+                          AND direction = $4
+                        """,
+                        evicted.wallet_address,
+                        evicted.market_id,
+                        evicted.token_id,
+                        evicted.direction,
+                    )
+        except Exception as e:
+            logger.error(
+                f"position_tracker_state eviction DELETE failed "
+                f"(wallet={evicted.wallet_address}, "
+                f"market={evicted.market_id}): {e}"
+            )
+
+    async def warm_start(self, conn=None) -> int:
+        """Rehydrate `_open_positions` from position_tracker_state.
+
+        Called by `src/observer/main.py` after the asyncpg pool is up but
+        BEFORE the trade subscription loop starts — otherwise a CLOSE-fast-
+        on-restart can fire before we've loaded the matching OPEN and gets
+        treated as an orphan SELL (the very bug the audit flagged).
+
+        `conn` is optional so callers can run this inside their own
+        transaction; when None we acquire one from the pool.
+
+        Returns the number of slots loaded (also incremented on the
+        polybot_position_tracker_warm_start_loaded_total counter).
+        """
+        loaded = 0
+        rows: list = []
+        try:
+            if conn is not None:
+                rows = await conn.fetch(
+                    """
+                    SELECT wallet_address, market_id, token_id, direction,
+                           open_time, entry_price, size_usdc, size_shares,
+                           shares_remaining, fee_rate_pct
+                    FROM position_tracker_state
+                    ORDER BY open_time ASC
+                    """
+                )
+            else:
+                async with get_db() as c:
+                    rows = await c.fetch(
+                        """
+                        SELECT wallet_address, market_id, token_id, direction,
+                               open_time, entry_price, size_usdc, size_shares,
+                               shares_remaining, fee_rate_pct
+                        FROM position_tracker_state
+                        ORDER BY open_time ASC
+                        """
+                    )
+        except Exception as e:
+            logger.error(f"PositionTracker.warm_start failed: {e}")
+            return 0
+
+        for row in rows:
+            try:
+                pos = OpenPosition(
+                    wallet_address=row["wallet_address"],
+                    market_id=row["market_id"],
+                    token_id=row["token_id"],
+                    direction=row["direction"],
+                    open_time=row["open_time"],
+                    entry_price=Decimal(str(row["entry_price"])),
+                    size_usdc=Decimal(str(row["size_usdc"])),
+                    size_shares=Decimal(str(row["size_shares"])),
+                    shares_remaining=Decimal(str(row["shares_remaining"])),
+                    fee_rate_pct=Decimal(str(row["fee_rate_pct"] or 0)),
+                )
+                key = (pos.wallet_address, pos.market_id, pos.token_id)
+                self._open_positions.setdefault(key, []).append(pos)
+                loaded += 1
+                try:
+                    position_tracker_warm_start_loaded_total.inc()
+                except Exception:
+                    pass
+            except Exception as e:
+                logger.warning(
+                    f"warm_start: skipping bad state row "
+                    f"(wallet={row.get('wallet_address')}): {e}"
+                )
+
+        self._recompute_open_gauge()
+        # Enforce the cap on the rehydrated set — a long-running outage
+        # might have left more than MAX_OPEN_POSITIONS_TRACKED rows behind.
+        await self._enforce_capacity()
+        logger.info(f"PositionTracker warm_start: loaded {loaded} open positions")
+        return loaded

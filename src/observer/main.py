@@ -161,6 +161,14 @@ async def main() -> None:
         leader_markets=leader_markets,
     )
     tracker = PositionTracker(redis_client=redis_client)
+    # Phase 2 Task C: hydrate _open_positions from position_tracker_state
+    # BEFORE tracker.start() subscribes to trades. Without this, a SELL
+    # that lands seconds after restart can't be matched to the OPEN it
+    # closes and is silently dropped (the very Red Flag #4 we're closing).
+    try:
+        await tracker.warm_start()
+    except Exception as exc:
+        logger.warning(f"PositionTracker warm_start failed: {exc}")
 
     stop_event = asyncio.Event()
 

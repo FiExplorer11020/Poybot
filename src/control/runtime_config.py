@@ -26,7 +26,7 @@ from typing import Any
 from loguru import logger
 
 from src.config import settings
-
+from src.control.redis_pubsub import Subscriber
 
 # Keys the dashboard is allowed to flip at runtime. Anything not in this
 # set is rejected by ``set_overrides`` to prevent accidental edits to
@@ -96,6 +96,14 @@ class RuntimeConfig:
         # that hit the singleton before the first Redis fetch don't get
         # KeyError on ``effective()``.
         self._defaults = _defaults_from_settings()
+        # Phase 2 Task D: subscribe to runtime_config:changed so dashboard
+        # edits invalidate the local cache within milliseconds rather
+        # than the 30s TTL. Audit Red Flag #6 called this out — the
+        # channel existed (set_overrides publishes on every write) but
+        # nothing consumed it. We build the Subscriber lazily so unit
+        # tests that exercise the bootless fallback (`redis_client=None`)
+        # don't open a TCP connection.
+        self._subscriber: Subscriber | None = None
 
     async def effective(self) -> dict[str, Any]:
         """Return defaults merged with persisted overrides (overrides win)."""
@@ -195,6 +203,60 @@ class RuntimeConfig:
         """Force the next ``effective()`` call to re-fetch from Redis. Used by
         the pub/sub listener so other services pick up changes within seconds."""
         self._cache = None
+
+    # ── Pub/sub push-invalidation ────────────────────────────────────────
+    # The audit (Red Flag #6) noted that ``set_overrides`` already
+    # publishes on ``runtime_config:changed`` but no one subscribed —
+    # readers stayed on the 30s in-memory cache. Calling ``start_pubsub``
+    # at process boot wires a reconnect-safe subscriber that invalidates
+    # the cache on every publish, dropping propagation to <100ms.
+    async def start_pubsub(self) -> None:
+        """Subscribe to ``runtime_config:changed`` and invalidate on every flip.
+
+        Safe to call multiple times: subsequent calls are no-ops. Safe to
+        skip entirely — the 30s TTL still bounds staleness either way.
+        """
+        if self._subscriber is not None:
+            return
+        if self._redis is None:
+            # Bootless fallback; nothing to subscribe to. The next call
+            # to ``effective()`` will still hit defaults-only.
+            return
+        sub = Subscriber(settings.REDIS_URL, name="control.runtime_config")
+        sub.register(REDIS_PUBSUB_CHANNEL, self._on_changed)
+        # Reuse the wired redis client so test rigs using a shared
+        # fakeredis instance see the same pub/sub graph as the publisher.
+        await sub.start(redis_client=self._redis)
+        self._subscriber = sub
+        logger.info(
+            f"RuntimeConfig: subscribed to {REDIS_PUBSUB_CHANNEL} "
+            "for push-invalidation"
+        )
+
+    async def stop_pubsub(self) -> None:
+        if self._subscriber is None:
+            return
+        await self._subscriber.stop()
+        self._subscriber = None
+
+    async def _on_changed(self, payload: Any, _channel: str) -> None:
+        """Handler for ``runtime_config:changed``. Just invalidates the cache.
+
+        We deliberately do NOT re-load synchronously here: the next
+        consumer call to ``effective()`` will see ``self._cache is None``
+        and refresh from Redis. That keeps the handler dirt-simple and
+        thread-safe (the lock is in ``_load_overrides``).
+        """
+        try:
+            edits = (
+                payload.get("edits") if isinstance(payload, dict) else None
+            )
+        except Exception:
+            edits = None
+        self._cache = None
+        logger.debug(
+            f"RuntimeConfig: cache invalidated via pub/sub (edits={edits})"
+        )
 
 
 # ── Singleton wiring ─────────────────────────────────────────────────────────

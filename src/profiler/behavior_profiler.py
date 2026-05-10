@@ -12,6 +12,7 @@ from datetime import datetime, timezone
 from loguru import logger
 
 from src.config import settings
+from src.control.redis_pubsub import Subscriber
 from src.database.connection import get_db
 from src.economics.models import ECONOMIC_MODEL_VERSION
 from src.economics.versioning import valid_paper_trade_filter
@@ -82,58 +83,57 @@ class BehaviorProfiler:
         self._error_model = error_model
         self._running = False
         self._stop_event = asyncio.Event()
+        # F-04: a single Subscriber owns BOTH positions:closed and
+        # trades:observed handlers. Previously the profiler spawned two
+        # bare async-for loops sharing the command client; both pinned
+        # pool connections forever and lost their subscription state on
+        # any disconnect.
+        self._subscriber: Subscriber | None = None
 
     async def start(self) -> None:
         self._running = True
         self._stop_event.clear()
         if self._redis is None:
             return
-        tasks = [
-            asyncio.create_task(self._subscribe_positions_loop()),
-            asyncio.create_task(self._subscribe_trades_loop()),
-        ]
+        # Build the subscriber lazily so tests that swap `_redis` and
+        # never call start() don't pull in a dedicated client.
+        self._subscriber = Subscriber(
+            settings.REDIS_URL, name="profiler.behavior"
+        )
+        self._subscriber.register(
+            REDIS_POSITIONS_CHANNEL, self._on_position_message
+        )
+        self._subscriber.register(REDIS_TRADES_CHANNEL, self._on_trade_message)
+        await self._subscriber.start()
         try:
-            await asyncio.gather(*tasks)
+            await self._stop_event.wait()
         except asyncio.CancelledError:
             pass
 
     async def stop(self) -> None:
         self._running = False
         self._stop_event.set()
+        if self._subscriber is not None:
+            await self._subscriber.stop()
+            self._subscriber = None
 
-    async def _subscribe_positions_loop(self) -> None:
-        pubsub = self._redis.pubsub()
-        await pubsub.subscribe(REDIS_POSITIONS_CHANNEL)
+    async def _on_position_message(self, event: dict, _channel: str) -> None:
+        if not self._running:
+            return
         try:
-            async for message in pubsub.listen():
-                if not self._running:
-                    break
-                if message["type"] != "message":
-                    continue
-                try:
-                    event = json.loads(message["data"])
-                    await self.on_position_closed(event)
-                except Exception as e:
-                    logger.error(f"BehaviorProfiler error: {e}")
-        finally:
-            await pubsub.unsubscribe(REDIS_POSITIONS_CHANNEL)
+            await self.on_position_closed(event)
+        except Exception as e:
+            logger.error(f"BehaviorProfiler error: {e}")
+            raise
 
-    async def _subscribe_trades_loop(self) -> None:
-        pubsub = self._redis.pubsub()
-        await pubsub.subscribe(REDIS_TRADES_CHANNEL)
+    async def _on_trade_message(self, event: dict, _channel: str) -> None:
+        if not self._running:
+            return
         try:
-            async for message in pubsub.listen():
-                if not self._running:
-                    break
-                if message["type"] != "message":
-                    continue
-                try:
-                    event = json.loads(message["data"])
-                    await self.on_leader_trade(event)
-                except Exception as e:
-                    logger.error(f"BehaviorProfiler trade error: {e}")
-        finally:
-            await pubsub.unsubscribe(REDIS_TRADES_CHANNEL)
+            await self.on_leader_trade(event)
+        except Exception as e:
+            logger.error(f"BehaviorProfiler trade error: {e}")
+            raise
 
     async def on_position_closed(self, event: dict) -> None:
         """Update behavioral profile for the leader of this closed position."""
