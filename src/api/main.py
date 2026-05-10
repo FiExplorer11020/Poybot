@@ -15,14 +15,23 @@ from pathlib import Path
 import asyncpg
 import redis.asyncio as redis_async
 from fastapi import FastAPI, HTTPException, Query, WebSocket
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from loguru import logger
+from pydantic import BaseModel, Field
 
 from src.api import queries
 from src.api.terminal_snapshot import build_terminal_snapshot, load_recent_log_entries
 from src.api.ws_bridge import WSBridge
 from src.config import settings
+from src.control.killswitch import get_killswitch
+from src.control.runtime_config import (
+    ALLOWED_KEYS as RUNTIME_CONFIG_ALLOWED_KEYS,
+    BOUNDS as RUNTIME_CONFIG_BOUNDS,
+    get_runtime_config,
+    init_runtime_config,
+)
+from src.logging_setup import configure_logging
 from src.engine.neural_readiness import ReadinessInputs, build_neural_readiness_snapshot
 from src.engine.readiness_persistence import (
     load_recent_persisted_transitions,
@@ -66,6 +75,10 @@ _api_started_at = datetime.now(timezone.utc)
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global _pool, _redis
+    # Configure loguru first so every log line during boot uses the env-driven
+    # level/format/file sink rather than loguru's default DEBUG-stderr.
+    log_level = configure_logging()
+    logger.info(f"Dashboard API booting (log_level={log_level})")
     created_pool = False
     created_redis = False
     if _pool is None:
@@ -79,6 +92,11 @@ async def lifespan(app: FastAPI):
         _redis = redis_async.from_url(settings.REDIS_URL, decode_responses=True)
         created_redis = True
     _bridge.attach_redis(_redis)
+    # Bind redis to the global killswitch service so writes propagate to all
+    # workers via the shared Redis cache.
+    get_killswitch(redis_client=_redis)
+    # Initialise runtime config (Risk & Config Option 2: mutable params).
+    init_runtime_config(redis_client=_redis)
     await _bridge.start()
     _schedule_falcon_probe()
     push_task = asyncio.create_task(_stats_push_loop())
@@ -209,6 +227,7 @@ async def _health_checks(force: bool = False) -> dict:
         fee_snapshot_coverage_source: str | None = None
         data_accumulation_counts: dict[str, int] = {}
         pipeline_stage_health: dict = {}
+        ws_msgs_last_minute: int = 0
 
         try:
             async with _pool.acquire() as conn:
@@ -234,6 +253,14 @@ async def _health_checks(force: bool = False) -> dict:
             if last_message_ts is not None:
                 last_message_age_s = max(0.0, time.time() - float(last_message_ts))
                 websocket_connected = last_message_age_s <= 30.0
+            # Real WS throughput — read the previous minute bucket (the
+            # current one is still being written, so it under-counts).
+            try:
+                prev_minute = int(time.time() // 60) - 1
+                ws_msgs = await _redis.get(f"ws:msgs:minute:{prev_minute}")
+                ws_msgs_last_minute = int(ws_msgs) if ws_msgs is not None else 0
+            except Exception:
+                ws_msgs_last_minute = 0
             book_age = await _redis.get("metrics:book_age_p95_s")
             fee_coverage = await _redis.get("metrics:fee_snapshot_coverage_pct")
             token_coverage = await _redis.get("metrics:token_map_coverage_pct")
@@ -287,6 +314,7 @@ async def _health_checks(force: bool = False) -> dict:
             "websocket": websocket_connected,
             "websocket_connected": websocket_connected,
             "last_message_age_s": last_message_age_s,
+            "ws_messages_last_minute": ws_msgs_last_minute,
             "book_age_p95_s": book_age_p95_s,
             "fee_snapshot_coverage_pct": fee_snapshot_coverage_pct,
             "fee_snapshot_coverage_source": fee_snapshot_coverage_source,
@@ -468,6 +496,30 @@ async def _fetch_recent_observed_trades(limit: int = 60) -> list[dict]:
         return await queries.recent_observed_trades(conn, limit=limit)
 
 
+async def _fetch_alpha_extras() -> dict:
+    """ALPHA TERMINAL v2 — 24h timeline + Next Signal ETA + ML totals."""
+    async with _pool.acquire() as conn:
+        return await queries.alpha_extras(conn)
+
+
+async def _fetch_wallet_graph() -> dict:
+    """WALLET GRAPH — nodes + edges for force-directed visualisation."""
+    async with _pool.acquire() as conn:
+        return await queries.wallet_graph(conn)
+
+
+async def _fetch_rejections_breakdown() -> dict:
+    """ML PROGRESSION — last-hour SKIP reasons grouped."""
+    async with _pool.acquire() as conn:
+        return await queries.decision_rejections_breakdown(conn, hours=1)
+
+
+async def _fetch_equity_curve_v2() -> dict:
+    """LIVE PORTFOLIO — equity series + by-leader / by-strategy breakdown."""
+    async with _pool.acquire() as conn:
+        return await queries.equity_curve(conn)
+
+
 async def _get_live_snapshot(force: bool = False) -> dict:
     now = time.monotonic()
     cached = _live_snapshot_cache.get("data")
@@ -539,6 +591,10 @@ async def _get_terminal_snapshot(force: bool = False) -> dict:
             _health_checks(),
             _fetch_market_scanner_rows(),
             _fetch_recent_observed_trades(),
+            _fetch_alpha_extras(),
+            _fetch_wallet_graph(),
+            _fetch_rejections_breakdown(),
+            _fetch_equity_curve_v2(),
             return_exceptions=True,
         )
         (
@@ -555,6 +611,10 @@ async def _get_terminal_snapshot(force: bool = False) -> dict:
             health_data,
             market_rows,
             observed_trades,
+            alpha_extras_data,
+            wallet_graph_data,
+            rejections_data,
+            equity_curve_data,
         ) = results
 
         defaults = (
@@ -571,6 +631,10 @@ async def _get_terminal_snapshot(force: bool = False) -> dict:
             {},
             [],
             [],
+            {"timeline": [], "follow_ready": [], "totals": {}},
+            {"nodes": [], "edges": [], "stats": {}},
+            {"total": 0, "breakdown": []},
+            {"series": [], "by_leader": [], "by_strategy": []},
         )
         names = (
             "overview",
@@ -586,6 +650,10 @@ async def _get_terminal_snapshot(force: bool = False) -> dict:
             "health",
             "market_rows",
             "observed_trades",
+            "alpha_extras",
+            "wallet_graph",
+            "rejections",
+            "equity_curve",
         )
         normalized: list = []
         for name, value, default in zip(
@@ -604,6 +672,10 @@ async def _get_terminal_snapshot(force: bool = False) -> dict:
                 health_data,
                 market_rows,
                 observed_trades,
+                alpha_extras_data,
+                wallet_graph_data,
+                rejections_data,
+                equity_curve_data,
             ),
             defaults,
         ):
@@ -627,6 +699,10 @@ async def _get_terminal_snapshot(force: bool = False) -> dict:
             health_data,
             market_rows,
             observed_trades,
+            alpha_extras_data,
+            wallet_graph_data,
+            rejections_data,
+            equity_curve_data,
         ) = normalized
         readiness_data = build_neural_readiness_snapshot(
             ReadinessInputs(
@@ -641,9 +717,19 @@ async def _get_terminal_snapshot(force: bool = False) -> dict:
             "uptime_seconds": int((datetime.now(timezone.utc) - _api_started_at).total_seconds()),
             "cycle_latency_ms": 0.0,
             "last_command_at": None,
-            "control_available": False,
-            "config_mutable": False,
+            # Killswitch + risk config writes go through real endpoints
+            # (api_control_killswitch, api_risk_update). The dashboard uses
+            # these flags to gate the editable / disabled state of its inputs.
+            "control_available": True,
+            "config_mutable": True,
         }
+        # Load the current effective runtime config so the snapshot exposes the
+        # actual live values (defaults merged with persisted Redis overrides).
+        try:
+            runtime_overrides = await get_runtime_config().effective()
+        except Exception as exc:
+            logger.warning(f"runtime_config load failed: {exc}")
+            runtime_overrides = None
         logs = load_recent_log_entries(LOG_PATHS, limit=120)
         snapshot = build_terminal_snapshot(
             overview=overview_data,
@@ -659,8 +745,13 @@ async def _get_terminal_snapshot(force: bool = False) -> dict:
             health=health_data,
             market_rows=market_rows,
             observed_trades=observed_trades,
+            alpha_extras=alpha_extras_data,
+            wallet_graph=wallet_graph_data,
+            rejections=rejections_data,
+            equity_curve=equity_curve_data,
             runtime=runtime,
             logs=logs,
+            runtime_overrides=runtime_overrides,
         )
         build_ms = round((time.perf_counter() - build_started) * 1000, 2)
         snapshot.setdefault("bot", {})["cycle_latency_ms"] = build_ms
@@ -847,6 +938,177 @@ async def api_data_quality():
 @app.get("/api/v1/live-summary")
 async def api_live_summary_v1():
     return {"data": await _get_terminal_snapshot()}
+
+
+@app.get("/api/inspector/snapshot")
+async def api_inspector_snapshot(limit: int = Query(80, ge=10, le=500)):
+    """Pipeline observability snapshot for the INSPECTOR dashboard tab."""
+    async with _pool.acquire() as conn:
+        return await queries.inspector_snapshot(conn, redis_client=_redis, limit=limit)
+
+
+# ---------------------------------------------------------------------------
+# Runtime control: killswitch + execution mode
+# ---------------------------------------------------------------------------
+
+
+class _KillswitchFlip(BaseModel):
+    enabled: bool
+    reason: str | None = Field(default=None, max_length=512)
+    actor: str | None = Field(default=None, max_length=64)
+
+
+# ---------------------------------------------------------------------------
+# Health & liveness probes
+#
+# `/healthz` is a CHEAP liveness probe — no external I/O. Cloud orchestrators,
+# Docker HEALTHCHECK, and watchdogs hit this very frequently and must not be
+# coupled to the database or Redis (otherwise a transient DB blip would cause
+# the whole container to be killed).
+#
+# `/health` is a readiness probe — verifies the upstream dependencies (DB +
+# Redis) are reachable. Returns HTTP 503 when the API process is alive but not
+# ready to serve traffic. Used by load balancers to drain traffic during a
+# partial outage.
+#
+# Aliased without leading slash and at /api/health for callers that already
+# scrape under /api/.
+# ---------------------------------------------------------------------------
+async def _liveness_payload() -> dict:
+    now = datetime.now(timezone.utc)
+    return {
+        "status": "ok",
+        "service": "polymarket-bot-api",
+        "started_at": _api_started_at.isoformat(),
+        "uptime_s": round((now - _api_started_at).total_seconds(), 1),
+        "now": now.isoformat(),
+    }
+
+
+async def _readiness_payload() -> tuple[dict, int]:
+    """Light DB + Redis probe. Returns (payload, http_status_code)."""
+    db_ok = False
+    redis_ok = False
+    db_err: str | None = None
+    redis_err: str | None = None
+
+    if _pool is not None:
+        try:
+            async with _pool.acquire() as conn:
+                await asyncio.wait_for(conn.fetchval("SELECT 1"), timeout=2.0)
+            db_ok = True
+        except Exception as exc:  # asyncio.TimeoutError, asyncpg errors, etc.
+            db_err = f"{type(exc).__name__}: {exc}"
+    else:
+        db_err = "pool_not_initialized"
+
+    if _redis is not None:
+        try:
+            pong = await asyncio.wait_for(_redis.ping(), timeout=1.0)
+            redis_ok = bool(pong)
+            if not redis_ok:
+                redis_err = "ping_returned_falsey"
+        except Exception as exc:
+            redis_err = f"{type(exc).__name__}: {exc}"
+    else:
+        redis_err = "redis_not_initialized"
+
+    payload = await _liveness_payload()
+    payload["status"] = "ok" if (db_ok and redis_ok) else "degraded"
+    payload["checks"] = {
+        "db": {"ok": db_ok, "error": db_err},
+        "redis": {"ok": redis_ok, "error": redis_err},
+    }
+    code = 200 if (db_ok and redis_ok) else 503
+    return payload, code
+
+
+@app.get("/healthz")
+async def healthz():
+    """Liveness probe — process alive, event loop responsive. No external I/O."""
+    return await _liveness_payload()
+
+
+@app.get("/health")
+@app.get("/api/health")
+async def health():
+    """Readiness probe — DB + Redis reachable. 200 if ready, 503 if degraded."""
+    payload, code = await _readiness_payload()
+    return JSONResponse(payload, status_code=code)
+
+
+@app.get("/api/control/state")
+async def api_control_state():
+    """Returns the current killswitch state (cached read)."""
+    state = await get_killswitch().get_state()
+    return state.to_dict()
+
+
+@app.post("/api/control/killswitch")
+async def api_control_killswitch(payload: _KillswitchFlip):
+    """
+    Master execution switch. When False, neither paper nor real trades execute.
+    """
+    state = await get_killswitch().set_execution_enabled(
+        payload.enabled,
+        reason=payload.reason,
+        actor=payload.actor or "api",
+    )
+    return state.to_dict()
+
+
+class _RiskConfigUpdate(BaseModel):
+    edits: dict = Field(default_factory=dict)
+    actor: str | None = "dashboard"
+
+
+@app.get("/api/risk/config")
+async def api_risk_config():
+    """Return the current effective runtime config (defaults + overrides)."""
+    cfg = await get_runtime_config().effective()
+    return {
+        "config": cfg,
+        "allowed_keys": RUNTIME_CONFIG_ALLOWED_KEYS,
+        "bounds": {k: list(v) for k, v in RUNTIME_CONFIG_BOUNDS.items()},
+    }
+
+
+@app.post("/api/risk/update")
+async def api_risk_update(payload: _RiskConfigUpdate):
+    """Apply runtime config edits.
+
+    Only keys in ``RUNTIME_CONFIG_ALLOWED_KEYS`` are accepted. Each value
+    is validated against ``RUNTIME_CONFIG_BOUNDS``. Returns the merged
+    effective config so the dashboard can refresh its display without
+    waiting for the next snapshot push.
+    """
+    try:
+        merged = await get_runtime_config().set_overrides(
+            payload.edits or {},
+            actor=payload.actor or "dashboard",
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    # Drop the in-memory cached snapshot so the next /api/v1/live-summary
+    # call surfaces the new values immediately.
+    _terminal_snapshot_cache["data"] = None
+    _terminal_snapshot_cache["last_built"] = 0.0
+    return {"config": merged}
+
+
+@app.post("/api/control/real_execution")
+async def api_control_real_execution(payload: _KillswitchFlip):
+    """
+    Real-trading switch. Independent of the master switch — paper always shadows
+    when execution is enabled. To run real trades you need BOTH execution_enabled
+    AND real_execution_enabled set to True.
+    """
+    state = await get_killswitch().set_real_execution_enabled(
+        payload.enabled,
+        reason=payload.reason,
+        actor=payload.actor or "api",
+    )
+    return state.to_dict()
 
 
 @app.websocket("/ws/live")

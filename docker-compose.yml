@@ -1,3 +1,50 @@
+# --------------------------------------------------------------------------- #
+# docker-compose.yml (S4.11) — local dev + base spec for prod.                 #
+#                                                                              #
+# Layout                                                                       #
+#   postgres + redis  : managed by us, persistent volumes.                     #
+#   observer          : WebSocket → trade ingestion + position tracker.        #
+#   engine            : confidence engine + paper trader + telegram bot +      #
+#                       APScheduler (nightly batch, killswitch sync, redis     #
+#                       cleanup) + watchdog.                                   #
+#   registry          : Falcon-driven leader registry refresh loop.            #
+#   api               : FastAPI dashboard + /health + /healthz. Optional.      #
+#                                                                              #
+# Build                                                                        #
+#   docker compose build                                                       #
+#                                                                              #
+# Run                                                                          #
+#   docker compose up -d postgres redis           # backend only               #
+#   docker compose up -d                          # everything                 #
+#                                                                              #
+# Prod overlay                                                                 #
+#   docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d      #
+# --------------------------------------------------------------------------- #
+
+x-app-base: &app-base
+  build:
+    context: .
+    dockerfile: Dockerfile
+  image: polymarket-bot:latest
+  env_file: .env
+  environment:
+    # The bot reaches Redis/DB by service name on the compose network,
+    # not localhost. Override what's in .env.
+    DATABASE_URL: postgresql://polymarket:polymarket_dev_password@postgres:5432/polymarket
+    REDIS_URL: redis://redis:6379/0
+  depends_on:
+    postgres:
+      condition: service_healthy
+    redis:
+      condition: service_healthy
+  # Default healthcheck — overridable per service.
+  healthcheck:
+    test: ["CMD", "python", "/app/scripts/docker_healthcheck.py"]
+    interval: 30s
+    timeout: 5s
+    start_period: 20s
+    retries: 3
+
 services:
   postgres:
     image: postgres:15
@@ -30,17 +77,87 @@ services:
       timeout: 3s
       retries: 3
 
-  # dashboard service commented out - run API directly with:
-  # python -m uvicorn src.api.main:app --host 127.0.0.1 --port 8000
-  # dashboard:
-  #   build: .
-  #   command: uvicorn src.api.main:app --host 0.0.0.0 --port 8080 --reload
-  #   ports:
-  #     - "8080:8080"
-  #   depends_on:
-  #     - postgres
-  #     - redis
-  #   env_file: .env
+  # ------------------------------------------------------------------------- #
+  # Application services                                                       #
+  # ------------------------------------------------------------------------- #
+
+  observer:
+    <<: *app-base
+    container_name: polymarket_observer
+    command: ["python", "-m", "src.observer.main"]
+    # Observer holds long-lived WebSocket connections — give it a longer
+    # cold-start grace.
+    healthcheck:
+      test: ["CMD", "python", "/app/scripts/docker_healthcheck.py"]
+      interval: 30s
+      timeout: 5s
+      start_period: 60s
+      retries: 3
+
+  engine:
+    <<: *app-base
+    container_name: polymarket_engine
+    command: ["python", "-m", "src.engine.main"]
+    # Engine boots scheduler + watchdog + telegram + 4 long-running
+    # components — give it 60s before the first probe.
+    healthcheck:
+      test: ["CMD", "python", "/app/scripts/docker_healthcheck.py"]
+      interval: 30s
+      timeout: 5s
+      start_period: 60s
+      retries: 3
+
+  registry:
+    <<: *app-base
+    container_name: polymarket_registry
+    command: ["python", "-m", "src.registry.main"]
+
+  # Daily Postgres → Cloudflare R2 backup (S4.12). Idle when
+  # BACKUPS_ENABLED=false (default). Reads R2_* + DATABASE_URL from
+  # .env. The pg_dump binary is installed via postgresql-client in
+  # the Dockerfile runtime stage.
+  backups:
+    <<: *app-base
+    container_name: polymarket_backups
+    command: ["python", "-m", "src.backups.main"]
+    # Backups doesn't need Redis but keeps the same dependency list
+    # so the restart policy + healthcheck stay coherent. Override
+    # env DATABASE_URL since pg_dump runs from this container against
+    # the postgres service.
+    healthcheck:
+      # Light healthcheck — just verifies the python process is up
+      # and pg_dump binary is reachable. Full Redis+DB probe is
+      # overkill for an idle nightly job.
+      test: ["CMD", "sh", "-c", "pg_dump --version >/dev/null && echo ok"]
+      interval: 60s
+      timeout: 5s
+      start_period: 15s
+      retries: 3
+
+  # FastAPI dashboard + health endpoints. Disabled by default in dev —
+  # uncomment ports to expose.
+  api:
+    <<: *app-base
+    container_name: polymarket_api
+    command:
+      - "python"
+      - "-m"
+      - "uvicorn"
+      - "src.api.main:app"
+      - "--host"
+      - "0.0.0.0"
+      - "--port"
+      - "8080"
+    ports:
+      - "8080:8080"
+    healthcheck:
+      # API has its own /healthz endpoint — prefer that over the
+      # generic Redis+DB probe.
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8080/healthz', timeout=3).status==200 else 1)"]
+      interval: 30s
+      timeout: 5s
+      start_period: 30s
+      retries: 3
 
 volumes:
   postgres_data:

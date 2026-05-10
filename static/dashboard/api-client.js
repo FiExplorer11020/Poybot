@@ -126,8 +126,38 @@
 
   // ── Public API actions ─────────────────────────────────────────────────────
   window.PoybotAPI = {
-    botControl: async () => { throw new Error(READ_ONLY_ERROR); },
-    updateConfig: async () => { throw new Error(READ_ONLY_ERROR); },
+    botControl: async (cmd) => {
+      // /api/control/killswitch is the only control surface exposed by the
+      // backend; map dashboard verbs to its enabled flag.
+      const enabledByCmd = { start: true, resume: true, stop: false, pause: false, halt: false };
+      if (!(cmd in enabledByCmd)) throw new Error(`Unknown control command: ${cmd}`);
+      const r = await fetch(`${API_BASE}/api/control/killswitch`, {
+        method: 'POST',
+        headers: hdrs(),
+        body: JSON.stringify({ enabled: enabledByCmd[cmd], reason: `dashboard:${cmd}`, actor: 'dashboard' }),
+      });
+      if (!r.ok) throw new Error(`HTTP ${r.status}: ${await r.text()}`);
+      // Force a snapshot refresh so the UI reflects the new state immediately.
+      loadSnap();
+      return r.json();
+    },
+    updateConfig: async (edits) => {
+      const r = await fetch(`${API_BASE}/api/risk/update`, {
+        method: 'POST',
+        headers: hdrs(),
+        body: JSON.stringify({ edits, actor: 'dashboard' }),
+      });
+      if (!r.ok) {
+        let msg = `HTTP ${r.status}`;
+        try {
+          const body = await r.json();
+          if (body.detail) msg += `: ${body.detail}`;
+        } catch (_) {}
+        throw new Error(msg);
+      }
+      loadSnap();
+      return r.json();
+    },
     closePosition: async () => { throw new Error(READ_ONLY_ERROR); },
     pnlTimeframe: async () => { throw new Error(READ_ONLY_ERROR); },
     runBacktest: async () => { throw new Error(READ_ONLY_ERROR); },

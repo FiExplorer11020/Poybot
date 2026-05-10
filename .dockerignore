@@ -1,0 +1,56 @@
+# --------------------------------------------------------------------------- #
+# .dockerignore (S4.11)                                                        #
+# Keeps build context lean (~10 MB instead of ~300 MB) and prevents secrets    #
+# from leaking into the image layer cache.                                     #
+# --------------------------------------------------------------------------- #
+
+# Version control
+.git/
+.gitignore
+.gitattributes
+
+# Editor + OS noise
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Python build artefacts
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Local virtualenv — built fresh inside the image
+.venv/
+venv/
+
+# Tests + dev fixtures (don't ship to prod)
+tests/
+docs/
+reports/
+data_cache/
+data/
+
+# Local-only runtime files
+.env
+.env.local
+.env.*.local
+*.log
+orchestrate.log
+
+# Plugin / Claude scratch
+.claude/
+00_READ_ME_FIRST.txt
+PROGRESS_TRACKER.xlsx
+
+# Misc
+*.bak
+*.tmp
+*.tar.gz
+docker-compose.override.yml

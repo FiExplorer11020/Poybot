@@ -34,6 +34,7 @@ from src.engine.portfolio_state import (
 )
 
 REDIS_DECISIONS_CHANNEL = "decisions"
+REDIS_PAPER_OPENED_CHANNEL = "positions:paper_opened"
 REDIS_PAPER_CLOSED_CHANNEL = "positions:paper_closed"
 
 TAKE_PROFIT_FOLLOW = 0.10  # +10%
@@ -552,6 +553,28 @@ class PaperTrader:
             f"Opened paper {strategy} trade #{trade_id} on {market_id}: "
             f"dir={direction} size={size_usdc} entry={entry_price}"
         )
+        # S3.9: publish open event so the Telegram notifier (and any other
+        # downstream consumer) can react. Best-effort — a failed publish
+        # must never block trade execution.
+        try:
+            await self._redis.publish(
+                REDIS_PAPER_OPENED_CHANNEL,
+                json.dumps(
+                    {
+                        "trade_id": trade_id,
+                        "market_id": market_id,
+                        "token_id": actual_token_id,
+                        "direction": direction,
+                        "strategy": strategy,
+                        "entry_price": entry_price,
+                        "size_usdc": size_usdc,
+                        "leader_wallet": leader_wallet,
+                        "confidence": confidence,
+                    }
+                ),
+            )
+        except Exception:
+            pass
         return trade_id
 
     async def close_trade(self, trade_id: int, exit_price: float, close_reason: str) -> bool:

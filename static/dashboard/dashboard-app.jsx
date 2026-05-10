@@ -5,15 +5,22 @@ const {
   C, S, useLiveStore, Badge, Dot, SectionLabel,
   fmtAge, fmtPnl, fmtMs, pnlColor,
 } = window;
-const { AlphaTerminal, MarketScanner, LivePortfolio, DecisionEngine, RiskConfig, BotHealth } = window;
+const { AlphaTerminal, MarketScanner, LivePortfolio, DecisionEngine, RiskConfig, BotHealth, WalletGraph, MLProgression } = window;
 
+const { Inspector } = window;
 const NAV = [
-  { id: 'alpha',     label: 'ALPHA TERMINAL',  icon: '◈', component: AlphaTerminal },
-  { id: 'scanner',   label: 'MARKET SCANNER',  icon: '◉', component: MarketScanner },
-  { id: 'portfolio', label: 'LIVE PORTFOLIO',  icon: '◎', component: LivePortfolio },
-  { id: 'decisions', label: 'DECISION ENGINE', icon: '◇', component: DecisionEngine },
-  { id: 'risk',      label: 'RISK & CONFIG',   icon: '◆', component: RiskConfig    },
-  { id: 'health',    label: 'BOT HEALTH',      icon: '◐', component: BotHealth     },
+  { id: 'alpha',      label: 'ALPHA TERMINAL',  icon: '◈', component: AlphaTerminal },
+  { id: 'mlprog',     label: 'ML PROGRESSION',  icon: '◍', component: MLProgression },
+  // The legacy MARKET SCANNER tab has been folded into WALLET GRAPH —
+  // the bot's edge is wallet-centric, so a market-only view is misleading.
+  // The legacy market table is kept as a sub-tab inside WALLET GRAPH for
+  // debugging until it's safe to remove the backend support.
+  { id: 'graph',      label: 'WALLET GRAPH',    icon: '⬢', component: WalletGraph },
+  { id: 'portfolio',  label: 'LIVE PORTFOLIO',  icon: '◎', component: LivePortfolio },
+  { id: 'decisions',  label: 'DECISION ENGINE', icon: '◇', component: DecisionEngine },
+  { id: 'inspector',  label: 'INSPECTOR',       icon: '✦', component: Inspector || (() => null) },
+  { id: 'risk',       label: 'RISK & CONFIG',   icon: '◆', component: RiskConfig    },
+  { id: 'health',     label: 'BOT HEALTH',      icon: '◐', component: BotHealth     },
 ];
 
 // ── Sidebar ────────────────────────────────────────────────────────────────────
@@ -190,9 +197,13 @@ const App = () => {
           <span style={{ marginLeft: 'auto', fontSize: 10, color: C.dim2, fontFamily: 'monospace' }}>UTC {utc}</span>
         </div>
 
-        {/* Active tab */}
-        <div style={{ flex: 1, overflow: 'hidden' }}>
-          <ActiveTab />
+        {/* Active tab — explicit `display: flex` + `width: 100%` ensures every
+            tab fills the available width identically, regardless of whether the
+            tab's own root uses grid, flex column, or simple block layout. */}
+        <div style={{ flex: 1, overflow: 'hidden', display: 'flex', width: '100%', minWidth: 0 }}>
+          <div style={{ flex: 1, minWidth: 0, display: 'flex', flexDirection: 'column' }}>
+            <ActiveTab />
+          </div>
         </div>
       </div>
 

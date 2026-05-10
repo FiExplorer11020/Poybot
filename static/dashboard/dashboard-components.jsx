@@ -106,16 +106,68 @@ const Dot = ({ status }) => {
 };
 
 const KpiStrip = ({ items }) => (
-  <div style={{ display: 'grid', gridTemplateColumns: `repeat(${items.length}, 1fr)`, borderBottom: `1px solid ${C.border}`, flexShrink: 0 }}>
+  <div style={{
+    display: 'grid',
+    gridTemplateColumns: `repeat(auto-fit, minmax(140px, 1fr))`,
+    borderBottom: `1px solid ${C.border}`,
+    flexShrink: 0,
+  }}>
     {items.map((k, i) => (
-      <div key={i} style={{ padding: '10px 14px', borderRight: i < items.length - 1 ? `1px solid ${C.border}` : 'none' }}>
+      <div key={i} style={{
+        padding: '10px 14px',
+        borderRight: `1px solid ${C.border}`,
+        minWidth: 0,
+      }}>
         <div style={S.label}>{k.label}</div>
-        <div style={{ fontSize: k.large ? 24 : 18, fontWeight: 700, color: k.color || C.white, marginTop: 4, letterSpacing: '-0.02em' }}>{k.value}</div>
+        <div style={{ fontSize: k.large ? 24 : 18, fontWeight: 700, color: k.color || C.white, marginTop: 4, letterSpacing: '-0.02em', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{k.value}</div>
+        {k.spark && <div style={{ marginTop: 4, height: 18 }}>{k.spark}</div>}
         {k.sub && <div style={{ fontSize: 10, color: C.dim2, marginTop: 2 }}>{k.sub}</div>}
       </div>
     ))}
   </div>
 );
+
+// ── Sparkline (SVG inline, no external deps) ──────────────────────────────────
+const Sparkline = ({ data, width = 100, height = 18, color = C.amber, fillOpacity = 0.12 }) => {
+  if (!Array.isArray(data) || data.length < 2) {
+    return <div style={{ width, height, display: 'flex', alignItems: 'center', color: C.dim2, fontSize: 9 }}>—</div>;
+  }
+  const max = Math.max(...data, 1);
+  const min = Math.min(...data, 0);
+  const range = (max - min) || 1;
+  const stepX = width / (data.length - 1);
+  const pts = data.map((v, i) => {
+    const x = i * stepX;
+    const y = height - ((v - min) / range) * height;
+    return `${x.toFixed(1)},${y.toFixed(1)}`;
+  });
+  const areaPts = `0,${height} ${pts.join(' ')} ${width},${height}`;
+  return (
+    <svg width={width} height={height} viewBox={`0 0 ${width} ${height}`} style={{ display: 'block' }}>
+      <polygon points={areaPts} fill={color} opacity={fillOpacity} />
+      <polyline fill="none" stroke={color} strokeWidth="1.4" strokeLinecap="round" strokeLinejoin="round" points={pts.join(' ')} />
+      <circle cx={width} cy={parseFloat(pts[pts.length - 1].split(',')[1])} r="2" fill={color} />
+    </svg>
+  );
+};
+
+// ── Progress bar with label (used for ML pipeline visualisation) ──────────────
+const ProgressBar = ({ value, max = 100, color = C.amber, label, sublabel, height = 8 }) => {
+  const pct = Math.min(100, Math.max(0, (value / max) * 100));
+  return (
+    <div style={{ width: '100%' }}>
+      {(label || sublabel) && (
+        <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 4 }}>
+          {label && <span style={{ fontSize: 10, color: C.dim2 }}>{label}</span>}
+          {sublabel && <span style={{ fontSize: 10, color: C.text, fontWeight: 600 }}>{sublabel}</span>}
+        </div>
+      )}
+      <div style={{ width: '100%', height, background: 'rgba(255,255,255,0.05)', borderRadius: 1, overflow: 'hidden' }}>
+        <div style={{ width: `${pct}%`, height: '100%', background: color, transition: 'width 0.4s' }} />
+      </div>
+    </div>
+  );
+};
 
 const TH = ({ children }) => (
   <th style={{ padding: '5px 10px', textAlign: 'left', ...S.label, fontWeight: 700, borderBottom: `1px solid ${C.border2}`, whiteSpace: 'nowrap' }}>
@@ -149,7 +201,7 @@ const phaseType  = { 0: 'default', 1: 'blue', 2: 'amber', 3: 'green' };
 
 Object.assign(window, {
   C, S, useLiveStore, ConnBanner,
-  Badge, MiniBar, ScoreBar, Dot, KpiStrip, TH, TD, SectionLabel,
+  Badge, MiniBar, ScoreBar, Dot, KpiStrip, TH, TD, SectionLabel, Sparkline, ProgressBar,
   short, fmtAge, fmtPnl, fmtPct, fmtMs, fmtNum,
   pnlColor, sideColor, actionType, stratType, phaseLabel, phaseType,
 });

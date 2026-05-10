@@ -1,0 +1,117 @@
+#cloud-config
+# ===========================================================================
+# Hetzner Cloud (CX22 — Helsinki) — Ubuntu 22.04 — bootstrap polymarket-bot.
+# À COLLER tel quel dans le champ "User data" du wizard de création serveur.
+#
+# Différences vs Oracle :
+#   - Pas de hack iptables interne : Hetzner Cloud Firewall (côté API) suffit.
+#   - Architecture x86_64 (CX22 = AMD), donc pas besoin de --arch=arm64 sur
+#     le repo Docker.
+#   - Pas de swap pré-créé sur Hetzner — on en ajoute 2 GB pour les pics
+#     LightGBM et autres jobs batch.
+#
+# Ce que ça fait :
+#   1. Update + upgrade système.
+#   2. Installe Docker CE + plugin compose (repo officiel Docker).
+#   3. Crée un user `polymarket` dans le groupe `docker` + sudo NOPASSWD.
+#      (On garde aussi root accessible via SSH — Hetzner le configure pour toi.)
+#   4. Durcit SSH : disable password auth, disable root login (clé seulement).
+#   5. Active unattended-upgrades (patches sécu Ubuntu, reboot 4h UTC si kernel).
+#   6. Crée 2 GB de swap.
+#   7. Layout du projet : /opt/polymarket-bot, owned by polymarket.
+#   8. Outils admin : htop, ncdu, jq, tmux, postgresql-client (pour pg_restore).
+#   9. Marqueur de fin : /var/log/cloud-init-bot.log.
+# ===========================================================================
+
+package_update: true
+package_upgrade: true
+
+packages:
+  - apt-transport-https
+  - ca-certificates
+  - curl
+  - gnupg
+  - lsb-release
+  - htop
+  - ncdu
+  - jq
+  - tmux
+  - postgresql-client
+  - unattended-upgrades
+
+users:
+  - name: polymarket
+    groups: [sudo, docker]
+    shell: /bin/bash
+    sudo: "ALL=(ALL) NOPASSWD:ALL"
+    # La clé publique est injectée par Hetzner depuis ton compte. Ce bloc
+    # est un fallback : si Hetzner injecte la clé pour root, on la copie
+    # à polymarket via runcmd plus bas.
+
+write_files:
+  # Active les unattended-upgrades pour les patches sécurité Ubuntu.
+  - path: /etc/apt/apt.conf.d/52unattended-upgrades-local
+    content: |
+      Unattended-Upgrade::Automatic-Reboot "true";
+      Unattended-Upgrade::Automatic-Reboot-Time "04:00";
+      Unattended-Upgrade::Allowed-Origins {
+          "${distro_id}:${distro_codename}-security";
+      };
+
+  # Durcissement SSH minimal : pas de password, pas de root password login.
+  # Root par clé reste OK (on en a besoin pour les premiers diagnostics
+  # avant que polymarket soit utilisable).
+  - path: /etc/ssh/sshd_config.d/99-polymarket-hardening.conf
+    content: |
+      PasswordAuthentication no
+      PermitRootLogin prohibit-password
+      ChallengeResponseAuthentication no
+      UsePAM yes
+      X11Forwarding no
+      MaxAuthTries 3
+
+runcmd:
+  # ---------- Docker -------------------------------------------------- #
+  - install -m 0755 -d /etc/apt/keyrings
+  - curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc
+  - chmod a+r /etc/apt/keyrings/docker.asc
+  - echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu $(. /etc/os-release && echo $VERSION_CODENAME) stable" | tee /etc/apt/sources.list.d/docker.list > /dev/null
+  - apt-get update
+  - DEBIAN_FRONTEND=noninteractive apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+  - systemctl enable --now docker
+
+  # ---------- Copy SSH keys de root vers polymarket -------------------- #
+  # Hetzner injecte la clé sur root par défaut. On la duplique sur
+  # polymarket pour pouvoir SSH directement en tant que polymarket.
+  - mkdir -p /home/polymarket/.ssh
+  - cp /root/.ssh/authorized_keys /home/polymarket/.ssh/authorized_keys || true
+  - chown -R polymarket:polymarket /home/polymarket/.ssh
+  - chmod 700 /home/polymarket/.ssh
+  - chmod 600 /home/polymarket/.ssh/authorized_keys
+
+  # ---------- Restart SSH avec le nouveau config --------------------- #
+  - systemctl restart ssh
+
+  # ---------- Layout du projet --------------------------------------- #
+  - mkdir -p /opt/polymarket-bot
+  - chown polymarket:polymarket /opt/polymarket-bot
+
+  # ---------- Disk swap (4 GB RAM + 2 GB swap = 6 GB virtuel) -------- #
+  # LightGBM training et Hawkes MLE peuvent spike 1-2 GB. Le swap évite
+  # un OOM-kill silencieux pendant la batch nightly.
+  - fallocate -l 2G /swapfile
+  - chmod 600 /swapfile
+  - mkswap /swapfile
+  - swapon /swapfile
+  - echo '/swapfile none swap sw 0 0' >> /etc/fstab
+
+  # ---------- Marqueur de fin ---------------------------------------- #
+  - 'echo "cloud-init OK — $(date -u +%FT%TZ)" > /var/log/cloud-init-bot.log'
+  - 'docker --version >> /var/log/cloud-init-bot.log'
+  - 'docker compose version >> /var/log/cloud-init-bot.log'
+  - 'pg_restore --version >> /var/log/cloud-init-bot.log'
+  - 'free -h >> /var/log/cloud-init-bot.log'
+  - 'chown polymarket:polymarket /var/log/cloud-init-bot.log'
+
+# Reboot non requis — Docker + swap prennent effet à chaud.
+final_message: "polymarket-bot host ready (Hetzner Helsinki) — Docker installed, swap on, SSH hardened."

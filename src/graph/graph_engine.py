@@ -307,6 +307,7 @@ class GraphEngine:
     async def get_confirmed_edges(self, min_confidence: float = 0.5) -> list[dict]:
         """Return edges meeting minimum quality thresholds."""
         async with get_db() as conn:
+            from src.config import eff
             rows = await conn.fetch(
                 """
                 SELECT * FROM follower_edges
@@ -315,8 +316,8 @@ class GraphEngine:
                   AND follow_probability >= $3
                 ORDER BY follow_probability DESC
                 """,
-                settings.MIN_CO_OCCURRENCES,
-                Decimal(str(settings.MIN_SAME_DIRECTION_RATE)),
+                int(eff("MIN_CO_OCCURRENCES")),
+                Decimal(str(eff("MIN_SAME_DIRECTION_RATE"))),
                 Decimal(str(min_confidence)),
             )
             return [dict(r) for r in rows]

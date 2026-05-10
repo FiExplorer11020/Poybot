@@ -58,10 +58,21 @@ DEFAULT_BETA = 1.0
 
 
 class ConfidenceEngine:
-    def __init__(self, redis_client, behavior_profiler=None, error_model=None):
+    def __init__(
+        self,
+        redis_client,
+        behavior_profiler=None,
+        error_model=None,
+        decision_router=None,
+    ):
         self._redis = redis_client
         self._profiler = behavior_profiler
         self._error_model = error_model
+        # If a router is provided, the engine delegates publishing to it
+        # (paper / live / dual routing). If None, we keep the legacy
+        # behaviour: publish directly to the "decisions" channel. This
+        # keeps existing tests and bootstrap code working unchanged.
+        self._router = decision_router
         self._running = False
         self._stop_event = asyncio.Event()
         # Per-wallet Thompson state: {wallet: {"follow": [a, b], "fade": [a, b]}}
@@ -91,7 +102,10 @@ class ConfidenceEngine:
                         continue
                     decision = await self.evaluate(trade)
                     if decision:
-                        await self._emit(decision)
+                        if self._router is not None:
+                            await self._router.route(decision)
+                        else:
+                            await self._emit(decision)
                 except Exception as e:
                     logger.error(f"ConfidenceEngine error: {e}")
         finally:
@@ -133,11 +147,16 @@ class ConfidenceEngine:
             return None
 
         readiness = await self._get_readiness(wallet)
+        # Use adaptive thresholds (refreshed periodically by the engine
+        # scheduler) so cold-start gates relax automatically once the
+        # system has accumulated enough data. Falls back to settings.*
+        # static cold floor if the cache hasn't been refreshed.
+        from src.config import eff
         follow_ready = (
-            readiness["trades_observed"] >= settings.FOLLOW_MIN_TRADES
-            and readiness["confirmed_followers"] >= settings.FOLLOW_MIN_FOLLOWERS
+            readiness["trades_observed"] >= eff("FOLLOW_MIN_TRADES")
+            and readiness["confirmed_followers"] >= eff("FOLLOW_MIN_FOLLOWERS")
         )
-        fade_ready = readiness["positions_resolved"] >= settings.FADE_MIN_RESOLVED
+        fade_ready = readiness["positions_resolved"] >= eff("FADE_MIN_RESOLVED")
 
         if not follow_ready and not fade_ready:
             await self._log_decision(
@@ -266,7 +285,7 @@ class ConfidenceEngine:
         if action == "fade":
             if (
                 error_prediction is not None
-                and error_prediction.confidence < settings.FADE_MIN_CONFIDENCE
+                and error_prediction.confidence < eff("FADE_MIN_CONFIDENCE")
             ):
                 await self._log_decision(
                     wallet,

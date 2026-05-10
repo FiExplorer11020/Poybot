@@ -8,12 +8,14 @@ from loguru import logger
 
 from src.config import settings
 from src.database.connection import close_pool, initialize_pool
+from src.logging_setup import configure_logging
 from src.registry.falcon_client import FalconClient
 from src.registry.leader_registry import LeaderRegistry
 
 
 async def main() -> None:
-    logger.info("Starting Leader Registry")
+    level = configure_logging()
+    logger.info(f"Starting Leader Registry (log_level={level})")
     await initialize_pool(
         dsn=settings.DATABASE_URL,
         min_size=settings.DB_POOL_MIN,

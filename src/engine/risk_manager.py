@@ -8,6 +8,8 @@ from datetime import datetime, timedelta, timezone
 from loguru import logger
 
 from src.config import settings
+from src.control.killswitch import get_killswitch
+from src.control.runtime_config import get_runtime_config
 from src.database.connection import get_db
 from src.economics.versioning import valid_paper_trade_filter
 
@@ -44,49 +46,110 @@ class RiskManager:
 
     async def check_can_trade(self, signal: dict, current_capital: float) -> bool:
         """
-        Returns True if it is safe to trade. Checks:
-        - Drawdown < 20%
-        - Fewer than 5 consecutive losses
-        - Fewer than 3 losses on the same market in the last 24h
-        - Market exposure < MAX_MARKET_EXPOSURE_PCT
-        - Total open positions < 10
+        Returns True if it is safe to trade. Thresholds are read from the
+        mutable RuntimeConfig (Redis-backed) so the dashboard's Risk &
+        Config cockpit can flip them at runtime without a redeploy.
+
+        Checks (in order):
+        - Global killswitch (execution_enabled flag in system_control)
+        - Drawdown < runtime.max_drawdown_stop_pct (default 20%)
+        - consecutive_losses < runtime.max_consecutive_losses (default 5)
+        - same-market 24h losses < runtime.max_recent_losses_per_market (default 3)
+        - open positions < runtime.max_concurrent_positions (default 10)
+        - market exposure < runtime.max_total_exposure_pct
         """
+        # Global killswitch — must be first. If False (or infra failure), refuse.
+        try:
+            if not await get_killswitch().is_execution_enabled():
+                logger.warning("Circuit breaker: killswitch is OFF, refusing trade")
+                return False
+        except Exception as e:
+            # Fail safe: if we can't read the killswitch, assume it's OFF.
+            logger.error(f"Circuit breaker: killswitch read failed ({e}), refusing trade")
+            return False
+
+        cfg = await get_runtime_config().effective()
+        max_dd = float(cfg.get("max_drawdown_stop_pct", 0.20))
+        max_cons_losses = int(cfg.get("max_consecutive_losses", 5))
+        max_recent_market_losses = int(cfg.get("max_recent_losses_per_market", 3))
+        max_open = int(cfg.get("max_concurrent_positions", 10))
+        max_market_exposure = float(cfg.get("max_total_exposure_pct", settings.MAX_MARKET_EXPOSURE_PCT))
+
         drawdown = (
             (self._peak_capital - current_capital) / self._peak_capital
             if self._peak_capital > 0
             else 0.0
         )
-        if drawdown >= 0.20:
-            logger.warning(f"Circuit breaker: drawdown={drawdown:.1%} >= 20%")
+        if drawdown >= max_dd:
+            logger.warning(f"Circuit breaker: drawdown={drawdown:.1%} >= {max_dd:.1%}")
             return False
 
-        if self._consecutive_losses >= 5:
-            logger.warning(f"Circuit breaker: {self._consecutive_losses} consecutive losses")
+        if self._consecutive_losses >= max_cons_losses:
+            logger.warning(
+                f"Circuit breaker: {self._consecutive_losses} consecutive losses "
+                f">= {max_cons_losses}"
+            )
             return False
 
         market_id = signal.get("market_id", "")
         recent_losses = await self._count_recent_losses(market_id)
-        if recent_losses >= 3:
-            logger.warning(f"Circuit breaker: {recent_losses} losses on {market_id} in 24h")
+        if recent_losses >= max_recent_market_losses:
+            logger.warning(
+                f"Circuit breaker: {recent_losses} losses on {market_id} in 24h "
+                f">= {max_recent_market_losses}"
+            )
             return False
 
         open_count = await self._count_open_positions()
-        if open_count >= 10:
-            logger.warning(f"Circuit breaker: {open_count} open positions >= 10")
+        if open_count >= max_open:
+            logger.warning(f"Circuit breaker: {open_count} open positions >= {max_open}")
             return False
 
         market_exposure = await self._market_exposure(market_id, current_capital)
-        if market_exposure >= settings.MAX_MARKET_EXPOSURE_PCT:
+        if market_exposure >= max_market_exposure:
             logger.warning(
                 f"Circuit breaker: market exposure {market_exposure:.1%} >= "
-                f"{settings.MAX_MARKET_EXPOSURE_PCT:.1%}"
+                f"{max_market_exposure:.1%}"
             )
             return False
 
         return True
 
+    async def apply_size_async(self, kelly_size: float, signal: dict) -> float:
+        """Enforce position size limits and return the allowed size in USDC.
+
+        Reads ``risk_per_trade_pct`` and ``fade_size_ratio`` from the
+        runtime config so the dashboard cockpit can scale exposure
+        without a redeploy. The synchronous ``apply_size`` shim below
+        falls back to the env-driven defaults for callers that haven't
+        been switched to the async path yet.
+        """
+        if kelly_size < settings.MIN_POSITION_USDC:
+            return 0.0
+
+        cfg = await get_runtime_config().effective()
+        risk_pct = float(cfg.get("risk_per_trade_pct", settings.MAX_POSITION_PCT))
+        fade_ratio = float(cfg.get("fade_size_ratio", settings.FADE_SIZE_RATIO))
+        max_cons = int(cfg.get("max_consecutive_losses", 5))
+
+        max_size = settings.PAPER_CAPITAL_USDC * risk_pct
+
+        if signal.get("action") == "fade":
+            max_size *= fade_ratio
+
+        # Warm circuit breaker: halve max once we cross 60% of the consecutive-loss
+        # ceiling. Smoothly anticipates the hard breaker rather than only reacting
+        # at the last possible moment.
+        warm_breaker = max(1, int(max_cons * 0.6))
+        if self._consecutive_losses >= warm_breaker:
+            max_size *= 0.5
+
+        size = min(kelly_size, max_size)
+        return size if size >= settings.MIN_POSITION_USDC else 0.0
+
     def apply_size(self, kelly_size: float, signal: dict) -> float:
-        """Enforce position size limits and return the allowed size in USDC."""
+        """Synchronous fallback that uses env defaults only — kept for
+        compatibility with callers that don't yet use the async API."""
         if kelly_size < settings.MIN_POSITION_USDC:
             return 0.0
 
@@ -95,7 +158,6 @@ class RiskManager:
         if signal.get("action") == "fade":
             max_size *= settings.FADE_SIZE_RATIO
 
-        # Warm circuit breaker: halve max if approaching consecutive-loss threshold
         if self._consecutive_losses >= 3:
             max_size *= 0.5
 

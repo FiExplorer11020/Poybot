@@ -1921,15 +1921,25 @@ async def data_quality(conn, redis_client=None) -> dict:
     report: dict[str, Any] = {}
 
     # --- Market enrichment gaps ----------------------------------------------
+    # unmapped_tokens only counts markets that are still tradable (end_date
+    # in the future or unset). Expired markets cannot be traded so the bot
+    # does not need them enriched — counting them as DQ issues was creating
+    # ~1700 false positives that never decreased.
     mrow = await conn.fetchrow(
         """
         SELECT
             COUNT(*) AS total,
             COUNT(*) FILTER (
-                WHERE NULLIF(token_yes, '') IS NULL OR NULLIF(token_no, '') IS NULL
+                WHERE (NULLIF(token_yes, '') IS NULL OR NULLIF(token_no, '') IS NULL)
+                  AND (end_date IS NULL OR end_date > NOW() - INTERVAL '24 hours')
             ) AS unmapped_tokens,
             COUNT(*) FILTER (WHERE end_date IS NOT NULL AND end_date < NOW()) AS expired_active,
-            COUNT(*) FILTER (WHERE active = TRUE) AS active
+            COUNT(*) FILTER (WHERE active = TRUE) AS active,
+            COUNT(*) FILTER (
+                WHERE (NULLIF(token_yes, '') IS NULL OR NULLIF(token_no, '') IS NULL)
+                  AND end_date IS NOT NULL
+                  AND end_date < NOW() - INTERVAL '24 hours'
+            ) AS unmapped_expired_skipped
         FROM markets
         """
     )
@@ -1939,6 +1949,7 @@ async def data_quality(conn, redis_client=None) -> dict:
         "active": _to_int(_row_get(mrow, "active"), 0),
         "unmapped_tokens": _to_int(_row_get(mrow, "unmapped_tokens"), 0),
         "expired_still_active": _to_int(_row_get(mrow, "expired_active"), 0),
+        "unmapped_expired_skipped": _to_int(_row_get(mrow, "unmapped_expired_skipped"), 0),
         "token_map_coverage_pct": (
             round(
                 (total_markets - _to_int(_row_get(mrow, "unmapped_tokens"), 0))
@@ -2055,3 +2066,652 @@ async def data_quality(conn, redis_client=None) -> dict:
     report["issues_count"] = issues
     report["status"] = "healthy" if issues == 0 else ("degraded" if issues <= 2 else "unhealthy")
     return report
+
+
+# ============================================================================
+# UI v2 — Alpha Terminal extras (24h timeline + next-signal ETA)
+# ============================================================================
+async def alpha_extras(conn) -> dict:
+    """
+    Time-series data for the redesigned ALPHA TERMINAL hero panels.
+
+    Returns:
+        timeline       : 12 buckets of 2h each over the last 24h with
+                         {trades, leader_trades, positions_resolved,
+                          edges_observed, avg_maturity}
+        readiness      : top leaders closest to triggering FOLLOW or FADE,
+                         with what's missing and an ETA in hours.
+        learning_totals: cumulative counts (current state) for headline KPIs.
+    """
+    # ---- 24h timeline (12 buckets of 2h) -------------------------------- #
+    timeline_rows = await conn.fetch(
+        """
+        WITH buckets AS (
+            SELECT generate_series(
+                date_trunc('hour', NOW()) - INTERVAL '22 hours',
+                date_trunc('hour', NOW()),
+                INTERVAL '2 hours'
+            ) AS bucket_start
+        )
+        SELECT
+            b.bucket_start,
+            COALESCE((
+                SELECT COUNT(*) FROM trades_observed t
+                WHERE t.time >= b.bucket_start AND t.time < b.bucket_start + INTERVAL '2 hours'
+            ), 0) AS trades,
+            COALESCE((
+                SELECT COUNT(*) FROM trades_observed t
+                WHERE t.time >= b.bucket_start AND t.time < b.bucket_start + INTERVAL '2 hours'
+                  AND t.is_leader = TRUE
+            ), 0) AS leader_trades,
+            COALESCE((
+                SELECT COUNT(*) FROM positions_reconstructed p
+                WHERE p.close_time >= b.bucket_start AND p.close_time < b.bucket_start + INTERVAL '2 hours'
+            ), 0) AS positions_resolved,
+            COALESCE((
+                SELECT COUNT(*) FROM follower_edges e
+                WHERE e.last_observed >= b.bucket_start AND e.last_observed < b.bucket_start + INTERVAL '2 hours'
+            ), 0) AS edges_active
+        FROM buckets b
+        ORDER BY b.bucket_start ASC
+        """
+    )
+    timeline = [
+        {
+            "t": _row_get(r, "bucket_start").isoformat() if _row_get(r, "bucket_start") else None,
+            "trades": _to_int(_row_get(r, "trades"), 0),
+            "leader_trades": _to_int(_row_get(r, "leader_trades"), 0),
+            "positions_resolved": _to_int(_row_get(r, "positions_resolved"), 0),
+            "edges_active": _to_int(_row_get(r, "edges_active"), 0),
+        }
+        for r in timeline_rows
+    ]
+
+    # ---- Top leaders closest to FOLLOW readiness ------------------------ #
+    # Thresholds from settings: FOLLOW needs 50 trades + 5 confirmed
+    # followers + 10 resolved positions. We rank leaders by how few of
+    # these gates remain.
+    follow_rows = await conn.fetch(
+        f"""
+        WITH counts AS (
+            SELECT
+                lp.wallet_address,
+                lp.trades_observed,
+                lp.positions_resolved,
+                lp.profile_maturity,
+                lp.error_model_phase,
+                COALESCE((
+                    SELECT COUNT(*) FROM follower_edges e
+                    WHERE e.leader_wallet = lp.wallet_address
+                      AND e.co_occurrences >= 5
+                      AND e.same_direction_rate >= 0.7
+                ), 0) AS confirmed_followers,
+                COALESCE((
+                    SELECT COUNT(*) FROM trades_observed t
+                    WHERE t.wallet_address = lp.wallet_address
+                      AND t.time >= NOW() - INTERVAL '24 hours'
+                ), 0) AS trades_24h,
+                COALESCE(l.falcon_score, 0) AS falcon_score,
+                l.classification_json
+            FROM leader_profiles lp
+            JOIN leaders l USING (wallet_address)
+            WHERE l.excluded = FALSE
+              AND l.on_watchlist = TRUE
+        )
+        SELECT
+            wallet_address,
+            trades_observed,
+            positions_resolved,
+            confirmed_followers,
+            profile_maturity,
+            error_model_phase,
+            trades_24h,
+            falcon_score,
+            classification_json
+        FROM counts
+        ORDER BY
+            -- Score: lower = closer to ready. Each gate contributes its
+            -- gap (clamped to 0 once met). We weight followers more since
+            -- they're the slowest to come online.
+            (GREATEST(0, 50 - trades_observed)
+              + GREATEST(0, 10 - positions_resolved) * 2
+              + GREATEST(0, 5 - confirmed_followers) * 5) ASC,
+            falcon_score DESC
+        LIMIT 6
+        """
+    )
+    follow_ready: list[dict] = []
+    for r in follow_rows:
+        trades = _to_int(_row_get(r, "trades_observed"), 0)
+        resolved = _to_int(_row_get(r, "positions_resolved"), 0)
+        followers = _to_int(_row_get(r, "confirmed_followers"), 0)
+        trades_24h = _to_int(_row_get(r, "trades_24h"), 0)
+        rate_per_h = trades_24h / 24.0 if trades_24h else 0.0
+        # ETA: hours to hit the binding gate (whichever is furthest).
+        # Followers come from co-occurrences observed via graph_engine —
+        # hard to estimate, so we approximate at 1 follower per 5 trades.
+        gates = []
+        if trades < 50:
+            gates.append(("trades", 50 - trades, (50 - trades) / rate_per_h if rate_per_h else None))
+        if resolved < 10:
+            # Positions resolve at ~10% of trades observed (rough heuristic)
+            est_h = ((10 - resolved) * 10) / rate_per_h if rate_per_h else None
+            gates.append(("resolved", 10 - resolved, est_h))
+        if followers < 5:
+            est_h = ((5 - followers) * 5) / rate_per_h if rate_per_h else None
+            gates.append(("followers", 5 - followers, est_h))
+        eta_h = max((g[2] or 0) for g in gates) if gates else 0
+        follow_ready.append(
+            {
+                "wallet_address": _row_get(r, "wallet_address"),
+                "trades": trades,
+                "trades_target": 50,
+                "resolved": resolved,
+                "resolved_target": 10,
+                "followers": followers,
+                "followers_target": 5,
+                "phase": _to_int(_row_get(r, "error_model_phase"), 1),
+                "maturity": _to_float(_row_get(r, "profile_maturity")),
+                "rate_per_h": round(rate_per_h, 2),
+                "missing": [{"gate": g[0], "gap": g[1], "eta_h": round(g[2], 1) if g[2] else None} for g in gates],
+                "eta_h": round(eta_h, 1) if eta_h else None,
+                "ready": len(gates) == 0,
+            }
+        )
+
+    # ---- Learning totals (current state snapshot) ----------------------- #
+    totals_row = await conn.fetchrow(
+        """
+        SELECT
+            (SELECT COUNT(*) FROM trades_observed) AS trades_total,
+            (SELECT COUNT(*) FROM positions_reconstructed WHERE close_time IS NOT NULL) AS positions_resolved_total,
+            (SELECT COUNT(*) FROM follower_edges) AS edges_total,
+            (SELECT COUNT(*) FROM follower_edges WHERE co_occurrences >= 5 AND same_direction_rate >= 0.7) AS edges_confirmed,
+            (SELECT COALESCE(AVG(profile_maturity), 0) FROM leader_profiles) AS avg_maturity,
+            (SELECT COUNT(*) FROM leader_profiles) AS profiles_total,
+            (SELECT COUNT(*) FROM leader_profiles WHERE error_model_phase = 1) AS phase1,
+            (SELECT COUNT(*) FROM leader_profiles WHERE error_model_phase = 2) AS phase2,
+            (SELECT COUNT(*) FROM leader_profiles WHERE error_model_phase = 3) AS phase3
+        """
+    )
+
+    return {
+        "timeline": timeline,
+        "follow_ready": follow_ready,
+        "totals": {
+            "trades_total": _to_int(_row_get(totals_row, "trades_total"), 0),
+            "positions_resolved_total": _to_int(_row_get(totals_row, "positions_resolved_total"), 0),
+            "edges_total": _to_int(_row_get(totals_row, "edges_total"), 0),
+            "edges_confirmed": _to_int(_row_get(totals_row, "edges_confirmed"), 0),
+            "avg_maturity": round(_to_float(_row_get(totals_row, "avg_maturity"), 0.0), 4),
+            "profiles_total": _to_int(_row_get(totals_row, "profiles_total"), 0),
+            "phase1": _to_int(_row_get(totals_row, "phase1"), 0),
+            "phase2": _to_int(_row_get(totals_row, "phase2"), 0),
+            "phase3": _to_int(_row_get(totals_row, "phase3"), 0),
+        },
+    }
+
+
+# ============================================================================
+# UI v2 — Wallet Graph (force-directed friendly payload)
+# ============================================================================
+async def wallet_graph(conn, max_leaders: int = 30) -> dict:
+    """
+    Returns node + edge lists ready for a force-directed visualisation.
+
+    nodes: [{id, label, role:'leader|follower', falcon_score, phase,
+             maturity, total_trades, classification, x?, y?}]
+    edges: [{source, target, p_follow, hawkes_alpha_mu, delay_s,
+             same_dir, co_occurrences, confirmed}]
+    """
+    # Top leaders by maturity * falcon_score (so we surface the "alive" ones).
+    # Also pulls win_rate (closed paper trades), 24h trade count and the
+    # latest decision context so the front-end Wallet Scanner can show a
+    # full leader-centric row without an extra round-trip.
+    leader_rows = await conn.fetch(
+        f"""
+        WITH
+        winrate AS (
+            SELECT leader_wallet,
+                   COUNT(*) FILTER (WHERE pnl_usdc IS NOT NULL)        AS closed_total,
+                   COUNT(*) FILTER (WHERE pnl_usdc > 0)                AS wins,
+                   COALESCE(SUM(pnl_usdc), 0)                          AS pnl_total
+            FROM paper_trades
+            WHERE status = 'closed'
+              AND {V1_PAPER_TRADE_SQL}
+            GROUP BY leader_wallet
+        ),
+        recent_act AS (
+            SELECT wallet_address,
+                   COUNT(*)                                            AS trades_24h,
+                   MAX(time)                                           AS last_seen
+            FROM trades_observed
+            WHERE time >= NOW() - INTERVAL '24 hours'
+              AND is_leader = TRUE
+            GROUP BY wallet_address
+        ),
+        last_dec AS (
+            SELECT DISTINCT ON (leader_wallet)
+                   leader_wallet, action, confidence, time AS decided_at
+            FROM decision_log
+            WHERE time >= NOW() - INTERVAL '24 hours'
+            ORDER BY leader_wallet, time DESC
+        )
+        SELECT lp.wallet_address,
+               lp.profile_maturity,
+               lp.error_model_phase,
+               lp.trades_observed,
+               lp.positions_resolved,
+               COALESCE(l.falcon_score, 0)        AS falcon_score,
+               l.classification_json,
+               l.exclude_reason,
+               COALESCE(wr.wins, 0)::float / NULLIF(wr.closed_total, 0) AS win_rate,
+               COALESCE(wr.closed_total, 0)       AS closed_total,
+               COALESCE(wr.pnl_total, 0)          AS pnl_total,
+               COALESCE(ra.trades_24h, 0)         AS trades_24h,
+               ra.last_seen,
+               ld.action                           AS last_action,
+               ld.confidence                       AS last_confidence,
+               ld.decided_at                       AS last_decision_at
+        FROM leader_profiles lp
+        JOIN leaders l USING (wallet_address)
+        LEFT JOIN winrate wr ON wr.leader_wallet = lp.wallet_address
+        LEFT JOIN recent_act ra ON ra.wallet_address = lp.wallet_address
+        LEFT JOIN last_dec ld ON ld.leader_wallet = lp.wallet_address
+        WHERE l.excluded = FALSE
+        ORDER BY (COALESCE(lp.profile_maturity, 0) * (COALESCE(l.falcon_score, 0) + 0.1)) DESC
+        LIMIT $1
+        """,
+        max_leaders,
+    )
+    leader_wallets = {str(_row_get(r, "wallet_address")) for r in leader_rows}
+
+    # Edges originating from those leaders (limit to keep graph readable).
+    edge_rows = await conn.fetch(
+        """
+        SELECT leader_wallet, follower_wallet, follow_probability,
+               hawkes_alpha_mu, avg_delay_s, same_direction_rate,
+               co_occurrences, trapped_rate
+        FROM follower_edges
+        WHERE leader_wallet = ANY($1::text[])
+          AND co_occurrences >= 2
+        ORDER BY follow_probability DESC NULLS LAST,
+                 co_occurrences DESC
+        LIMIT 200
+        """,
+        list(leader_wallets),
+    )
+
+    # Collect follower wallets we want to also surface as nodes.
+    follower_wallets = {str(_row_get(r, "follower_wallet")) for r in edge_rows} - leader_wallets
+    follower_meta_rows: list = []
+    if follower_wallets:
+        follower_meta_rows = await conn.fetch(
+            """
+            SELECT lp.wallet_address,
+                   lp.profile_maturity,
+                   lp.error_model_phase,
+                   lp.trades_observed,
+                   COALESCE(l.falcon_score, 0) AS falcon_score,
+                   l.classification_json
+            FROM leader_profiles lp
+            LEFT JOIN leaders l USING (wallet_address)
+            WHERE lp.wallet_address = ANY($1::text[])
+            """,
+            list(follower_wallets),
+        )
+    follower_meta = {str(_row_get(r, "wallet_address")): r for r in follower_meta_rows}
+
+    def _classification_strategy(blob) -> str | None:
+        try:
+            parsed = blob if isinstance(blob, dict) else json.loads(blob) if blob else {}
+            return parsed.get("strategy")
+        except Exception:
+            return None
+
+    nodes: list[dict] = []
+    for r in leader_rows:
+        wallet = str(_row_get(r, "wallet_address"))
+        last_seen = _row_get(r, "last_seen")
+        last_decision_at = _row_get(r, "last_decision_at")
+        nodes.append(
+            {
+                "id": wallet,
+                "label": wallet[:6] + "…" + wallet[-4:],
+                "role": "leader",
+                "falcon_score": _to_float(_row_get(r, "falcon_score"), 0.0),
+                "phase": _to_int(_row_get(r, "error_model_phase"), 1),
+                "maturity": _to_float(_row_get(r, "profile_maturity"), 0.0),
+                "trades_observed": _to_int(_row_get(r, "trades_observed"), 0),
+                "positions_resolved": _to_int(_row_get(r, "positions_resolved"), 0),
+                "classification": _classification_strategy(_row_get(r, "classification_json")),
+                "exclude_reason": _row_get(r, "exclude_reason"),
+                # ── Wallet Scanner enrichments (replaces the old market-centric scanner) ──
+                "win_rate": _to_float(_row_get(r, "win_rate")) if _row_get(r, "win_rate") is not None else None,
+                "closed_total": _to_int(_row_get(r, "closed_total"), 0),
+                "pnl_total": _to_float(_row_get(r, "pnl_total"), 0.0),
+                "trades_24h": _to_int(_row_get(r, "trades_24h"), 0),
+                "last_seen_iso": last_seen.isoformat() if last_seen else None,
+                "last_action": _row_get(r, "last_action"),
+                "last_confidence": _to_float(_row_get(r, "last_confidence")) if _row_get(r, "last_confidence") is not None else None,
+                "last_decision_iso": last_decision_at.isoformat() if last_decision_at else None,
+            }
+        )
+    for wallet in follower_wallets:
+        m = follower_meta.get(wallet)
+        nodes.append(
+            {
+                "id": wallet,
+                "label": wallet[:6] + "…" + wallet[-4:],
+                "role": "follower",
+                "falcon_score": _to_float(_row_get(m, "falcon_score"), 0.0) if m else 0.0,
+                "phase": _to_int(_row_get(m, "error_model_phase"), 1) if m else 1,
+                "maturity": _to_float(_row_get(m, "profile_maturity"), 0.0) if m else 0.0,
+                "trades_observed": _to_int(_row_get(m, "trades_observed"), 0) if m else 0,
+                "positions_resolved": 0,
+                "classification": _classification_strategy(_row_get(m, "classification_json")) if m else None,
+                "exclude_reason": None,
+            }
+        )
+
+    edges: list[dict] = []
+    for r in edge_rows:
+        co_occ = _to_int(_row_get(r, "co_occurrences"), 0)
+        same_dir = _to_float(_row_get(r, "same_direction_rate"), 0.0)
+        confirmed = co_occ >= 5 and same_dir >= 0.7
+        edges.append(
+            {
+                "source": str(_row_get(r, "leader_wallet")),
+                "target": str(_row_get(r, "follower_wallet")),
+                "p_follow": _to_float(_row_get(r, "follow_probability"), 0.0),
+                "hawkes_alpha_mu": _to_float(_row_get(r, "hawkes_alpha_mu")),
+                "delay_s": _to_float(_row_get(r, "avg_delay_s")),
+                "same_dir": same_dir,
+                "co_occurrences": co_occ,
+                "trapped_rate": _to_float(_row_get(r, "trapped_rate")),
+                "confirmed": confirmed,
+            }
+        )
+
+    # Stats
+    confirmed_count = sum(1 for e in edges if e["confirmed"])
+    return {
+        "nodes": nodes,
+        "edges": edges,
+        "stats": {
+            "leaders": len(leader_rows),
+            "followers": len(follower_wallets),
+            "edges_total": len(edges),
+            "edges_confirmed": confirmed_count,
+        },
+    }
+
+
+# ============================================================================
+# UI v2 — Decision rejections breakdown (last hour)
+# ============================================================================
+async def decision_rejections_breakdown(conn, hours: int = 1) -> dict:
+    """Aggregate SKIP reasons over the last `hours` for the dashboard."""
+    rows = await conn.fetch(
+        """
+        SELECT
+            COALESCE(NULLIF(reason, ''), 'unspecified') AS reason,
+            COUNT(*) AS count,
+            COUNT(DISTINCT leader_wallet) AS uniq_leaders,
+            COUNT(DISTINCT market_id) AS uniq_markets,
+            MAX(time) AS last_seen
+        FROM decision_log
+        WHERE action = 'skip'
+          AND time >= NOW() - ($1 || ' hours')::interval
+        GROUP BY 1
+        ORDER BY count DESC
+        LIMIT 12
+        """,
+        str(hours),
+    )
+    total = sum(_to_int(_row_get(r, "count"), 0) for r in rows)
+    breakdown = []
+    for r in rows:
+        cnt = _to_int(_row_get(r, "count"), 0)
+        breakdown.append(
+            {
+                "reason": _row_get(r, "reason"),
+                "count": cnt,
+                "pct": round(cnt / total * 100, 1) if total else 0,
+                "uniq_leaders": _to_int(_row_get(r, "uniq_leaders"), 0),
+                "uniq_markets": _to_int(_row_get(r, "uniq_markets"), 0),
+                "last_seen": _row_get(r, "last_seen").isoformat() if _row_get(r, "last_seen") else None,
+            }
+        )
+    return {"total": total, "window_hours": hours, "breakdown": breakdown}
+
+
+# ============================================================================
+# UI v2 — Equity curve for LIVE PORTFOLIO
+# ============================================================================
+async def inspector_snapshot(conn, redis_client=None, limit: int = 80) -> dict:
+    """
+    Pipeline observability snapshot for the INSPECTOR tab.
+
+    Surfaces the raw signals the bot is reacting to, so operators can
+    diagnose attribution issues, source skew, latency drift, and
+    decision-pipeline stalls without SSH'ing into the server.
+
+    Sections returned:
+      raw_trades   — last N trades_observed rows with full payload
+      decisions    — last N decision_log rows with reason and confidence
+      source_mix   — count by source over the last 5 min (ws / api_market / api_wallet)
+      pipeline     — heartbeat / lag / pubsub backlog metrics from Redis
+      counters     — DB-side counters (trades 1h, decisions 1h, etc.)
+    """
+    now = datetime.now(timezone.utc)
+    payload: dict[str, Any] = {"generated_at": now.isoformat()}
+
+    # ── Raw trades (last N, all columns) ─────────────────────────────────────
+    raw_rows = await conn.fetch(
+        """
+        SELECT t.id, t.time, t.market_id, t.token_id, t.wallet_address,
+               t.side, t.price, t.size_usdc, t.source, t.is_leader,
+               m.question AS market_question, m.category AS market_category
+        FROM trades_observed t
+        LEFT JOIN markets m ON m.market_id = t.market_id
+        ORDER BY t.time DESC
+        LIMIT $1
+        """,
+        limit,
+    )
+    payload["raw_trades"] = [
+        {
+            "id": _to_int(_row_get(r, "id"), 0),
+            "time": _row_get(r, "time").isoformat() if _row_get(r, "time") else None,
+            "market_id": _row_get(r, "market_id"),
+            "market_question": _row_get(r, "market_question"),
+            "market_category": _row_get(r, "market_category"),
+            "token_id": _row_get(r, "token_id"),
+            "wallet_address": _row_get(r, "wallet_address"),
+            "side": _row_get(r, "side"),
+            "price": _to_float(_row_get(r, "price"), 0.0),
+            "size_usdc": _to_float(_row_get(r, "size_usdc"), 0.0),
+            "source": _row_get(r, "source"),
+            "is_leader": bool(_row_get(r, "is_leader")),
+        }
+        for r in raw_rows
+    ]
+
+    # ── Decision log (last N) ────────────────────────────────────────────────
+    dec_rows = await conn.fetch(
+        """
+        SELECT time, leader_wallet, market_id, action, confidence,
+               kelly_fraction, thompson_follow, thompson_fade, reason, outcome
+        FROM decision_log
+        ORDER BY time DESC
+        LIMIT $1
+        """,
+        min(limit, 50),
+    )
+    payload["decisions"] = [
+        {
+            "time": _row_get(r, "time").isoformat() if _row_get(r, "time") else None,
+            "leader_wallet": _row_get(r, "leader_wallet"),
+            "market_id": _row_get(r, "market_id"),
+            "action": _row_get(r, "action"),
+            "confidence": _to_float(_row_get(r, "confidence")),
+            "kelly_fraction": _to_float(_row_get(r, "kelly_fraction")),
+            "thompson_follow": _to_float(_row_get(r, "thompson_follow")),
+            "thompson_fade": _to_float(_row_get(r, "thompson_fade")),
+            "reason": _row_get(r, "reason"),
+            "outcome": _row_get(r, "outcome"),
+        }
+        for r in dec_rows
+    ]
+
+    # ── Source mix (last 5 min) ──────────────────────────────────────────────
+    src_rows = await conn.fetch(
+        """
+        SELECT COALESCE(source, 'unknown') AS source,
+               COUNT(*) AS total,
+               COUNT(*) FILTER (WHERE is_leader) AS leader_count
+        FROM trades_observed
+        WHERE time > NOW() - INTERVAL '5 minutes'
+        GROUP BY source
+        ORDER BY total DESC
+        """
+    )
+    payload["source_mix"] = [
+        {
+            "source": _row_get(r, "source"),
+            "total": _to_int(_row_get(r, "total"), 0),
+            "leader_count": _to_int(_row_get(r, "leader_count"), 0),
+        }
+        for r in src_rows
+    ]
+
+    # ── DB-side counters (last 1h) ───────────────────────────────────────────
+    counters_row = await conn.fetchrow(
+        """
+        SELECT
+            (SELECT COUNT(*) FROM trades_observed WHERE time > NOW() - INTERVAL '1 hour')      AS trades_1h,
+            (SELECT COUNT(*) FROM trades_observed
+              WHERE time > NOW() - INTERVAL '1 hour' AND is_leader = TRUE)                      AS leader_trades_1h,
+            (SELECT COUNT(*) FROM decision_log WHERE time > NOW() - INTERVAL '1 hour')          AS decisions_1h,
+            (SELECT COUNT(*) FROM decision_log
+              WHERE time > NOW() - INTERVAL '1 hour' AND action != 'skip')                      AS actionable_1h,
+            (SELECT COUNT(*) FROM positions_reconstructed
+              WHERE close_time > NOW() - INTERVAL '1 hour')                                     AS closes_1h
+        """
+    )
+    payload["counters"] = {
+        "trades_1h": _to_int(_row_get(counters_row, "trades_1h"), 0),
+        "leader_trades_1h": _to_int(_row_get(counters_row, "leader_trades_1h"), 0),
+        "decisions_1h": _to_int(_row_get(counters_row, "decisions_1h"), 0),
+        "actionable_1h": _to_int(_row_get(counters_row, "actionable_1h"), 0),
+        "closes_1h": _to_int(_row_get(counters_row, "closes_1h"), 0),
+    }
+
+    # ── Redis pipeline metrics ───────────────────────────────────────────────
+    pipeline: dict[str, Any] = {
+        "ws_last_message_age_s": None,
+        "ws_msgs_per_min": None,
+        "trades_pubsub_backlog": None,
+        "redis_reachable": False,
+    }
+    if redis_client is not None:
+        try:
+            ts = await redis_client.get("ws:market:last_message_ts")
+            if ts is not None:
+                pipeline["ws_last_message_age_s"] = max(0.0, now.timestamp() - float(ts))
+            rate = await redis_client.get("ws:market:msgs_per_min")
+            if rate is not None:
+                pipeline["ws_msgs_per_min"] = float(rate)
+            # Channel pubsub channel stats (rough — pubsub doesn't have persistent backlog,
+            # but we can read the count of sub-listeners as a sanity check).
+            try:
+                channels = await redis_client.execute_command("PUBSUB", "NUMSUB", "trades:observed")
+                if isinstance(channels, list) and len(channels) >= 2:
+                    pipeline["trades_pubsub_subscribers"] = int(channels[1])
+            except Exception:
+                pass
+            pipeline["redis_reachable"] = True
+        except Exception as exc:
+            logger.warning(f"inspector_snapshot redis fetch failed: {exc}")
+
+    payload["pipeline"] = pipeline
+    return payload
+
+
+async def equity_curve(conn, limit: int = 200) -> dict:
+    """Recent portfolio equity time-series + breakdown by leader/strategy."""
+    series_rows = await conn.fetch(
+        """
+        SELECT time, capital, equity, unrealized_pnl, realized_pnl_cum, open_positions
+        FROM portfolio_equity
+        WHERE time >= NOW() - INTERVAL '7 days'
+        ORDER BY time DESC
+        LIMIT $1
+        """,
+        limit,
+    )
+    series = [
+        {
+            "t": _row_get(r, "time").isoformat() if _row_get(r, "time") else None,
+            "capital": _to_float(_row_get(r, "capital"), 0.0),
+            "equity": _to_float(_row_get(r, "equity"), 0.0),
+            "unrealized_pnl": _to_float(_row_get(r, "unrealized_pnl"), 0.0),
+            "realized_pnl_cum": _to_float(_row_get(r, "realized_pnl_cum"), 0.0),
+            "open_positions": _to_int(_row_get(r, "open_positions"), 0),
+        }
+        for r in reversed(series_rows)  # chronological asc for sparklines
+    ]
+
+    by_leader_rows = await conn.fetch(
+        """
+        SELECT leader_wallet,
+               COUNT(*) AS trades,
+               COUNT(*) FILTER (WHERE pnl_usdc > 0) AS wins,
+               COALESCE(SUM(pnl_usdc), 0) AS pnl,
+               COALESCE(AVG(pnl_usdc), 0) AS avg_pnl
+        FROM paper_trades
+        WHERE status = 'closed'
+          AND opened_at >= NOW() - INTERVAL '30 days'
+        GROUP BY leader_wallet
+        ORDER BY pnl DESC
+        LIMIT 20
+        """
+    )
+    by_leader = [
+        {
+            "wallet": _row_get(r, "leader_wallet"),
+            "trades": _to_int(_row_get(r, "trades"), 0),
+            "wins": _to_int(_row_get(r, "wins"), 0),
+            "pnl": _to_float(_row_get(r, "pnl"), 0.0),
+            "avg_pnl": _to_float(_row_get(r, "avg_pnl"), 0.0),
+        }
+        for r in by_leader_rows
+    ]
+
+    by_strategy_rows = await conn.fetch(
+        """
+        SELECT strategy,
+               COUNT(*) AS trades,
+               COUNT(*) FILTER (WHERE pnl_usdc > 0) AS wins,
+               COALESCE(SUM(pnl_usdc), 0) AS pnl
+        FROM paper_trades
+        WHERE status = 'closed'
+        GROUP BY strategy
+        """
+    )
+    by_strategy = [
+        {
+            "strategy": _row_get(r, "strategy"),
+            "trades": _to_int(_row_get(r, "trades"), 0),
+            "wins": _to_int(_row_get(r, "wins"), 0),
+            "pnl": _to_float(_row_get(r, "pnl"), 0.0),
+        }
+        for r in by_strategy_rows
+    ]
+
+    return {
+        "series": series,
+        "by_leader": by_leader,
+        "by_strategy": by_strategy,
+    }

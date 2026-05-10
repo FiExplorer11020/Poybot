@@ -1,4 +1,23 @@
-# Production overlay — use with: docker-compose -f docker-compose.yml -f docker-compose.prod.yml up -d
+# --------------------------------------------------------------------------- #
+# Production overlay (S4.11).                                                  #
+#                                                                              #
+# Usage                                                                        #
+#   docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d      #
+#                                                                              #
+# Targets the Oracle Cloud Free tier (Ampere A1 — 4 vCPU / 24 GB RAM           #
+# shared with the rest of the box, but we self-cap at ~1.5 GB for the          #
+# whole stack to leave headroom).                                              #
+#                                                                              #
+# Memory budget                                                                #
+#   postgres : 300 MB                                                          #
+#   redis    :  64 MB                                                          #
+#   observer : 300 MB                                                          #
+#   engine   : 600 MB  (jax/lightgbm load lazily for nightly batch)            #
+#   registry : 200 MB                                                          #
+#   api      : 200 MB                                                          #
+#   ──────────                                                                 #
+#   total    : ~1.66 GB                                                        #
+# --------------------------------------------------------------------------- #
 
 services:
   postgres:
@@ -17,6 +36,9 @@ services:
       resources:
         limits:
           memory: 300M
+    # Don't expose Postgres on the public network — only reachable via
+    # the compose bridge.
+    ports: !reset []
 
   redis:
     restart: unless-stopped
@@ -25,3 +47,66 @@ services:
       resources:
         limits:
           memory: 64M
+    ports: !reset []
+
+  observer:
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 300M
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+
+  engine:
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 600M
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+
+  registry:
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 200M
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+
+  api:
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 200M
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+
+  backups:
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          # 200M is plenty: pg_dump streams ~50 MB compressed, boto3
+          # buffers an 8 MB part. Spike room for 2× during upload.
+          memory: 200M
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"

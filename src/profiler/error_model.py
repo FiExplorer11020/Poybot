@@ -290,10 +290,16 @@ class ErrorModel:
     # ─── Phase management ────────────────────────────────────────────────────
 
     def _determine_phase(self, positions_resolved: int) -> int:
-        """Return the appropriate model phase given how many positions have resolved."""
-        if positions_resolved >= settings.MIN_RESOLVED_FOR_ERROR_P3 and _phase3_supported():
+        """Return the appropriate model phase given how many positions have resolved.
+
+        Uses adaptive thresholds (refreshed by the engine scheduler) so the
+        promotion gates relax during cold start and tighten as the system
+        accumulates observations. Static settings.* are the cold floor.
+        """
+        from src.config import eff
+        if positions_resolved >= eff("MIN_RESOLVED_FOR_ERROR_P3") and _phase3_supported():
             return 3
-        if positions_resolved >= settings.MIN_RESOLVED_FOR_ERROR_P2:
+        if positions_resolved >= eff("MIN_RESOLVED_FOR_ERROR_P2"):
             return 2
         return 1
 

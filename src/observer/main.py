@@ -11,6 +11,7 @@ from loguru import logger
 
 from src.config import settings
 from src.database.connection import close_pool, initialize_pool
+from src.logging_setup import configure_logging
 from src.observer.position_tracker import PositionTracker
 from src.observer.trade_observer import TradeObserver
 from src.registry.falcon_client import FalconClient
@@ -142,7 +143,8 @@ async def _bootstrap_subscriptions() -> tuple[set[str], set[str]]:
 
 
 async def main() -> None:
-    logger.info("Starting Observer")
+    level = configure_logging()
+    logger.info(f"Starting Observer (log_level={level})")
     await initialize_pool(
         dsn=settings.DATABASE_URL,
         min_size=settings.DB_POOL_MIN,

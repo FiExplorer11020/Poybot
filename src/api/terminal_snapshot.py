@@ -295,6 +295,15 @@ def _build_decision_engine(
             {
                 "market_id": row.get("market_id"),
                 "title": row.get("question") or row.get("title") or row.get("market_id"),
+                # The whole strategy revolves around leaders, so the wallet
+                # is a first-class column for the UI — not an internal-only
+                # field. Without it, the dashboard shows a market list and
+                # hides what the bot is actually tracking (which leader,
+                # how mature its profile, etc.).
+                "leader_wallet": row.get("leader_wallet"),
+                "thompson_follow": _to_float(row.get("thompson_follow"), 0.0) or 0.0,
+                "thompson_fade": _to_float(row.get("thompson_fade"), 0.0) or 0.0,
+                "kelly_fraction": _to_float(row.get("kelly_fraction"), 0.0) or 0.0,
                 "action": action,
                 "side": (row.get("side") or row.get("signal_audit", {}).get("side")),
                 "confidence": _to_float(row.get("confidence"), 0.0) or 0.0,
@@ -314,6 +323,10 @@ def _build_decision_engine(
                 {
                     "market_id": row.get("market_id"),
                     "title": row.get("question") or row.get("market_id"),
+                    "leader_wallet": row.get("leader_wallet"),
+                    "thompson_follow": 0.0,
+                    "thompson_fade": 0.0,
+                    "kelly_fraction": 0.0,
                     "action": _map_readiness_action(state),
                     "side": None,
                     "confidence": ((_to_float((row.get("bars") or {}).get("first_position_readiness_pct"), 0.0) or 0.0) / 100.0),
@@ -387,12 +400,18 @@ def _build_ingestion(
     stage_status = stage_health.get("stage_status") or {}
     ws_age_s = _to_float(health.get("last_message_age_s"), 0.0) or 0.0
 
+    # Prefer the real WebSocket throughput counter (price_change + book +
+    # trade events all combined) over the trades_observed-derived count
+    # which only sees the tiny subset that maps to a known leader wallet.
+    ws_msgs_real = _to_int(health.get("ws_messages_last_minute"), -1)
+    ws_msgs_for_panel = ws_msgs_real if ws_msgs_real >= 0 else updates_last_minute
+
     sources = [
         {
             "name": "CLOB WebSocket",
             "status": "healthy" if health.get("websocket_connected") else "degraded",
             "lag_ms": int(round(ws_age_s * 1000)),
-            "messages_last_minute": updates_last_minute,
+            "messages_last_minute": ws_msgs_for_panel,
             "note": None,
         },
         {
@@ -443,19 +462,35 @@ def _build_bot_payload(
 
 def _build_risk_config(
     runtime: dict[str, Any],
+    runtime_overrides: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    """Build the risk_config block of the snapshot.
+
+    ``runtime_overrides`` is the merged effective config from
+    ``RuntimeConfig.effective()`` — we pass it in instead of awaiting
+    here because this function is intentionally synchronous.
+    """
+    rc = runtime_overrides or {}
+
+    def _val(key: str, fallback: Any) -> Any:
+        v = rc.get(key)
+        return v if v is not None else fallback
+
     return {
-        "risk_per_trade_pct": settings.MAX_POSITION_PCT,
-        "max_total_exposure_pct": settings.MAX_MARKET_EXPOSURE_PCT,
-        "kelly_fraction": None,
-        "max_drawdown_stop_pct": 0.20,
+        "risk_per_trade_pct": _val("risk_per_trade_pct", settings.MAX_POSITION_PCT),
+        "max_total_exposure_pct": _val("max_total_exposure_pct", settings.MAX_MARKET_EXPOSURE_PCT),
+        "kelly_fraction": _val("kelly_fraction", getattr(settings, "KELLY_FRACTION", 0.5)),
+        "max_drawdown_stop_pct": _val("max_drawdown_stop_pct", 0.20),
         "base_entry_threshold": None,
         "spread_cap": None,
         "fee_bps": None,
-        "min_signal_strength": settings.FADE_MIN_CONFIDENCE,
-        "max_concurrent_positions": 10,
+        "min_signal_strength": _val("min_signal_strength", settings.FADE_MIN_CONFIDENCE),
+        "max_concurrent_positions": _val("max_concurrent_positions", 10),
         "max_positions_per_tick": None,
-        "cooldown_seconds": settings.PAPER_REENTRY_COOLDOWN_S,
+        "cooldown_seconds": _val("cooldown_seconds", settings.PAPER_REENTRY_COOLDOWN_S),
+        "max_consecutive_losses": _val("max_consecutive_losses", 5),
+        "max_recent_losses_per_market": _val("max_recent_losses_per_market", 3),
+        "fade_size_ratio": _val("fade_size_ratio", getattr(settings, "FADE_SIZE_RATIO", 0.5)),
         "max_holding_seconds": None,
         "paper_only": True,
         "config_mutable": bool(runtime.get("config_mutable", False)),
@@ -479,6 +514,11 @@ def build_terminal_snapshot(
     observed_trades: list[dict[str, Any]],
     runtime: dict[str, Any],
     logs: list[dict[str, Any]],
+    alpha_extras: dict[str, Any] | None = None,
+    wallet_graph: dict[str, Any] | None = None,
+    rejections: dict[str, Any] | None = None,
+    equity_curve: dict[str, Any] | None = None,
+    runtime_overrides: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     paper_capital = _to_float(risk.get("paper_capital"), settings.PAPER_CAPITAL_USDC) or settings.PAPER_CAPITAL_USDC
     positions_payload = _build_positions_payload(positions_live, paper_capital)
@@ -514,7 +554,32 @@ def build_terminal_snapshot(
         "positions": positions_payload,
         "recent_trades": _build_recent_trades(positions, observed_trades),
         "decision_engine": decision_engine,
-        "risk_config": _build_risk_config(runtime),
+        "risk_config": _build_risk_config(runtime, runtime_overrides),
         "ingestion": ingestion,
+        "alpha_extras": alpha_extras or {"timeline": [], "follow_ready": [], "totals": {}},
+        "wallet_graph": wallet_graph or {"nodes": [], "edges": [], "stats": {}},
+        "rejections": rejections or {"total": 0, "breakdown": []},
+        "equity_curve": equity_curve or {"series": [], "by_leader": [], "by_strategy": []},
+        # Expose the full data_quality report so BOT HEALTH can drill-down
+        # into the exact gates that flipped the dashboard to DEGRADED
+        # (instead of just showing the issue count).
+        "data_quality_full": data_quality or {},
+        # Effective adaptive thresholds — read from the runtime cache so
+        # the dashboard can show what gates are CURRENTLY in effect and
+        # how mature the system is. Updated every 5 min by the engine.
+        "adaptive_thresholds": _build_adaptive_thresholds(),
         "logs": logs,
     }
+
+
+def _build_adaptive_thresholds() -> dict[str, Any]:
+    """Snapshot of EFFECTIVE_THRESHOLDS for the dashboard."""
+    try:
+        from src.config import EFFECTIVE_THRESHOLDS, ADAPTIVE_RANGES
+        return {
+            "maturity": EFFECTIVE_THRESHOLDS.get("_maturity", 0.0),
+            "values": {k: v for k, v in EFFECTIVE_THRESHOLDS.items() if not k.startswith("_")},
+            "ranges": {k: {"cold": cold, "mature": mature} for k, (cold, mature) in ADAPTIVE_RANGES.items()},
+        }
+    except Exception:
+        return {"maturity": 0.0, "values": {}, "ranges": {}}

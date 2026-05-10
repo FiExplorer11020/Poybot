@@ -20,9 +20,15 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from src.config import settings
 from src.database.connection import close_pool, initialize_pool
 from src.engine.confidence_engine import ConfidenceEngine
+from src.engine.jobs import (
+    make_killswitch_sync_job,
+    make_nightly_batch_job,
+    make_redis_cleanup_job,
+    make_refresh_markets_job,
+)
 from src.engine.paper_trader import PaperTrader
 from src.engine.risk_manager import RiskManager
-from src.engine.scheduler import NightlyBatchScheduler
+from src.engine.scheduler import Scheduler
 from src.graph.graph_engine import GraphEngine
 from src.observer.position_tracker import PositionTracker
 from src.observer.trade_observer import TradeObserver
@@ -137,7 +143,35 @@ async def main() -> None:
         confidence_engine=confidence,
         risk_manager=risk_manager,
     )
-    batch_scheduler = NightlyBatchScheduler(hour_utc=settings.BATCH_HOUR_UTC)
+
+    # S3.10: APScheduler — nightly batch + Redis cleanup + killswitch
+    # sync + market refresh. The watchdog itself lives in the engine
+    # container only (see src/engine/main.py); run_all is the dev one-
+    # process entry point so we don't need it here.
+    from src.control.killswitch import get_killswitch
+
+    killswitch = get_killswitch(redis_client=redis_client)
+    scheduler = Scheduler()
+    scheduler.add_cron(
+        "nightly_batch",
+        make_nightly_batch_job(),
+        hour=settings.BATCH_HOUR_UTC,
+    )
+    scheduler.add_cron(
+        "redis_cleanup",
+        make_redis_cleanup_job(redis_client),
+        hour=settings.REDIS_CLEANUP_HOUR_UTC,
+    )
+    scheduler.add_interval(
+        "killswitch_sync",
+        make_killswitch_sync_job(killswitch),
+        seconds=settings.KILLSWITCH_SYNC_INTERVAL_S,
+    )
+    scheduler.add_interval(
+        "refresh_markets",
+        make_refresh_markets_job(redis_client, limit=settings.TOP_MARKETS_COUNT),
+        seconds=settings.REFRESH_MARKETS_INTERVAL_S,
+    )
 
     stop_event = asyncio.Event()
 
@@ -149,6 +183,7 @@ async def main() -> None:
     for sig in (signal.SIGTERM, signal.SIGINT):
         loop.add_signal_handler(sig, handle_signal)
 
+    await scheduler.start()
     try:
         await asyncio.gather(
             registry.run(),
@@ -158,11 +193,11 @@ async def main() -> None:
             profiler.start(),
             confidence.start(),
             paper_trader.start(),
-            batch_scheduler.run(),
             stop_event.wait(),
             return_exceptions=True,
         )
     finally:
+        await scheduler.stop()
         for component in (
             observer,
             tracker,
@@ -171,7 +206,6 @@ async def main() -> None:
             confidence,
             paper_trader,
             registry,
-            batch_scheduler,
         ):
             try:
                 await component.stop()

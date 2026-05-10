@@ -10,10 +10,10 @@ import asyncio
 import hashlib
 import json
 import time
-from collections import deque
+from collections import OrderedDict, deque
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
-from typing import Any
+from typing import Any, Iterable, Iterator
 
 import aiohttp
 from loguru import logger
@@ -29,6 +29,113 @@ DEDUP_TTL_S = 7 * 86400  # 7 days
 MARKET_META_TTL_S = 3600
 SOURCE_API_WALLET = "api_wallet"
 SOURCE_API_MARKET = "api_market"
+
+# Cache caps — sized for an Oracle Free 24GB ARM VM. Polymarket has ~thousands of
+# active markets at any time and a few hundred leaders, so these are well above
+# the working set while still capping unbounded growth that would OOM a long-lived
+# observer process.
+MARKET_META_CACHE_MAXSIZE = 10_000
+LEADER_CONDITION_IDS_MAXSIZE = 2_000
+
+
+class _BoundedTTLCache:
+    """Tiny in-memory LRU+TTL cache (no dep) used to bound observer state.
+
+    - `maxsize` LRU eviction when capacity is reached.
+    - `ttl` (seconds) eviction on read for expired entries.
+    Designed for the small surface used by TradeObserver: __contains__, get,
+    __setitem__, __getitem__. NOT thread-safe; observer is single-asyncio-loop.
+    """
+
+    __slots__ = ("_data", "_maxsize", "_ttl")
+
+    def __init__(self, *, maxsize: int, ttl: float):
+        self._data: OrderedDict[str, tuple[float, float]] = OrderedDict()
+        self._maxsize = max(1, int(maxsize))
+        self._ttl = float(ttl)
+
+    def __len__(self) -> int:  # for tests / introspection
+        return len(self._data)
+
+    def __contains__(self, key: str) -> bool:
+        return self.get(key) is not None
+
+    def get(self, key: str, default: float | None = None) -> float | None:
+        entry = self._data.get(key)
+        if entry is None:
+            return default
+        value, expires_at = entry
+        if expires_at <= time.time():
+            self._data.pop(key, None)
+            return default
+        # Refresh LRU recency on read.
+        self._data.move_to_end(key)
+        return value
+
+    def __getitem__(self, key: str) -> float:
+        v = self.get(key)
+        if v is None:
+            raise KeyError(key)
+        return v
+
+    def __setitem__(self, key: str, value: float) -> None:
+        expires_at = time.time() + self._ttl
+        if key in self._data:
+            self._data.move_to_end(key)
+        self._data[key] = (float(value), expires_at)
+        while len(self._data) > self._maxsize:
+            self._data.popitem(last=False)
+
+
+class _BoundedSet:
+    """A FIFO-bounded set-like container (insertion-ordered, capped size).
+
+    Used for `_leader_condition_ids` so the observer cannot accumulate every
+    market a leader has ever touched. Oldest entries fall out first; periodic
+    DB rehydration in `_get_recent_leader_market_ids()` re-warms the working
+    set from `trades_observed`.
+    """
+
+    __slots__ = ("_data", "_maxsize")
+
+    def __init__(self, *, maxsize: int, initial: Iterable[str] | None = None):
+        self._data: OrderedDict[str, None] = OrderedDict()
+        self._maxsize = max(1, int(maxsize))
+        if initial:
+            self.update(initial)
+
+    def __len__(self) -> int:
+        return len(self._data)
+
+    def __bool__(self) -> bool:
+        return bool(self._data)
+
+    def __contains__(self, key: str) -> bool:
+        return key in self._data
+
+    def __iter__(self) -> Iterator[str]:
+        return iter(self._data)
+
+    def add(self, key: str) -> None:
+        if key in self._data:
+            # Re-adding a hot key refreshes its recency, protecting it from
+            # FIFO eviction. Important for `_leader_condition_ids` where
+            # actively-traded markets must not fall out just because they
+            # were inserted long ago.
+            self._data.move_to_end(key)
+            return
+        self._data[key] = None
+        while len(self._data) > self._maxsize:
+            self._data.popitem(last=False)
+
+    def update(self, keys: Iterable[str]) -> None:
+        for k in keys:
+            self.add(k)
+
+    def replace(self, keys: Iterable[str]) -> None:
+        """Atomically rebuild the set from a fresh source (e.g. DB rehydrate)."""
+        self._data.clear()
+        self.update(keys)
 
 
 def _row_value(row: Any, key: str, default: Any = None) -> Any:
@@ -164,12 +271,17 @@ class TradeObserver:
         self._redis = redis_client
         self._leader_wallets: set[str] = leader_wallets or set()
         self._leader_markets: set[str] = leader_markets or set()
-        self._leader_condition_ids: set[str] = set()
+        self._leader_condition_ids: _BoundedSet = _BoundedSet(
+            maxsize=LEADER_CONDITION_IDS_MAXSIZE,
+        )
         self._running = False
         self._stop_event = asyncio.Event()
         self._ws_client: PolymarketWSClient | None = None
         self._inserted: int = 0
-        self._market_meta_cache: dict[str, float] = {}
+        self._market_meta_cache: _BoundedTTLCache = _BoundedTTLCache(
+            maxsize=MARKET_META_CACHE_MAXSIZE,
+            ttl=MARKET_META_TTL_S,
+        )
         self._book_age_samples: deque[float] = deque(maxlen=512)
 
     @property
@@ -215,7 +327,15 @@ class TradeObserver:
         event_type = msg.get("event_type", "")
         if self._redis:
             try:
-                await self._redis.set("ws:market:last_message_ts", str(time.time()), ex=300)
+                now_ts = time.time()
+                await self._redis.set("ws:market:last_message_ts", str(now_ts), ex=300)
+                # Per-minute sliding counter so the dashboard ingestion source
+                # for "CLOB WebSocket msgs/min" reflects the *real* WS throughput
+                # (price_change + book + trade events), not just trades that
+                # ended up in trades_observed (which under-counts by ~99x).
+                minute_bucket = int(now_ts // 60)
+                await self._redis.incrby(f"ws:msgs:minute:{minute_bucket}", 1)
+                await self._redis.expire(f"ws:msgs:minute:{minute_bucket}", 180)
             except Exception:
                 pass
 
@@ -615,7 +735,9 @@ class TradeObserver:
                     """,
                     max(25, int(settings.DATA_API_RECENT_LEADER_MARKETS)),
                 )
-                self._leader_condition_ids = {str(r["market_id"]) for r in rows if r["market_id"]}
+                self._leader_condition_ids.replace(
+                    str(r["market_id"]) for r in rows if r["market_id"]
+                )
         except Exception as exc:
             logger.debug(f"Leader market bootstrap failed: {exc}")
         return set(self._leader_condition_ids)
@@ -766,7 +888,7 @@ class TradeObserver:
 
         try:
             async with get_db() as conn:
-                await conn.execute(
+                inserted_id = await conn.fetchval(
                     """
                     INSERT INTO trades_observed
                         (
@@ -774,6 +896,9 @@ class TradeObserver:
                             size_usdc, source, is_leader
                         )
                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+                    ON CONFLICT (wallet_address, market_id, time, side, price, size_usdc)
+                        DO NOTHING
+                    RETURNING id
                     """,
                     trade_time,
                     market_id,
@@ -785,6 +910,18 @@ class TradeObserver:
                     source,
                     is_leader,
                 )
+                if inserted_id is None:
+                    # DB-level uniqueness caught a duplicate that the Redis dedup
+                    # missed (cold cache after restart, Redis flush, race window
+                    # between two backfill loops). Silent no-op: no counter bump,
+                    # no enrichment, no pub/sub publish — same end-state as a
+                    # Redis dedup hit.
+                    logger.debug(
+                        "trades_observed dupe blocked at DB layer: "
+                        f"wallet={wallet_address[:10]}… market={market_id[:10]}… "
+                        f"time={trade_time.isoformat()}"
+                    )
+                    return
                 self._inserted += 1
                 # FIX 1: Ensure market stub exists so LEFT JOINs return a row
                 await conn.execute(
@@ -1035,13 +1172,23 @@ class TradeObserver:
     def _needs_market_enrichment(self, market_id: str, market_row: Any) -> bool:
         question = str(_row_value(market_row, "question", "") or "").strip()
         category = str(_row_value(market_row, "category", "") or "").strip().lower()
+        token_yes = str(_row_value(market_row, "token_yes", "") or "").strip()
+        token_no = str(_row_value(market_row, "token_no", "") or "").strip()
         now_ts = datetime.now(tz=timezone.utc).timestamp()
         last_fetch = float(self._market_meta_cache.get(market_id, 0.0) or 0.0)
         if now_ts - last_fetch < MARKET_META_TTL_S:
             return False
+        # Question/category placeholders → always enrich.
         if not question or question.startswith("Market "):
             return True
-        return category in {"", "unknown", "none", "null"}
+        if category in {"", "unknown", "none", "null"}:
+            return True
+        # Token mapping is required for the market scanner to display the
+        # market by name and compute YES/NO direction. Without it the row
+        # shows up in hex and the decision engine can't price-anchor.
+        if not token_yes or not token_no:
+            return True
+        return False
 
     async def _fetch_market_metadata_from_gamma(self, market_id: str, token_id: str) -> dict | None:
         url = "https://gamma-api.polymarket.com/markets"

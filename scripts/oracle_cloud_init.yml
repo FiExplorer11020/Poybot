@@ -1,0 +1,88 @@
+#cloud-config
+# ===========================================================================
+# Oracle Cloud (eu-paris-1) — Ubuntu 22.04 ARM64 — bootstrap pour le bot
+# Polymarket. À COLLER tel quel dans le champ "User data" du wizard
+# d'instance OCI.
+#
+# Ce que ça fait, dans l'ordre :
+#   1. Installe Docker CE + plugin compose (depuis le repo officiel
+#      Docker, pas la version Ubuntu qui peut être en retard).
+#   2. Ajoute l'utilisateur `ubuntu` au groupe `docker` (pas de sudo
+#      pour les commandes docker).
+#   3. Ouvre les ports 22 + 8080 sur le firewall iptables INTERNE de
+#      l'image Oracle Ubuntu (oui, Oracle livre l'image avec un
+#      iptables qui bloque tout sauf SSH par défaut, en plus du
+#      Security List côté VCN — il faut faire les deux).
+#   4. Persiste les règles iptables avec `iptables-persistent`.
+#   5. Crée /opt/polymarket-bot avec les bonnes perms.
+#   6. Installe quelques utilitaires d'admin (htop, ncdu, jq, tmux).
+#   7. Logue le statut dans /var/log/cloud-init-bot.log.
+#
+# Le user `ubuntu` est créé automatiquement par l'image Oracle, avec
+# la clé SSH que tu as collée dans le wizard.
+# ===========================================================================
+
+package_update: true
+package_upgrade: true
+
+packages:
+  - apt-transport-https
+  - ca-certificates
+  - curl
+  - gnupg
+  - lsb-release
+  - htop
+  - ncdu
+  - jq
+  - tmux
+  - iptables-persistent
+  - unattended-upgrades
+
+write_files:
+  # Active les unattended-upgrades pour les patches sécurité Ubuntu.
+  # Reboot auto à 4h UTC seulement si nécessaire (kernel update).
+  - path: /etc/apt/apt.conf.d/52unattended-upgrades-local
+    content: |
+      Unattended-Upgrade::Automatic-Reboot "true";
+      Unattended-Upgrade::Automatic-Reboot-Time "04:00";
+      Unattended-Upgrade::Allowed-Origins {
+          "${distro_id}:${distro_codename}-security";
+      };
+
+runcmd:
+  # ---------- Docker ---------------------------------------------------- #
+  - install -m 0755 -d /etc/apt/keyrings
+  - curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc
+  - chmod a+r /etc/apt/keyrings/docker.asc
+  - echo "deb [arch=arm64 signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu $(. /etc/os-release && echo $VERSION_CODENAME) stable" | tee /etc/apt/sources.list.d/docker.list > /dev/null
+  - apt-get update
+  - DEBIAN_FRONTEND=noninteractive apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+  - systemctl enable --now docker
+  - usermod -aG docker ubuntu
+
+  # ---------- Firewall (iptables interne Oracle Ubuntu) ----------------- #
+  # Oracle's Ubuntu image installe iptables avec une règle DEFAULT DROP
+  # sur la chaîne INPUT. On ajoute les ports qu'on veut, AVANT la règle
+  # REJECT finale (insertion via -I INPUT 6 pour passer après les
+  # règles state-tracking / loopback / ICMP qui sont en positions 1-5).
+  - iptables -I INPUT 6 -m state --state NEW -p tcp --dport 8080 -j ACCEPT
+  - netfilter-persistent save
+
+  # ---------- Layout du projet ----------------------------------------- #
+  - mkdir -p /opt/polymarket-bot
+  - chown ubuntu:ubuntu /opt/polymarket-bot
+
+  # ---------- Disk swap (24 GB RAM mais lightgbm fit ~peut spike) ------- #
+  - fallocate -l 2G /swapfile
+  - chmod 600 /swapfile
+  - mkswap /swapfile
+  - swapon /swapfile
+  - echo '/swapfile none swap sw 0 0' >> /etc/fstab
+
+  # ---------- Marqueur de fin ------------------------------------------ #
+  - 'echo "cloud-init OK — $(date -u +%FT%TZ)" > /var/log/cloud-init-bot.log'
+  - 'docker --version >> /var/log/cloud-init-bot.log'
+  - 'docker compose version >> /var/log/cloud-init-bot.log'
+
+# Reboot non requis — Docker + iptables prennent effet à chaud.
+final_message: "polymarket-bot host ready — Docker installed, port 8080 open."

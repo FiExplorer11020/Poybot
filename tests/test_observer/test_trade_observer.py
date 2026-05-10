@@ -27,10 +27,17 @@ def _make_redis_mock(duplicate: bool = False):
     return r
 
 
-def _make_conn():
+def _make_conn(*, trade_insert_id: int | None = 1):
+    """Build a fake asyncpg conn.
+
+    `trade_insert_id` is the value `fetchval(...)` returns for the trades_observed
+    INSERT … ON CONFLICT … RETURNING id call. Set to None to simulate a DB-level
+    duplicate (the new S1.3 idempotency safety net).
+    """
     conn = AsyncMock()
     conn.fetchrow = AsyncMock(return_value=None)
     conn.execute = AsyncMock()
+    conn.fetchval = AsyncMock(return_value=trade_insert_id)
     return conn
 
 
@@ -96,9 +103,13 @@ async def test_process_trade_inserts_to_db():
             source="websocket",
         )
 
-    assert conn.execute.await_count >= 2
-    first_sql = conn.execute.call_args_list[0].args[0]
-    assert "INSERT INTO trades_observed" in first_sql
+    # The trade insert now goes through fetchval (RETURNING id pattern).
+    conn.fetchval.assert_awaited_once()
+    insert_sql = conn.fetchval.call_args_list[0].args[0]
+    assert "INSERT INTO trades_observed" in insert_sql
+    assert "ON CONFLICT" in insert_sql
+    assert "DO NOTHING" in insert_sql
+    assert "RETURNING id" in insert_sql
     assert obs.inserted_count == 1
 
 
@@ -124,7 +135,45 @@ async def test_process_trade_deduplicates():
             source="websocket",
         )
 
+    # Redis dedup short-circuits before any DB call (fast path).
     conn.execute.assert_not_awaited()
+    conn.fetchval.assert_not_awaited()
+    assert obs.inserted_count == 0
+
+
+# ---------------------------------------------------------------------------
+# 2b. DB-layer dedup catches what Redis missed (S1.3 safety net)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_process_trade_db_layer_dedup_short_circuits():
+    """Simulate Redis NOT catching a dupe (cold cache / flush) and the unique
+    constraint in trades_observed catching it instead. fetchval returns None,
+    which means ON CONFLICT DO NOTHING swallowed the row. We must not bump the
+    inserted counter, must not publish to Redis, and must not run any of the
+    market-enrichment side effects.
+    """
+    obs, redis, _ = _make_observer(leader_wallets={_LEADER_WALLET})
+    conn = _make_conn(trade_insert_id=None)  # <-- DB says "dupe"
+
+    with _mock_get_db(conn):
+        await obs._process_trade(
+            market_id=_MARKET,
+            token_id=_TOKEN,
+            wallet_address=_LEADER_WALLET,
+            side="BUY",
+            price=Decimal("0.65"),
+            size_usdc=Decimal("100.00"),
+            trade_time=_TRADE_TIME,
+            source="websocket",
+        )
+
+    conn.fetchval.assert_awaited_once()
+    # No market stub insert, no fetchrow for market/leader, no enrichment write.
+    conn.execute.assert_not_awaited()
+    conn.fetchrow.assert_not_awaited()
+    redis.publish.assert_not_awaited()
     assert obs.inserted_count == 0
 
 
@@ -137,12 +186,16 @@ async def test_process_trade_deduplicates():
 async def test_is_leader_flagged_correctly():
     obs, redis, _ = _make_observer(leader_wallets={_LEADER_WALLET})
     conn = _make_conn()
+
+    # Capture the trade-insert positional args via fetchval (the new code path
+    # for `INSERT INTO trades_observed … RETURNING id`).
     captured_args: list = []
 
-    async def capture_execute(sql, *args):
+    async def capture_fetchval(sql, *args):
         captured_args.extend(args)
+        return 1  # behave like a real successful insert
 
-    conn.execute = AsyncMock(side_effect=capture_execute)
+    conn.fetchval = AsyncMock(side_effect=capture_fetchval)
 
     # Leader wallet
     with _mock_get_db(conn):
@@ -246,7 +299,8 @@ async def test_backfill_from_falcon():
         await obs._backfill_from_falcon()
 
     assert falcon.query.await_count == 1
-    assert conn.execute.await_count >= 2
+    # 2 trades → 2 trades_observed inserts via fetchval.
+    assert conn.fetchval.await_count == 2
 
 
 # ---------------------------------------------------------------------------
@@ -342,7 +396,9 @@ async def test_handle_ws_message_parses_trade():
     with _mock_get_db(conn):
         await obs._handle_ws_message(msg)
 
-    assert conn.execute.await_count >= 2
+    # Trade insert is fetchval (RETURNING id); markets stub is execute.
+    conn.fetchval.assert_awaited()
+    assert conn.execute.await_count >= 1
 
 
 # ---------------------------------------------------------------------------
@@ -379,8 +435,10 @@ async def test_process_falcon_trade_ms_timestamp():
 
     async def capture(sql, *args):
         captured.extend(args)
+        return 1  # simulate successful insert (RETURNING id)
 
-    conn.execute = AsyncMock(side_effect=capture)
+    # Trade insert path is fetchval now.
+    conn.fetchval = AsyncMock(side_effect=capture)
 
     trade = {
         "market_id": _MARKET,
@@ -394,9 +452,9 @@ async def test_process_falcon_trade_ms_timestamp():
     with _mock_get_db(conn):
         await obs._process_falcon_trade(trade, _LEADER_WALLET)
 
-    assert conn.execute.await_count >= 2
-    # First execute is the trades_observed insert; $1 is the first arg after SQL.
-    trade_time: datetime = conn.execute.call_args_list[0].args[1]
+    conn.fetchval.assert_awaited_once()
+    # captured[0] is trade_time (the first $-arg after the SQL string).
+    trade_time: datetime = captured[0]
     assert trade_time.tzinfo is not None
     # 1700000000000 ms = 1700000000 s → 2023-11-14T22:13:20Z
     assert trade_time.year == 2023
@@ -415,8 +473,9 @@ async def test_process_falcon_trade_s_timestamp():
 
     async def capture(sql, *args):
         captured.extend(args)
+        return 1
 
-    conn.execute = AsyncMock(side_effect=capture)
+    conn.fetchval = AsyncMock(side_effect=capture)
 
     trade = {
         "market_id": _MARKET,
@@ -430,8 +489,8 @@ async def test_process_falcon_trade_s_timestamp():
     with _mock_get_db(conn):
         await obs._process_falcon_trade(trade, _LEADER_WALLET)
 
-    assert conn.execute.await_count >= 2
-    trade_time: datetime = conn.execute.call_args_list[0].args[1]
+    conn.fetchval.assert_awaited_once()
+    trade_time: datetime = captured[0]
     assert trade_time.tzinfo is not None
     # 1700000000 s → 2023-11-14T22:13:20Z
     assert trade_time.year == 2023

@@ -96,6 +96,16 @@ class PolymarketWSClient:
                 async for raw in ws:
                     self.messages_received += 1
                     self.last_message_at = time.time()
+                    # Loud INFO log on the first message and one every 100
+                    # so we can prove in `docker compose logs observer` that
+                    # the WS is actually receiving (not just connected). The
+                    # health dashboard's "0 msgs/min" can mislead: this log
+                    # is the source of truth.
+                    if self.messages_received == 1 or self.messages_received % 100 == 0:
+                        logger.info(
+                            f"WS messages_received={self.messages_received} "
+                            f"(first 80 chars: {str(raw)[:80]})"
+                        )
                     try:
                         data = json.loads(raw)
                         if isinstance(data, list):

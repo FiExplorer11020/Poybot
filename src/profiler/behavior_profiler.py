@@ -161,19 +161,20 @@ class BehaviorProfiler:
             confirmed_followers=confirmed_followers,
         )
 
-        # 1. Update Dirichlet category preferences
-        _update_dirichlet(profile, category)
-
-        # 2. Update EWMA sizing
+        # 2. Update EWMA sizing FIRST so the size-weighted updates below
+        #    have a stable baseline to normalise against.
         if size_usdc > 0:
             _update_sizing(profile, size_usdc)
+
+        # 1. Update Dirichlet category preferences (size-weighted)
+        _update_dirichlet(profile, category, size_usdc=size_usdc)
 
         # 3. Update entry patterns
         _update_entry_patterns(profile, is_contrarian)
 
-        # 4. Update accuracy
+        # 4. Update accuracy (size-weighted Beta posterior)
         win = pnl_usdc > 0
-        _update_accuracy(profile, category, win)
+        _update_accuracy(profile, category, win, size_usdc=size_usdc)
 
         new_resolved = positions_resolved + 1
 
@@ -496,6 +497,21 @@ class BehaviorProfiler:
     ) -> None:
         try:
             async with get_db() as conn:
+                # Ensure the wallet exists in `leaders` before we touch
+                # leader_profiles — the FK leader_profiles_wallet_address_fkey
+                # would otherwise raise on observed wallets that the registry
+                # hasn't ingested yet (race at boot, or a wallet picked up
+                # via WebSocket before the hourly Falcon refresh). Inserting
+                # with ON CONFLICT DO NOTHING is idempotent: the registry
+                # will still enrich the row on its next pass.
+                await conn.execute(
+                    """
+                    INSERT INTO leaders (wallet_address, on_watchlist, excluded, first_seen)
+                    VALUES ($1, FALSE, FALSE, NOW())
+                    ON CONFLICT (wallet_address) DO NOTHING
+                    """,
+                    wallet,
+                )
                 await conn.execute(
                     """
                     INSERT INTO leader_profiles
@@ -848,14 +864,48 @@ class BehaviorProfiler:
 # ─── Pure helper functions (easy to unit-test) ────────────────────────────────
 
 
-def _update_dirichlet(profile: dict, category: str) -> None:
-    """Increment the Dirichlet count for a category."""
+def _size_weight(size_usdc: float | None, ewma_size: float | None) -> float:
+    """
+    Convert a trade's USDC size into a Dirichlet/Beta increment in [0.5, 3.0].
+
+    Why a sub-linear scaling: a $20k trade carries more conviction than a
+    $200 one, but not 100× more — we don't want a single whale trade to
+    dominate a leader's category preference. We use sqrt(size / ewma) to
+    compress the dynamic range, then clamp into [0.5, 3.0]. Trades smaller
+    than the leader's typical size still bump the prior at half-strength;
+    abnormally large trades bump 3× at most. Passing size_usdc<=0 (e.g.
+    when the field is missing) falls back to the legacy +1.0 increment.
+    """
+    if not size_usdc or size_usdc <= 0:
+        return 1.0
+    baseline = float(ewma_size or 0.0)
+    if baseline <= 0:
+        # First trade we see for this leader — neutral weight.
+        return 1.0
+    import math
+    ratio = float(size_usdc) / baseline
+    weight = math.sqrt(max(ratio, 0.01))
+    return max(0.5, min(3.0, weight))
+
+
+def _update_dirichlet(
+    profile: dict,
+    category: str,
+    size_usdc: float | None = None,
+) -> None:
+    """Increment the Dirichlet count for a category, weighted by trade size.
+
+    Larger trades carry more weight in the leader's category preferences.
+    The weight is bounded (see ``_size_weight``) so a single whale doesn't
+    overwhelm the prior.
+    """
     cats = profile.setdefault("preferred_categories", {})
+    ewma_size = (profile.get("sizing") or {}).get("ewma_size")
+    weight = _size_weight(size_usdc, ewma_size)
     if category not in cats:
-        cats[category] = {"alpha": [1.0]}  # Start at 1 (Dirichlet prior)
+        cats[category] = {"alpha": [1.0 + weight]}  # prior 1 + first observation
     else:
-        # Increment overall alpha count
-        cats[category]["alpha"][0] = cats[category]["alpha"][0] + 1.0
+        cats[category]["alpha"][0] = float(cats[category]["alpha"][0]) + weight
 
 
 def _update_sizing(profile: dict, size_usdc: float) -> None:
@@ -887,8 +937,20 @@ def _update_entry_patterns(profile: dict, is_contrarian: bool) -> None:
     patterns["momentum_rate"] = 1.0 - new_contrarian
 
 
-def _update_accuracy(profile: dict, category: str, win: bool) -> None:
-    """Update per-category Beta-Binomial accuracy."""
+def _update_accuracy(
+    profile: dict,
+    category: str,
+    win: bool,
+    size_usdc: float | None = None,
+) -> None:
+    """Update per-category Beta-Binomial accuracy, size-weighted.
+
+    The Beta posterior on each category absorbs more "evidence" from
+    larger trades — a $50k winning bet shifts confidence more than a
+    $50 winning bet. ``wins``/``losses`` keep the integer trade counts
+    (used for raw display); ``beta_a``/``beta_b`` carry the size-weighted
+    pseudo-counts that drive Thompson sampling downstream.
+    """
     acc = profile.setdefault("accuracy", {"overall": 0.0, "resolved_count": 0, "by_category": {}})
     by_cat = acc.setdefault("by_category", {})
 
@@ -896,14 +958,16 @@ def _update_accuracy(profile: dict, category: str, win: bool) -> None:
         by_cat[category] = {"wins": 0, "losses": 0, "beta_a": 1.0, "beta_b": 1.0}
 
     cat_acc = by_cat[category]
+    ewma_size = (profile.get("sizing") or {}).get("ewma_size")
+    weight = _size_weight(size_usdc, ewma_size)
     if win:
         cat_acc["wins"] += 1
-        cat_acc["beta_a"] += 1.0
+        cat_acc["beta_a"] = float(cat_acc.get("beta_a", 1.0)) + weight
     else:
         cat_acc["losses"] += 1
-        cat_acc["beta_b"] += 1.0
+        cat_acc["beta_b"] = float(cat_acc.get("beta_b", 1.0)) + weight
 
-    # Update overall
+    # Update overall (raw, unweighted — kept for legacy display)
     total_wins = sum(c["wins"] for c in by_cat.values())
     total = total_wins + sum(c["losses"] for c in by_cat.values())
     acc["overall"] = total_wins / total if total > 0 else 0.0
@@ -1047,12 +1111,14 @@ def _infer_reason_codes(
         reason_codes.append("extreme_market_price")
 
     if action == "follow":
-        if confirmed_followers < settings.FOLLOW_MIN_FOLLOWERS + 2:
+        from src.config import eff
+        if confirmed_followers < eff("FOLLOW_MIN_FOLLOWERS") + 2:
             reason_codes.append("fragile_follow_consensus")
         if p_error >= 0.6:
             reason_codes.append("follow_against_error_model")
     elif action == "fade":
-        if fade_confidence < settings.FADE_MIN_CONFIDENCE + 0.1:
+        from src.config import eff
+        if fade_confidence < eff("FADE_MIN_CONFIDENCE") + 0.1:
             reason_codes.append("weak_fade_confidence")
         if p_error < 0.55:
             reason_codes.append("fade_without_edge")

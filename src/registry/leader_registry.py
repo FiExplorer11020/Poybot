@@ -126,17 +126,21 @@ class LeaderRegistry:
             return 0
 
         stale_cutoff = datetime.now(tz=timezone.utc) - timedelta(hours=24)
+        # LIMIT 300 (was settings.INITIAL_LEADER_COUNT=200): with stale_refresh
+        # piling up to 158+ from FK-upserted wallets, 200/cycle was barely
+        # keeping pace. 300/cycle drains the queue in ~1 cycle even after
+        # injects from new leaders the profiler has never seen.
         rows = await conn.fetch(
             """
             SELECT wallet_address FROM leaders
             WHERE (last_refresh IS NULL OR last_refresh < $1)
               AND excluded = FALSE
-            LIMIT $2
+            LIMIT 300
             """,
             stale_cutoff,
-            settings.INITIAL_LEADER_COUNT,
         )
         count = 0
+        skipped = 0
         for row in rows:
             wallet = row["wallet_address"]
             try:
@@ -145,6 +149,24 @@ class LeaderRegistry:
                 logger.debug(f"Wallet360 unavailable for {wallet}: {e}")
                 metrics = None
             if metrics is None:
+                # Falcon doesn't know this wallet (typical for fresh wallets
+                # injected via the profiler's FK upsert). Mark the wallet as
+                # excluded + off-watchlist so it stops bloating the active
+                # leader pool and the DQ "stale_refresh" counter. Historical
+                # rows are preserved (we only flip flags). If Falcon ever
+                # learns the wallet later, we can manually re-include it.
+                await conn.execute(
+                    """
+                    UPDATE leaders
+                    SET last_refresh = NOW(),
+                        excluded = TRUE,
+                        on_watchlist = FALSE,
+                        exclude_reason = COALESCE(exclude_reason, 'falcon_no_data')
+                    WHERE wallet_address = $1
+                    """,
+                    wallet,
+                )
+                skipped += 1
                 continue
             w360 = metrics.to_dict()
             classification = self.classify_leader(w360)
@@ -165,7 +187,7 @@ class LeaderRegistry:
                 "structural_bot" if classification.strategy == "structural" else None,
             )
             count += 1
-        logger.info(f"Enriched {count} leaders")
+        logger.info(f"Enriched {count} leaders ({skipped} stamped no_data)")
         return count
 
     def classify_leader(self, wallet360: dict) -> LeaderClassification:
@@ -264,15 +286,28 @@ class LeaderRegistry:
         )
 
     async def sync_markets(self, conn: Any) -> int:
-        """Upsert recent market metadata that is missing or stale."""
+        """Upsert recent market metadata that is missing or stale.
+
+        Filters out markets whose end_date has already passed by more than
+        24 hours: they are resolved/dead and will never produce another
+        trade signal worth modelling. This keeps sync_markets focused on
+        the live pool and prevents the "unmapped_tokens" DQ counter from
+        being inflated by old expired markets the bot will never trade.
+        """
         rows = await conn.fetch(
             """
-            SELECT DISTINCT market_id FROM trades_observed
-            WHERE time > NOW() - INTERVAL '7 days'
-              AND market_id NOT IN (
-                  SELECT market_id FROM markets WHERE updated_at > NOW() - INTERVAL '24 hours'
+            SELECT DISTINCT t.market_id FROM trades_observed t
+            LEFT JOIN markets m ON m.market_id = t.market_id
+            WHERE t.time > NOW() - INTERVAL '7 days'
+              AND (m.end_date IS NULL OR m.end_date > NOW() - INTERVAL '24 hours')
+              AND t.market_id NOT IN (
+                  SELECT market_id FROM markets
+                  WHERE updated_at > NOW() - INTERVAL '24 hours'
+                    AND volume_24h IS NOT NULL
+                    AND token_yes IS NOT NULL
+                    AND token_no IS NOT NULL
               )
-            LIMIT 100
+            LIMIT 300
             """
         )
         count = 0
