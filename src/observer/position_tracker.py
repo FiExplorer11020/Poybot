@@ -300,67 +300,79 @@ class PositionTracker:
         is_contrarian = False
 
         try:
+            # F-02 fix: the two SELECTs (category lookup + trend snapshot)
+            # and the INSERT into positions_reconstructed are a single
+            # logical atomic unit — the denormalized `category` and the
+            # `is_contrarian` flag derived from the trend window must match
+            # the row's `pnl_usdc` (which was computed BEFORE these reads).
+            # Without the transaction wrapper, asyncpg runs each statement
+            # under per-statement autocommit at READ COMMITTED, so each
+            # statement sees a different snapshot. Wrapping in a tx pins a
+            # consistent view and guarantees the Redis `positions:closed`
+            # publish below only fires after commit.
             async with get_db() as conn:
-                market_row = await conn.fetchrow(
-                    "SELECT category FROM markets WHERE market_id = $1",
-                    pos.market_id,
-                )
-                if market_row and market_row["category"]:
-                    category = market_row["category"]
+                async with conn.transaction():
+                    market_row = await conn.fetchrow(
+                        "SELECT category FROM markets WHERE market_id = $1",
+                        pos.market_id,
+                    )
+                    if market_row and market_row["category"]:
+                        category = market_row["category"]
 
-                trend_row = await conn.fetchrow(
-                    """
-                    SELECT AVG(price) AS avg_price FROM (
-                        SELECT price
-                        FROM trades_observed
-                        WHERE market_id = $1
-                          AND token_id = $2
-                          AND time < $3
-                        ORDER BY time DESC
-                        LIMIT 10
-                    ) recent
-                    """,
-                    pos.market_id,
-                    pos.token_id,
-                    pos.open_time,
-                )
-                if trend_row and trend_row["avg_price"] is not None:
-                    avg_price = Decimal(str(trend_row["avg_price"]))
-                    if pos.direction == "yes":
-                        is_contrarian = pos.entry_price < avg_price
-                    else:
-                        is_contrarian = pos.entry_price > avg_price
+                    trend_row = await conn.fetchrow(
+                        """
+                        SELECT AVG(price) AS avg_price FROM (
+                            SELECT price
+                            FROM trades_observed
+                            WHERE market_id = $1
+                              AND token_id = $2
+                              AND time < $3
+                            ORDER BY time DESC
+                            LIMIT 10
+                        ) recent
+                        """,
+                        pos.market_id,
+                        pos.token_id,
+                        pos.open_time,
+                    )
+                    if trend_row and trend_row["avg_price"] is not None:
+                        avg_price = Decimal(str(trend_row["avg_price"]))
+                        if pos.direction == "yes":
+                            is_contrarian = pos.entry_price < avg_price
+                        else:
+                            is_contrarian = pos.entry_price > avg_price
 
-                await conn.execute(
-                    """
-                    INSERT INTO positions_reconstructed
-                        (wallet_address, market_id, token_id, direction,
-                         open_time, close_time, entry_price, exit_price,
-                         size_usdc, pnl_usdc, pnl_pct, holding_period_s, close_method,
-                         size_shares, entry_fee_usdc, exit_fee_usdc, gross_pnl_usdc,
-                         net_pnl_usdc, economic_model_version)
-                    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19)
-                    """,
-                    pos.wallet_address,
-                    pos.market_id,
-                    pos.token_id,
-                    pos.direction,
-                    pos.open_time,
-                    close_time,
-                    pos.entry_price,
-                    exit_price,
-                    entry_cost,
-                    round(pnl_usdc, 2),
-                    round(pnl_pct, 4),
-                    holding_s,
-                    close_method,
-                    close_shares,
-                    entry_fee,
-                    exit_fee,
-                    gross_pnl,
-                    pnl_usdc,
-                    ECONOMIC_MODEL_VERSION,
-                )
+                    await conn.execute(
+                        """
+                        INSERT INTO positions_reconstructed
+                            (wallet_address, market_id, token_id, direction,
+                             open_time, close_time, entry_price, exit_price,
+                             size_usdc, pnl_usdc, pnl_pct, holding_period_s, close_method,
+                             size_shares, entry_fee_usdc, exit_fee_usdc, gross_pnl_usdc,
+                             net_pnl_usdc, economic_model_version, category)
+                        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20)
+                        """,
+                        pos.wallet_address,
+                        pos.market_id,
+                        pos.token_id,
+                        pos.direction,
+                        pos.open_time,
+                        close_time,
+                        pos.entry_price,
+                        exit_price,
+                        entry_cost,
+                        round(pnl_usdc, 2),
+                        round(pnl_pct, 4),
+                        holding_s,
+                        close_method,
+                        close_shares,
+                        entry_fee,
+                        exit_fee,
+                        gross_pnl,
+                        pnl_usdc,
+                        ECONOMIC_MODEL_VERSION,
+                        category,
+                    )
         except Exception as e:
             logger.error(f"Failed to insert closed position: {e}")
             return

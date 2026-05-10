@@ -36,6 +36,7 @@ from typing import Optional
 from loguru import logger
 
 from src.config import settings
+from src.control.killswitch import get_killswitch
 from src.database.connection import get_db
 from src.economics.fees import calculate_polymarket_fee
 from src.economics.models import ECONOMIC_MODEL_VERSION, LiquidityRole, StrategyTrack
@@ -217,6 +218,34 @@ class LiveTrader:
         if not market_id or not token_id:
             logger.warning("LiveTrader veto: missing market_id/token_id")
             return None
+
+        # --- Strict-path killswitch check ------------------------------
+        # The live-trade gate: about to send an order to py-clob-client.
+        # We must NOT trust the 2s-TTL Redis cache here — between a DB
+        # flip and the cache rewrite, fast-path readers can see an old
+        # value and we'd leak real trades through a "disabled" switch.
+        # In dry_run we skip the gate (no real order goes out either way)
+        # so we preserve shadow-row behavior for benchmark comparisons.
+        if not self.dry_run:
+            try:
+                # F-05: bypass cache to prevent 2s leak window
+                real_enabled = await get_killswitch().is_real_execution_enabled(
+                    bypass_cache=True
+                )
+            except Exception as e:
+                # Fail safe: if the strict path itself raises, refuse the trade.
+                logger.error(
+                    f"LiveTrader veto: killswitch strict-path read failed ({e}), "
+                    f"refusing trade"
+                )
+                return None
+            if not real_enabled:
+                logger.warning(
+                    f"LiveTrader veto: real_execution_enabled is OFF "
+                    f"(strict-path read), refusing live order on {market_id[:14]}…"
+                )
+                return None
+
         if await self._has_open_trade_conflict(market_id, leader_wallet, action):
             logger.info(
                 f"LiveTrader skip: open_trade_conflict on {market_id[:10]}… "

@@ -14,6 +14,21 @@ from websockets.exceptions import ConnectionClosed, WebSocketException
 
 from src.config import settings
 
+# Phase 1 Task M contract import. See trade_observer.py for the rationale
+# behind the no-op fallback (Task M lands first in production; this guard
+# only fires in early CI runs).
+try:
+    from src.monitoring.metrics import ws_disconnects_total  # type: ignore[attr-defined]
+except ImportError:  # pragma: no cover
+    class _NoopMetric:
+        def labels(self, *a, **kw):  # noqa: ANN001
+            return self
+
+        def inc(self, *a, **kw):  # noqa: ANN001
+            return None
+
+    ws_disconnects_total = _NoopMetric()
+
 
 class PolymarketWSClient:
     WS_URL = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
@@ -58,11 +73,24 @@ class PolymarketWSClient:
         while self._running and not self._stop_event.is_set():
             try:
                 await self._connect_and_run()
+                # A clean exit from `_connect_and_run` (i.e. the upstream
+                # closed the socket without raising) still counts as a
+                # disconnect from our perspective — the WS market channel
+                # has no "end of session" signal.
+                if self._running:
+                    ws_disconnects_total.labels(reason="clean").inc()
                 backoff = 1  # Reset on clean disconnect
             except (ConnectionClosed, WebSocketException, OSError) as e:
                 if not self._running:
                     break
                 self.reconnect_count += 1
+                # Bucket disconnects by exception class so the dashboard can
+                # tell "remote closed normally" from "TCP-level OSError"
+                # from "protocol error". Keeping cardinality bounded by
+                # using class names, not the string representation.
+                ws_disconnects_total.labels(
+                    reason=type(e).__name__
+                ).inc()
                 logger.warning(
                     f"WebSocket disconnected: {e}. "
                     f"Reconnecting in {backoff}s (attempt #{self.reconnect_count})"
@@ -76,6 +104,7 @@ class PolymarketWSClient:
             except Exception as e:
                 if not self._running:
                     break
+                ws_disconnects_total.labels(reason="unexpected").inc()
                 logger.error(f"Unexpected WebSocket error: {e}")
                 await asyncio.sleep(backoff)
                 backoff = min(backoff * 2, max_backoff)

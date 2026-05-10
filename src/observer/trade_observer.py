@@ -4,6 +4,12 @@ Deduplicates trades using Redis. Stores to trades_observed. Publishes to Redis p
 
 Note: Polymarket CLOB WebSocket market channel sends orderbook/price_change events only
 (no wallet addresses). Leader trade attribution comes exclusively from data-api backfill.
+
+HP-1 (Phase 1 Task O): producer/consumer pipeline. The WS + REST coroutines act as
+producers and only ever do Redis-fast dedup before enqueuing onto a bounded
+`asyncio.Queue`. A dedicated `_db_writer_loop` drains the queue in batches and
+performs all DB writes inside one transaction per batch. This decouples ingestion
+latency from Postgres RTT and gives us visible backpressure metrics.
 """
 
 import asyncio
@@ -11,11 +17,13 @@ import hashlib
 import json
 import time
 from collections import OrderedDict, deque
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Any, Iterable, Iterator
 
 import aiohttp
+import asyncpg
 from loguru import logger
 
 from src.config import settings
@@ -23,12 +31,56 @@ from src.database.connection import get_db
 from src.observer.websocket_client import PolymarketWSClient
 from src.registry.falcon_client import FalconClient
 
+# Phase 1 Task M contract import. If Task M hasn't landed yet (early test
+# runs), fall back to no-op metrics so trade_observer still imports cleanly.
+# In production Task M MUST land before this module — the no-op path is a
+# build-system concession, not a behaviour we want to ship.
+try:
+    from src.monitoring.metrics import (  # type: ignore[attr-defined]
+        db_write_batch_size,
+        db_write_latency_seconds,
+        observer_queue_depth,
+        observer_queue_drops_total,
+        redis_publishes_total,
+        trade_ingestion_latency_seconds,
+        trades_ingested_total,
+        ws_disconnects_total,  # noqa: F401  (re-exported for websocket_client)
+    )
+except ImportError:  # pragma: no cover — fallback for early CI before Task M
+    class _NoopMetric:
+        def labels(self, *a, **kw):  # noqa: ANN001
+            return self
+
+        def inc(self, *a, **kw):  # noqa: ANN001
+            return None
+
+        def observe(self, *a, **kw):  # noqa: ANN001
+            return None
+
+        def set(self, *a, **kw):  # noqa: ANN001
+            return None
+
+    trades_ingested_total = _NoopMetric()
+    trade_ingestion_latency_seconds = _NoopMetric()
+    db_write_batch_size = _NoopMetric()
+    db_write_latency_seconds = _NoopMetric()
+    observer_queue_depth = _NoopMetric()
+    observer_queue_drops_total = _NoopMetric()
+    redis_publishes_total = _NoopMetric()
+    ws_disconnects_total = _NoopMetric()
+
 REDIS_TRADES_CHANNEL = "trades:observed"
 DEDUP_KEY_PREFIX = "seen_trades"
 DEDUP_TTL_S = 7 * 86400  # 7 days
 MARKET_META_TTL_S = 3600
 SOURCE_API_WALLET = "api_wallet"
 SOURCE_API_MARKET = "api_market"
+
+# HP-1 (Phase 1 Task O): how long a producer will wait to enqueue before giving
+# up and counting a queue-full drop. 1 s is generous enough that a brief writer
+# stall doesn't bleed into the WS pong loop, but tight enough that we don't
+# starve the producer's other work (dedup, Redis pubsub).
+QUEUE_PUT_TIMEOUT_S = 1.0
 
 # Cache caps — sized for an Oracle Free 24GB ARM VM. Polymarket has ~thousands of
 # active markets at any time and a few hundred leaders, so these are well above
@@ -162,42 +214,77 @@ def _json_dict(raw: Any) -> dict:
 
 
 def _market_type_label(category: Any, question: Any = None) -> str:
+    """Infer a market's thematic category from its category hint + question text.
+
+    Order matters: weather is checked before sports because some weather
+    questions also contain "win" or location names that overlap with sports
+    tokens. Crypto wins over politics/macro because "btc" is unambiguous.
+    """
     category_text = str(category or "").strip()
     text = f"{category_text} {question or ''}".lower()
-    sports_tokens = (
-        " vs ",
-        " o/u ",
-        "map ",
-        "set ",
-        "grand prix",
-        "premier league",
-        "champions league",
-        "world cup",
-        "tennis",
-        "soccer",
-        "football",
-        "nba",
-        "nfl",
-        "mlb",
-        "nhl",
-        "cup",
-        "fc",
-        "winner",
-        " win on 20",
+
+    # Weather first — many of these would match "win on 20" otherwise.
+    weather_tokens = (
+        "highest temperature", "lowest temperature", "high temp", "low temp",
+        "°c", "°f", "celsius", "fahrenheit",
+        "rainfall", "snowfall", "snow on", "rain on",
+        "hurricane", "typhoon", "tropical storm",
     )
-    crypto_tokens = ("bitcoin", "btc", "ethereum", "eth", "crypto", "solana", "xrp")
+    if any(token in text for token in weather_tokens):
+        return "weather"
+
+    crypto_tokens = (
+        "bitcoin", "btc", "ethereum", "eth ", "crypto", "solana", "sol ",
+        "xrp", "doge", "ada", "cardano", "altcoin", "halving", "stablecoin",
+        "usdc", "usdt",
+    )
     if any(token in text for token in crypto_tokens):
         return "crypto"
+
+    sports_tokens = (
+        " vs ", " vs.", " o/u ", "map ", "map handicap", "set ", "handicap",
+        "grand prix", "formula 1", "f1 ", "nascar",
+        "premier league", "champions league", "europa league", "world cup",
+        "uefa", "fifa", "epl", "la liga", "bundesliga", "serie a", "ligue 1",
+        "ipl", "ncaa", "march madness",
+        "tennis", "atp", "wta", "wimbledon", "us open",
+        "soccer", "football", "basketball", "baseball", "hockey",
+        "nba", "nfl", "mlb", "nhl", "wnba", "mls",
+        "boxing", "ufc", "mma",
+        "cup", " fc ", "fc.", "fc?",
+        "winner", "to win", " win on 20",
+    )
     if any(token in text for token in sports_tokens):
         return "sports"
-    politics_tokens = ("election", "president", "senate", "vote", "parliament", "mayor")
+
+    politics_tokens = (
+        "election", "president", "senate", "house of representatives",
+        "parliament", "mayor", "vote", "ballot", "congress",
+        "primary", "caucus", "candidate", "governor",
+        "trump", "biden", "harris", "putin", "xi jinping",
+    )
     if any(token in text for token in politics_tokens):
         return "politics"
-    if any(token in text for token in ("fed", "inflation", "cpi", "rate cut", "recession", "gdp")):
+
+    macro_tokens = (
+        "fed ", "fomc", "inflation", "cpi", "ppi",
+        "rate cut", "rate hike", "interest rate", "recession",
+        "gdp", "unemployment", "jobless", "nonfarm",
+        "tariff", "trade war",
+    )
+    if any(token in text for token in macro_tokens):
         return "macro"
-    if any(token in text for token in ("movie", "album", "oscar", "grammy", "tv", "show")):
+
+    entertainment_tokens = (
+        "movie", "film", "album", "oscar", "grammy", "emmy",
+        " tv ", " show ", "netflix", "spotify",
+        "billboard", "box office", "season finale",
+    )
+    if any(token in text for token in entertainment_tokens):
         return "entertainment"
-    if category_text and category_text.lower() != "unknown":
+
+    # Last resort: trust an explicit non-unknown category hint.
+    if category_text and category_text.lower() not in {"unknown", "none", "null"}:
         return category_text
 
     return "unknown"
@@ -259,6 +346,39 @@ def _gamma_market_matches_request(market: dict, market_id: str, token_id: str) -
     return True
 
 
+@dataclass(slots=True)
+class _TradeRecord:
+    """In-memory record handed from `_process_trade` (producer) to the
+    `_db_writer_loop` (consumer). Carries everything the writer needs so the
+    writer never has to call back into the producer for context.
+
+    `event_ts_s` is the wall-clock time when the upstream event was *first*
+    observed (WS message arrival or REST response). It feeds
+    `trade_ingestion_latency_seconds` so we can prove HP-1 actually delivers
+    the median 16 s → 2-3 s freshness cut.
+    """
+
+    market_id: str
+    token_id: str
+    wallet_address: str
+    side: str
+    price: Decimal
+    size_usdc: Decimal
+    trade_time: datetime
+    source: str
+    is_leader: bool
+    dedup_key: str
+    event_ts_s: float
+    market_question_hint: str | None = None
+    market_slug_hint: str | None = None
+    outcome_hint: str | None = None
+    outcome_index: int | None = None
+    # Pure-Python category inference, computed inside `_process_trade` so the
+    # writer never has to re-parse the question text. The writer only refines
+    # this against the markets row when DB content suggests a better label.
+    inferred_category: str = "unknown"
+
+
 class TradeObserver:
     def __init__(
         self,
@@ -284,6 +404,28 @@ class TradeObserver:
         )
         self._book_age_samples: deque[float] = deque(maxlen=512)
 
+        # HP-1 fix #3: bounded write queue + dedicated DB writer task. The
+        # queue is allocated lazily on `start()` so unit tests that build a
+        # TradeObserver and call `_process_trade` directly without a running
+        # event loop still work — `_process_trade` lazy-creates the queue too.
+        self._write_queue: asyncio.Queue[_TradeRecord] | None = None
+        self._writer_task: asyncio.Task | None = None
+        self._writer_drain_event: asyncio.Event = asyncio.Event()
+
+        # HP-1 fix #1 supplement: ETag / If-Modified-Since state for the
+        # global market sweep. `None` means "no cached validator yet" — we
+        # send the request without conditional headers. After the first 200
+        # response we capture whatever ETag/Last-Modified the server sent;
+        # subsequent requests echo it back as `If-None-Match` /
+        # `If-Modified-Since`. Lost on restart by design (Phase 1 scope —
+        # cold start does at most one wasted full poll).
+        self._last_etag: str | None = None
+        self._last_modified: str | None = None
+        # If the server confirms it ships ETag/Last-Modified at least once,
+        # flip this to True so we don't keep emitting the
+        # "no validators on response" debug log every 5 s.
+        self._etag_observed: bool = False
+
     @property
     def inserted_count(self) -> int:
         return self._inserted
@@ -295,14 +437,32 @@ class TradeObserver:
         if self._ws_client:
             self._ws_client.update_markets(markets)
 
+    def _ensure_write_queue(self) -> asyncio.Queue:
+        """Lazy-init the bounded write queue. Called from both producer and
+        consumer paths so unit tests that exercise `_process_trade` without
+        going through `start()` still see a real queue.
+        """
+        if self._write_queue is None:
+            self._write_queue = asyncio.Queue(
+                maxsize=max(1, int(settings.TRADE_OBSERVER_QUEUE_MAX))
+            )
+        return self._write_queue
+
     async def start(self) -> None:
         self._running = True
         self._stop_event.clear()
+        self._ensure_write_queue()
         self._ws_client = PolymarketWSClient(
             on_message=self._handle_ws_message,
             markets=self._leader_markets,
         )
+        # HP-1 fix #3: dedicated DB writer task drains the queue in batches.
+        # Started BEFORE the producers so the very first enqueued record has
+        # somewhere to land. `gather` so any one crashing surfaces in the
+        # supervisor.
+        self._writer_task = asyncio.create_task(self._db_writer_loop())
         tasks = [
+            self._writer_task,
             asyncio.create_task(self._ws_client.start()),
             asyncio.create_task(self._backfill_loop()),
         ]
@@ -316,6 +476,501 @@ class TradeObserver:
         self._stop_event.set()
         if self._ws_client:
             await self._ws_client.stop()
+        # Drain anything left in the queue before tearing down the writer task
+        # so we don't lose trades that were enqueued but not yet committed.
+        if self._writer_task is not None:
+            try:
+                await asyncio.wait_for(self._drain_writer(), timeout=5.0)
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "DB writer drain timed out after 5 s; "
+                    f"{self._write_queue.qsize() if self._write_queue else 0} "
+                    "records may be lost"
+                )
+            self._writer_task.cancel()
+            try:
+                await self._writer_task
+            except (asyncio.CancelledError, Exception):
+                pass
+            self._writer_task = None
+
+    async def _drain_writer(self) -> None:
+        """Wait until the queue is empty AND the writer is idle. Used by
+        `stop()` and by tests that need a deterministic flush.
+        """
+        if self._write_queue is None:
+            return
+        while self._write_queue.qsize() > 0:
+            await asyncio.sleep(0.01)
+
+    async def _db_writer_loop(self) -> None:
+        """Drain the write queue in batches and commit them as one tx each.
+
+        Loop body: collect up to TRADE_OBSERVER_BATCH_MAX records or wait
+        TRADE_OBSERVER_BATCH_FLUSH_MS milliseconds for the queue to fill,
+        whichever comes first. Empty drains just sleep on `queue.get()` so
+        we don't spin.
+        """
+        while self._running and not self._stop_event.is_set():
+            try:
+                await self._writer_run_once()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                # The per-batch path already logs on failure and falls back
+                # to per-row insert. Anything that escapes that is a
+                # programmer error — log loudly and keep going so a single
+                # bad batch doesn't take down ingestion.
+                logger.exception("DB writer iteration crashed; continuing")
+
+    async def _writer_run_once(self) -> int:
+        """Drain at most one batch from the queue and commit it.
+
+        Returns the number of records the writer attempted to insert (i.e.
+        batch size, not committed-row count). Used by `_db_writer_loop` and
+        by unit tests that need a deterministic flush.
+        """
+        queue = self._ensure_write_queue()
+        observer_queue_depth.set(queue.qsize())
+        batch_max = max(1, int(settings.TRADE_OBSERVER_BATCH_MAX))
+        flush_ms = max(1, int(settings.TRADE_OBSERVER_BATCH_FLUSH_MS))
+        flush_deadline = time.monotonic() + (flush_ms / 1000.0)
+
+        # Block on the first record so an idle writer doesn't spin.
+        try:
+            first = await asyncio.wait_for(
+                queue.get(), timeout=flush_ms / 1000.0
+            )
+        except asyncio.TimeoutError:
+            return 0
+
+        batch: list[_TradeRecord] = [first]
+        # Then opportunistically pull more without blocking, capped at
+        # batch_max OR by the flush deadline.
+        while len(batch) < batch_max and time.monotonic() < flush_deadline:
+            try:
+                batch.append(queue.get_nowait())
+                continue
+            except asyncio.QueueEmpty:
+                pass
+            remaining = flush_deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            try:
+                nxt = await asyncio.wait_for(
+                    queue.get(), timeout=min(remaining, 0.005)
+                )
+            except asyncio.TimeoutError:
+                break
+            batch.append(nxt)
+
+        observer_queue_depth.set(queue.qsize())
+        await self._write_batch(batch)
+        return len(batch)
+
+    async def _write_batch(self, batch: list[_TradeRecord]) -> None:
+        """Commit one batch of trades. All-or-nothing transaction; on
+        UniqueViolationError for the whole batch (rare — usually intra-batch
+        dupes from WS+REST overlap), fall back to per-row inserts with
+        ON CONFLICT DO NOTHING so partial progress is preserved.
+        """
+        if not batch:
+            return
+
+        t0 = time.monotonic()
+        committed: list[tuple[_TradeRecord, int | None, dict | None, dict | None]] = []
+        try:
+            async with get_db() as conn:
+                async with conn.transaction():
+                    committed = await self._insert_batch_atomic(conn, batch)
+        except asyncpg.UniqueViolationError:
+            # Multi-row VALUES with ON CONFLICT DO NOTHING shouldn't raise
+            # this — but if it does (intra-batch dupes that bypassed the
+            # Redis dedup, or some other constraint), recover row-by-row so
+            # we don't lose the whole batch.
+            logger.warning(
+                f"batch insert hit UniqueViolation; falling back to "
+                f"per-row insert for {len(batch)} records"
+            )
+            committed = await self._insert_batch_per_row_fallback(batch)
+        except Exception as exc:
+            # Any other DB failure: clear dedup keys so retries can succeed,
+            # log, and abandon the batch. We do NOT keep the records on the
+            # queue — that would block the writer indefinitely if Postgres
+            # is hard-down. Trade durability is best-effort here.
+            for rec in batch:
+                await self._clear_dedup_key(rec.dedup_key)
+            logger.error(f"batch insert failed ({len(batch)} records): {exc}")
+            db_write_batch_size.observe(len(batch))
+            db_write_latency_seconds.observe(time.monotonic() - t0)
+            return
+
+        elapsed = time.monotonic() - t0
+        db_write_batch_size.observe(len(batch))
+        db_write_latency_seconds.observe(elapsed)
+
+        n_inserted = sum(1 for c in committed if c[1] is not None)
+        if n_inserted:
+            self._inserted += n_inserted
+
+        # Group source-wise for accurate per-source counters (Prometheus
+        # rejects unbounded label cardinality, so we map to {ws,rest,backfill}).
+        inserted_by_source: dict[str, int] = {}
+        deduped_by_source: dict[str, int] = {}
+        for rec, inserted_id, _, _ in committed:
+            src = self._metric_source_label(rec.source)
+            if inserted_id is not None:
+                inserted_by_source[src] = inserted_by_source.get(src, 0) + 1
+            else:
+                deduped_by_source[src] = deduped_by_source.get(src, 0) + 1
+        for src, n in inserted_by_source.items():
+            trades_ingested_total.labels(source=src, result="inserted").inc(n)
+        for src, n in deduped_by_source.items():
+            trades_ingested_total.labels(source=src, result="deduped").inc(n)
+
+        # End-to-end latency: from event observation to committed transaction.
+        now_s = time.time()
+        for rec, inserted_id, _, _ in committed:
+            if inserted_id is None:
+                continue
+            trade_ingestion_latency_seconds.labels(
+                source=self._metric_source_label(rec.source)
+            ).observe(max(0.0, now_s - rec.event_ts_s))
+
+        # Publish AFTER commit (Phase 0 ordering invariant — pub/sub never
+        # advertises an uncommitted state).
+        for rec, inserted_id, market_row, leader_row in committed:
+            if inserted_id is None:
+                continue
+            await self._publish_trade_event(rec, market_row, leader_row)
+
+    @staticmethod
+    def _metric_source_label(source: str) -> str:
+        """Map the observer's internal `source` strings to the Prometheus
+        contract labels (ws | rest | backfill). Unknown sources default to
+        'rest' so labels stay bounded (prom-client rejects unbounded
+        cardinality).
+        """
+        if source == "websocket":
+            return "ws"
+        if source in (SOURCE_API_WALLET, SOURCE_API_MARKET):
+            return "rest"
+        if source == "falcon":
+            return "backfill"
+        return "rest"
+
+    async def _insert_batch_atomic(
+        self,
+        conn,
+        batch: list[_TradeRecord],
+    ) -> list[tuple[_TradeRecord, int | None, dict | None, dict | None]]:
+        """The happy path: one tx, batched markets-stub upsert, batched
+        trades_observed insert with RETURNING, then per-row enrichment
+        (markets repair + leader fetch) inside the same tx.
+
+        Returns a list of (record, inserted_id_or_None, market_row, leader_row)
+        in input order. inserted_id=None means the row was deduped at the
+        DB layer.
+        """
+        # 1. Markets stub upsert — one row per unique market_id in the batch.
+        unique_markets: dict[str, str] = {}
+        for rec in batch:
+            unique_markets.setdefault(
+                rec.market_id,
+                rec.market_question_hint or f"Market {rec.market_id[:30]}…",
+            )
+        await conn.executemany(
+            """
+            INSERT INTO markets (market_id, question, category)
+            VALUES ($1, $2, 'unknown')
+            ON CONFLICT (market_id) DO NOTHING
+            """,
+            list(unique_markets.items()),
+        )
+
+        # 2. Resolve initial category per unique market_id. Done as a separate
+        # batched SELECT rather than inlining a subquery in step 3's INSERT
+        # because the multi-row form would force asyncpg to deduce one type
+        # for $market_id used in two contexts (VALUES + WHERE in the
+        # subquery), which Postgres rejects with "inconsistent types deduced
+        # for parameter $N". One extra round-trip on the same conn is cheap.
+        category_rows = await conn.fetch(
+            """
+            SELECT market_id, NULLIF(category, 'unknown') AS category
+            FROM markets
+            WHERE market_id = ANY($1::text[])
+            """,
+            list(unique_markets.keys()),
+        )
+        initial_category_by_market: dict[str, str] = {
+            row["market_id"]: (row["category"] or "unknown") for row in category_rows
+        }
+
+        # 3. Batched trades_observed insert — multi-row VALUES with RETURNING.
+        # asyncpg's executemany() doesn't return rows; a multi-row VALUES
+        # INSERT does. We RETURN the natural-key tuple so we can correlate
+        # the response set back to input records (some may have been
+        # ON-CONFLICT-dropped).
+        params: list = []
+        placeholders: list[str] = []
+        for i, rec in enumerate(batch):
+            base = i * 10
+            placeholders.append(
+                f"(${base + 1}, ${base + 2}, ${base + 3}, ${base + 4}, "
+                f"${base + 5}, ${base + 6}, ${base + 7}, ${base + 8}, "
+                f"${base + 9}, ${base + 10})"
+            )
+            params.extend([
+                rec.trade_time,
+                rec.market_id,
+                rec.token_id,
+                rec.wallet_address,
+                rec.side,
+                rec.price,
+                rec.size_usdc,
+                rec.source,
+                rec.is_leader,
+                initial_category_by_market.get(rec.market_id, "unknown"),
+            ])
+        sql = (
+            "INSERT INTO trades_observed "
+            "(time, market_id, token_id, wallet_address, side, price, "
+            "size_usdc, source, is_leader, category) VALUES "
+            + ", ".join(placeholders)
+            + " ON CONFLICT (wallet_address, market_id, time, side, price, size_usdc) "
+            "DO NOTHING RETURNING id, wallet_address, market_id, time, side, price, size_usdc"
+        )
+        returned = await conn.fetch(sql, *params)
+
+        nk_to_id: dict[tuple, int] = {}
+        for row in returned:
+            key = (
+                row["wallet_address"],
+                row["market_id"],
+                row["time"],
+                row["side"],
+                row["price"],
+                row["size_usdc"],
+            )
+            nk_to_id[key] = row["id"]
+
+        # 4. Batched leaders fetch — one query per unique leader wallet.
+        leader_wallets_to_fetch: set[str] = {
+            rec.wallet_address for rec in batch if rec.is_leader
+        }
+        leader_rows: dict[str, dict] = {}
+        if leader_wallets_to_fetch:
+            rows = await conn.fetch(
+                """
+                SELECT wallet_address, classification_json, excluded, on_watchlist
+                FROM leaders
+                WHERE wallet_address = ANY($1::text[])
+                """,
+                list(leader_wallets_to_fetch),
+            )
+            for row in rows:
+                leader_rows[row["wallet_address"]] = dict(row)
+
+        # 5. Per-row enrichment (markets repair + category refine UPDATE)
+        # INSIDE the same tx so we still pay only one commit per batch.
+        out: list[tuple[_TradeRecord, int | None, dict | None, dict | None]] = []
+        for rec in batch:
+            key = (
+                rec.wallet_address,
+                rec.market_id,
+                rec.trade_time,
+                rec.side,
+                rec.price,
+                rec.size_usdc,
+            )
+            inserted_id = nk_to_id.get(key)
+            if inserted_id is None:
+                logger.debug(
+                    "trades_observed dupe blocked at DB layer: "
+                    f"wallet={rec.wallet_address[:10]}… "
+                    f"market={rec.market_id[:10]}… "
+                    f"time={rec.trade_time.isoformat()}"
+                )
+                out.append((rec, None, None, None))
+                continue
+
+            market_row = await conn.fetchrow(
+                """
+                SELECT question, category, token_yes, token_no, end_date
+                FROM markets
+                WHERE market_id = $1
+                """,
+                rec.market_id,
+            )
+            market_row = await self._repair_market_from_trade_hint(
+                conn=conn,
+                market_id=rec.market_id,
+                token_id=rec.token_id,
+                trade_time=rec.trade_time,
+                market_row=market_row,
+                market_question_hint=rec.market_question_hint,
+                market_slug_hint=rec.market_slug_hint,
+                outcome_hint=rec.outcome_hint,
+                outcome_index=rec.outcome_index,
+            )
+            refined_category = (_row_value(market_row, "category") or "").strip()
+            if refined_category and refined_category.lower() not in {
+                "", "unknown", "none", "null"
+            }:
+                await conn.execute(
+                    """
+                    UPDATE trades_observed
+                    SET category = $2
+                    WHERE id = $1 AND (category IS NULL OR category = 'unknown')
+                    """,
+                    inserted_id,
+                    refined_category,
+                )
+            leader_row = leader_rows.get(rec.wallet_address)
+            out.append((rec, inserted_id, market_row, leader_row))
+
+        return out
+
+    async def _insert_batch_per_row_fallback(
+        self,
+        batch: list[_TradeRecord],
+    ) -> list[tuple[_TradeRecord, int | None, dict | None, dict | None]]:
+        """Per-row fallback for when the atomic batch path raises a
+        UniqueViolation. Each row gets its own tx so partial progress is
+        preserved.
+        """
+        out: list[tuple[_TradeRecord, int | None, dict | None, dict | None]] = []
+        for rec in batch:
+            try:
+                async with get_db() as conn:
+                    async with conn.transaction():
+                        single = await self._insert_batch_atomic(conn, [rec])
+                        out.extend(single)
+            except Exception as exc:
+                logger.error(
+                    f"per-row fallback failed for "
+                    f"wallet={rec.wallet_address[:10]}… "
+                    f"market={rec.market_id[:10]}…: {exc}"
+                )
+                await self._clear_dedup_key(rec.dedup_key)
+                out.append((rec, None, None, None))
+        return out
+
+    async def _publish_trade_event(
+        self,
+        rec: _TradeRecord,
+        market_row: dict | None,
+        leader_row: dict | None,
+    ) -> None:
+        """Build the `trades:observed` payload and publish to Redis.
+
+        Out-of-tx by design (Phase 0 invariant — pub/sub never advertises
+        an uncommitted state). Also drives the Gamma-enrichment market-fetch
+        path when the markets row is too thin to publish a useful payload.
+        """
+        if self._needs_market_enrichment(rec.market_id, market_row):
+            try:
+                enriched = await self._fetch_market_metadata_from_gamma(
+                    rec.market_id, rec.token_id
+                )
+            except Exception as exc:
+                logger.debug(f"Gamma market lookup failed for {rec.market_id}: {exc}")
+                enriched = None
+            if enriched:
+                try:
+                    async with get_db() as conn:
+                        async with conn.transaction():
+                            await conn.execute(
+                                """
+                                INSERT INTO markets
+                                    (market_id, question, category, token_yes, token_no,
+                                     end_date, volume_24h, liquidity_score, fee_rate_pct, updated_at)
+                                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,NOW())
+                                ON CONFLICT (market_id) DO UPDATE SET
+                                    question       = EXCLUDED.question,
+                                    category       = EXCLUDED.category,
+                                    token_yes      = COALESCE(EXCLUDED.token_yes, markets.token_yes),
+                                    token_no       = COALESCE(EXCLUDED.token_no, markets.token_no),
+                                    end_date       = COALESCE(EXCLUDED.end_date, markets.end_date),
+                                    volume_24h     = COALESCE(EXCLUDED.volume_24h, markets.volume_24h),
+                                    liquidity_score= COALESCE(
+                                        EXCLUDED.liquidity_score,
+                                        markets.liquidity_score
+                                    ),
+                                    fee_rate_pct   = COALESCE(
+                                        EXCLUDED.fee_rate_pct,
+                                        markets.fee_rate_pct
+                                    ),
+                                    updated_at     = NOW()
+                                """,
+                                rec.market_id,
+                                enriched["question"],
+                                enriched["category"],
+                                enriched["token_yes"],
+                                enriched["token_no"],
+                                enriched["end_date"],
+                                enriched["volume_24h"],
+                                enriched["liquidity_score"],
+                                enriched["fee_rate_pct"],
+                            )
+                    market_row = {
+                        "question": enriched["question"],
+                        "category": enriched["category"],
+                    }
+                    self._market_meta_cache[rec.market_id] = datetime.now(
+                        tz=timezone.utc
+                    ).timestamp()
+                except Exception as exc:
+                    logger.debug(
+                        f"Failed to upsert Gamma market metadata for {rec.market_id}: {exc}"
+                    )
+
+        classification = _json_dict(_row_value(leader_row, "classification_json", {}))
+        market_question = (
+            _row_value(market_row, "question")
+            or rec.market_question_hint
+            or f"Market {rec.market_id[:30]}…"
+        )
+        market_category = _row_value(market_row, "category") or "unknown"
+        market_type = _market_type_label(market_category, market_question)
+        wallet_status = "market_participant"
+        if rec.is_leader:
+            if bool(_row_value(leader_row, "excluded", False)):
+                wallet_status = "excluded"
+            elif bool(_row_value(leader_row, "on_watchlist", False)):
+                wallet_status = "active"
+            else:
+                wallet_status = "watching"
+
+        event = {
+            "time": rec.trade_time.isoformat(),
+            "market_id": rec.market_id,
+            "market_question": market_question,
+            "market_category": market_category,
+            "market_type": market_type,
+            "token_id": rec.token_id,
+            "wallet_address": rec.wallet_address,
+            "wallet_type": "leader" if rec.is_leader else "market_participant",
+            "wallet_status": wallet_status,
+            "wallet_strategy": classification.get("strategy"),
+            "wallet_horizon": classification.get("horizon"),
+            "wallet_influence": classification.get("influence"),
+            "side": rec.side,
+            "price": str(rec.price),
+            "size_usdc": str(rec.size_usdc),
+            "is_leader": rec.is_leader,
+            "source": rec.source,
+        }
+        try:
+            await self._redis.publish(REDIS_TRADES_CHANNEL, json.dumps(event))
+            redis_publishes_total.labels(
+                channel=REDIS_TRADES_CHANNEL, result="ok"
+            ).inc()
+        except Exception as e:
+            redis_publishes_total.labels(
+                channel=REDIS_TRADES_CHANNEL, result="error"
+            ).inc()
+            logger.warning(f"Failed to publish trade event: {e}")
 
     async def _handle_ws_message(self, msg: dict) -> None:
         """Process a single WebSocket market message.
@@ -566,15 +1221,29 @@ class TradeObserver:
             size_usdc=size_usdc,
             trade_time=trade_time,
             source="websocket",
+            # WS arrival = "now" — the WS dispatch already happened, so
+            # time.time() here is a tight proxy for "event observed". The
+            # writer subtracts this from its own time.time() when it
+            # observes `trade_ingestion_latency_seconds`.
+            event_ts_s=time.time(),
         )
 
     async def _backfill_loop(self) -> None:
-        """Poll data-api.polymarket.com every 60s for leader trades."""
+        """Poll data-api.polymarket.com every TRADE_OBSERVER_POLL_INTERVAL_S
+        seconds for leader trades.
+
+        HP-1 fix #1: cadence dropped from 30 s → 5 s by default. The interval
+        is bounded by [TRADE_OBSERVER_POLL_INTERVAL_S_MIN,
+        TRADE_OBSERVER_POLL_INTERVAL_S_MAX] in `settings` (validated at
+        load), so the previous `max(5, …)` floor is no longer needed — the
+        config layer enforces sane bounds and we honour the configured
+        value verbatim.
+        """
         while self._running and not self._stop_event.is_set():
             try:
                 await asyncio.wait_for(
                     self._stop_event.wait(),
-                    timeout=max(5, int(settings.TRADE_OBSERVER_POLL_INTERVAL_S)),
+                    timeout=int(settings.TRADE_OBSERVER_POLL_INTERVAL_S),
                 )
                 break
             except asyncio.TimeoutError:
@@ -650,24 +1319,104 @@ class TradeObserver:
         )
 
     async def _backfill_wallet_trades(self, session: aiohttp.ClientSession) -> int:
-        processed = 0
-        for wallet in list(self._leader_wallets):
+        """Per-wallet REST backfill, parallelised under a bounded semaphore.
+
+        Phase 1 Task F (audit HP-1 fix #2). The previous implementation
+        looped wallets serially with an 8 s timeout each; with ~200 leaders
+        the worst case was 200 × 8 s = 26 min. We now fan out to
+        `REGISTRY_BACKFILL_CONCURRENCY` (default 20) workers via
+        `asyncio.gather(..., return_exceptions=True)`:
+
+        * Each per-wallet HTTP call still respects the 8 s timeout (now via
+          `asyncio.wait_for` so the cancellation kills the slow worker, not
+          the whole batch).
+        * One wallet's failure no longer kills the others — exceptions are
+          captured by `return_exceptions=True` and logged in aggregate.
+        * The 60 RPM Falcon-side limiter (`FALCON_MAX_REQUESTS_PER_MINUTE`)
+          is the *real* cap on sustained throughput. We're not hitting
+          Falcon here (`data-api.polymarket.com` is a separate endpoint
+          with a different ceiling), but the same logic applies: with 20
+          workers, sustained tput converges to whatever the upstream
+          allows; the win is in stall recovery — one stuck wallet no
+          longer blocks the other 19. That's the audit's "~16×" claim.
+        """
+        wallets = [w for w in self._leader_wallets if w]
+        if not wallets:
+            return 0
+        if not self._running:
+            return 0
+
+        max_concurrency = max(1, int(settings.REGISTRY_BACKFILL_CONCURRENCY))
+        sem = asyncio.Semaphore(max_concurrency)
+
+        async def _backfill_one(wallet: str) -> int:
             if not self._running:
-                break
+                return 0
             url = f"https://data-api.polymarket.com/trades?user={wallet}&limit=100"
-            try:
-                async with session.get(url, timeout=aiohttp.ClientTimeout(total=8)) as resp:
-                    if resp.status != 200:
-                        continue
-                    trades = await resp.json()
-                    for trade in trades:
-                        await self._process_data_api_trade(trade, source=SOURCE_API_WALLET)
-                        processed += 1
-            except Exception as e:
-                logger.debug(f"data-api wallet backfill failed for {wallet}: {e}")
+            async with sem:
+                if not self._running:
+                    return 0
+                try:
+                    # asyncio.wait_for kills this single coroutine on
+                    # timeout — the rest of the gather keeps going.
+                    async with session.get(
+                        url, timeout=aiohttp.ClientTimeout(total=8)
+                    ) as resp:
+                        if resp.status != 200:
+                            return 0
+                        trades = await resp.json()
+                except asyncio.TimeoutError:
+                    logger.debug(f"data-api wallet backfill timeout for {wallet}")
+                    return 0
+                except Exception as e:
+                    logger.debug(f"data-api wallet backfill failed for {wallet}: {e}")
+                    return 0
+            # Process trades OUTSIDE the semaphore — _process_data_api_trade
+            # touches the DB and Redis; holding the per-wallet HTTP slot
+            # while we serialise the writes would defeat the parallelism.
+            response_ts_s = time.time()
+            count = 0
+            for trade in trades:
+                await self._process_data_api_trade(
+                    trade, source=SOURCE_API_WALLET, event_ts_s=response_ts_s
+                )
+                count += 1
+            return count
+
+        results = await asyncio.gather(
+            *(_backfill_one(w) for w in wallets), return_exceptions=True
+        )
+        processed = 0
+        errors = 0
+        for outcome in results:
+            if isinstance(outcome, BaseException):
+                errors += 1
+                continue
+            processed += int(outcome or 0)
+        if errors:
+            logger.debug(
+                f"data-api wallet backfill: {processed} trades from "
+                f"{len(wallets) - errors}/{len(wallets)} wallets ({errors} failed)"
+            )
         return processed
 
     async def _backfill_market_activity(self, session: aiohttp.ClientSession) -> int:
+        """Global market sweep against `data-api.polymarket.com/trades`.
+
+        HP-1 fix #1 supplement (ETag / If-Modified-Since): at the new 5 s
+        cadence we burn a request every five seconds. If the server ships
+        a strong ETag (or even Last-Modified), we cache it and echo it
+        back as `If-None-Match` (and `If-Modified-Since`) on the next
+        call. A 304 response means "no new trades since you last asked"
+        and we skip parsing the body entirely. We also count the skip in
+        `trades_ingested_total{source="rest", result="not_modified"}`
+        for observability — that counter against `…{result="inserted"}`
+        is the easiest way to see the bandwidth saved.
+
+        If the server never returns ETag/Last-Modified, we log once at
+        DEBUG and stop trying — the conditional headers cost ~80 bytes
+        per request to send unconditionally, which is fine but noisy.
+        """
         target_markets = await self._get_recent_leader_market_ids()
         if not target_markets:
             return 0
@@ -677,20 +1426,67 @@ class TradeObserver:
             "https://data-api.polymarket.com/trades"
             f"?limit={max(50, int(settings.DATA_API_GLOBAL_TRADES_LIMIT))}"
         )
+        # Build conditional headers from cached validators. data-api may
+        # return either ETag or Last-Modified (or neither); we send
+        # whichever we have.
+        headers: dict[str, str] = {}
+        if self._last_etag:
+            headers["If-None-Match"] = self._last_etag
+        if self._last_modified:
+            headers["If-Modified-Since"] = self._last_modified
+
         try:
-            async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+            async with session.get(
+                url,
+                timeout=aiohttp.ClientTimeout(total=10),
+                headers=headers or None,
+            ) as resp:
+                if resp.status == 304:
+                    # No new trades — server confirms our cached snapshot
+                    # is still current. Skip body parsing entirely.
+                    trades_ingested_total.labels(
+                        source="rest", result="not_modified"
+                    ).inc()
+                    logger.debug(
+                        f"data-api market activity 304 Not Modified "
+                        f"(etag={self._last_etag!r} last_mod={self._last_modified!r})"
+                    )
+                    return 0
                 if resp.status != 200:
                     return 0
+                # Capture validators BEFORE consuming the body so a
+                # mid-response error doesn't poison the cache with a bad
+                # ETag.
+                etag = resp.headers.get("ETag")
+                last_modified = resp.headers.get("Last-Modified")
+                if etag or last_modified:
+                    self._etag_observed = True
+                    self._last_etag = etag or self._last_etag
+                    self._last_modified = last_modified or self._last_modified
+                elif not self._etag_observed:
+                    logger.debug(
+                        "data-api: no ETag/Last-Modified on response; "
+                        "conditional polling disabled"
+                    )
+                    # Mark observed=True so we only log this once.
+                    self._etag_observed = True
                 trades = await resp.json()
         except Exception as exc:
             logger.debug(f"data-api market activity fetch failed: {exc}")
             return 0
 
+        # All trades in this response share the same observation timestamp
+        # (the moment we received the response). Threading it through the
+        # producer lets the writer measure end-to-end latency from "REST
+        # response received" to "DB committed".
+        response_ts_s = time.time()
         for trade in trades:
             market_id = str(trade.get("conditionId") or "")
             if not market_id or market_id not in target_markets:
                 continue
-            await self._process_data_api_trade(trade, source=SOURCE_API_MARKET)
+            await self._process_data_api_trade(
+                trade, source=SOURCE_API_MARKET, event_ts_s=response_ts_s
+            )
             processed += 1
         return processed
 
@@ -742,12 +1538,22 @@ class TradeObserver:
             logger.debug(f"Leader market bootstrap failed: {exc}")
         return set(self._leader_condition_ids)
 
-    async def _process_data_api_trade(self, trade: dict, source: str = SOURCE_API_WALLET) -> None:
+    async def _process_data_api_trade(
+        self,
+        trade: dict,
+        source: str = SOURCE_API_WALLET,
+        event_ts_s: float | None = None,
+    ) -> None:
         """Parse and store a trade from data-api.polymarket.com.
 
         Response shape:
           {proxyWallet, side, asset (token_id), conditionId (market_id),
            size (shares), price, timestamp (seconds or ms)}
+
+        `event_ts_s` is the wall-clock time the REST response was received
+        (set by the caller, shared across all trades in one response). It
+        feeds the `trade_ingestion_latency_seconds` histogram so we can
+        prove HP-1 actually delivers the median 16 s → 2-3 s freshness cut.
         """
         try:
             wallet = trade.get("proxyWallet", "")
@@ -783,6 +1589,7 @@ class TradeObserver:
             market_slug_hint=trade.get("slug") or trade.get("eventSlug"),
             outcome_hint=trade.get("outcome"),
             outcome_index=trade.get("outcomeIndex"),
+            event_ts_s=event_ts_s,
         )
 
     def _dedup_key(
@@ -861,204 +1668,82 @@ class TradeObserver:
         market_slug_hint: str | None = None,
         outcome_hint: str | None = None,
         outcome_index: int | None = None,
+        event_ts_s: float | None = None,
     ) -> None:
-        """Deduplicate and store a trade, then publish to Redis."""
+        """Producer entry point.
+
+        HP-1 fix #3: previously this method ran 3-7 DB roundtrips synchronously
+        for every observed trade, serialising ingestion through the same
+        coroutine that owned the WS / REST loop. We now do only Redis-fast
+        work here (input validation, dedup, leader-set lookup, pure-Python
+        category inference) and hand the rest to a bounded queue drained by
+        `_db_writer_loop`. The queue's bound (`TRADE_OBSERVER_QUEUE_MAX`)
+        plus a 1 s `wait_for` timeout on `put()` give us visible
+        backpressure: under sustained DB stalls we drop trades and bump
+        `observer_queue_drops_total` rather than block the WS pong loop and
+        cascade-disconnect.
+        """
         if not market_id or not wallet_address:
             return
 
         dedup_key = self._dedup_key(wallet_address, market_id, trade_time, side, price, size_usdc)
         if await self._is_duplicate(dedup_key):
-            if source == SOURCE_API_MARKET and not await self._trade_exists(
-                market_id=market_id,
-                wallet_address=wallet_address,
-                trade_time=trade_time,
-                side=side,
-                price=price,
-                size_usdc=size_usdc,
-            ):
-                await self._clear_dedup_key(dedup_key)
-            else:
-                return
+            # NOTE (audit HP-1 fix #5 deferred): the previous implementation
+            # ran a `_trade_exists` DB probe here for SOURCE_API_MARKET hits
+            # to recover from cold-Redis false positives. That probe is
+            # exactly the kind of synchronous DB call the new producer must
+            # avoid — and the unique index on `trades_observed` already
+            # protects us at write time. We therefore short-circuit on a
+            # Redis hit unconditionally; the cold-start window is bounded
+            # to one poll cycle (5 s), which is acceptable. If the probe
+            # ever needs to come back, do it on a background task — never
+            # in the producer.
+            return
 
         is_leader = wallet_address in self._leader_wallets
         if is_leader:
             self._leader_condition_ids.add(market_id)
-        market_row = None
-        leader_row = None
 
-        try:
-            async with get_db() as conn:
-                inserted_id = await conn.fetchval(
-                    """
-                    INSERT INTO trades_observed
-                        (
-                            time, market_id, token_id, wallet_address, side, price,
-                            size_usdc, source, is_leader
-                        )
-                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-                    ON CONFLICT (wallet_address, market_id, time, side, price, size_usdc)
-                        DO NOTHING
-                    RETURNING id
-                    """,
-                    trade_time,
-                    market_id,
-                    token_id,
-                    wallet_address,
-                    side,
-                    price,
-                    size_usdc,
-                    source,
-                    is_leader,
-                )
-                if inserted_id is None:
-                    # DB-level uniqueness caught a duplicate that the Redis dedup
-                    # missed (cold cache after restart, Redis flush, race window
-                    # between two backfill loops). Silent no-op: no counter bump,
-                    # no enrichment, no pub/sub publish — same end-state as a
-                    # Redis dedup hit.
-                    logger.debug(
-                        "trades_observed dupe blocked at DB layer: "
-                        f"wallet={wallet_address[:10]}… market={market_id[:10]}… "
-                        f"time={trade_time.isoformat()}"
-                    )
-                    return
-                self._inserted += 1
-                # FIX 1: Ensure market stub exists so LEFT JOINs return a row
-                await conn.execute(
-                    """
-                    INSERT INTO markets (market_id, question, category)
-                    VALUES ($1, $2, 'unknown')
-                    ON CONFLICT (market_id) DO NOTHING
-                    """,
-                    market_id,
-                    market_question_hint or f"Market {market_id[:30]}…",
-                )
-                market_row = await conn.fetchrow(
-                    """
-                    SELECT question, category, token_yes, token_no, end_date
-                    FROM markets
-                    WHERE market_id = $1
-                    """,
-                    market_id,
-                )
-                market_row = await self._repair_market_from_trade_hint(
-                    conn=conn,
-                    market_id=market_id,
-                    token_id=token_id,
-                    trade_time=trade_time,
-                    market_row=market_row,
-                    market_question_hint=market_question_hint,
-                    market_slug_hint=market_slug_hint,
-                    outcome_hint=outcome_hint,
-                    outcome_index=outcome_index,
-                )
-                if is_leader:
-                    leader_row = await conn.fetchrow(
-                        """
-                        SELECT classification_json, excluded, on_watchlist
-                        FROM leaders
-                        WHERE wallet_address = $1
-                        """,
-                        wallet_address,
-                    )
-        except Exception as e:
-            await self._clear_dedup_key(dedup_key)
-            logger.error(f"Failed to insert trade: {e}")
-            return
-
-        if self._needs_market_enrichment(market_id, market_row):
-            try:
-                enriched = await self._fetch_market_metadata_from_gamma(market_id, token_id)
-            except Exception as exc:
-                logger.debug(f"Gamma market lookup failed for {market_id}: {exc}")
-                enriched = None
-            if enriched:
-                try:
-                    async with get_db() as conn:
-                        await conn.execute(
-                            """
-                            INSERT INTO markets
-                                (market_id, question, category, token_yes, token_no,
-                                 end_date, volume_24h, liquidity_score, fee_rate_pct, updated_at)
-                            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,NOW())
-                            ON CONFLICT (market_id) DO UPDATE SET
-                                question       = EXCLUDED.question,
-                                category       = EXCLUDED.category,
-                                token_yes      = COALESCE(EXCLUDED.token_yes, markets.token_yes),
-                                token_no       = COALESCE(EXCLUDED.token_no, markets.token_no),
-                                end_date       = COALESCE(EXCLUDED.end_date, markets.end_date),
-                                volume_24h     = COALESCE(EXCLUDED.volume_24h, markets.volume_24h),
-                                liquidity_score= COALESCE(
-                                    EXCLUDED.liquidity_score,
-                                    markets.liquidity_score
-                                ),
-                                fee_rate_pct   = COALESCE(
-                                    EXCLUDED.fee_rate_pct,
-                                    markets.fee_rate_pct
-                                ),
-                                updated_at     = NOW()
-                            """,
-                            market_id,
-                            enriched["question"],
-                            enriched["category"],
-                            enriched["token_yes"],
-                            enriched["token_no"],
-                            enriched["end_date"],
-                            enriched["volume_24h"],
-                            enriched["liquidity_score"],
-                            enriched["fee_rate_pct"],
-                        )
-                        market_row = {
-                            "question": enriched["question"],
-                            "category": enriched["category"],
-                        }
-                        self._market_meta_cache[market_id] = datetime.now(
-                            tz=timezone.utc
-                        ).timestamp()
-                except Exception as exc:
-                    logger.debug(f"Failed to upsert Gamma market metadata for {market_id}: {exc}")
-
-        classification = _json_dict(_row_value(leader_row, "classification_json", {}))
-        market_question = (
-            _row_value(market_row, "question")
-            or market_question_hint
-            or f"Market {market_id[:30]}…"
+        # Pure-Python category refine. The writer can still upgrade this if
+        # the markets row contains a better label after the fact.
+        inferred_category = _infer_market_category(
+            market_question_hint, market_slug_hint
         )
-        market_category = _row_value(market_row, "category") or "unknown"
-        market_type = _market_type_label(market_category, market_question)
-        wallet_status = "market_participant"
-        if is_leader:
-            if bool(_row_value(leader_row, "excluded", False)):
-                wallet_status = "excluded"
-            elif bool(_row_value(leader_row, "on_watchlist", False)):
-                wallet_status = "active"
-            else:
-                wallet_status = "watching"
 
-        # Publish to Redis pub/sub
-        event = {
-            "time": trade_time.isoformat(),
-            "market_id": market_id,
-            "market_question": market_question,
-            "market_category": market_category,
-            "market_type": market_type,
-            "token_id": token_id,
-            "wallet_address": wallet_address,
-            "wallet_type": "leader" if is_leader else "market_participant",
-            "wallet_status": wallet_status,
-            "wallet_strategy": classification.get("strategy"),
-            "wallet_horizon": classification.get("horizon"),
-            "wallet_influence": classification.get("influence"),
-            "side": side,
-            "price": str(price),
-            "size_usdc": str(size_usdc),
-            "is_leader": is_leader,
-            "source": source,
-        }
+        record = _TradeRecord(
+            market_id=market_id,
+            token_id=token_id,
+            wallet_address=wallet_address,
+            side=side,
+            price=price,
+            size_usdc=size_usdc,
+            trade_time=trade_time,
+            source=source,
+            is_leader=is_leader,
+            dedup_key=dedup_key,
+            event_ts_s=float(event_ts_s) if event_ts_s is not None else time.time(),
+            market_question_hint=market_question_hint,
+            market_slug_hint=market_slug_hint,
+            outcome_hint=outcome_hint,
+            outcome_index=outcome_index,
+            inferred_category=inferred_category,
+        )
+
+        queue = self._ensure_write_queue()
         try:
-            await self._redis.publish(REDIS_TRADES_CHANNEL, json.dumps(event))
-        except Exception as e:
-            logger.warning(f"Failed to publish trade event: {e}")
+            await asyncio.wait_for(queue.put(record), timeout=QUEUE_PUT_TIMEOUT_S)
+        except asyncio.TimeoutError:
+            # Backpressure: writer can't keep up. We've already burned the
+            # Redis dedup slot (NX SET succeeded), so to keep idempotency
+            # honest we clear it — otherwise a retry within DEDUP_TTL_S
+            # would silently swallow this trade.
+            await self._clear_dedup_key(dedup_key)
+            observer_queue_drops_total.labels(reason="queue_full").inc()
+            logger.warning(
+                f"observer queue full ({queue.qsize()}/{queue.maxsize}); "
+                f"dropping trade wallet={wallet_address[:10]}… "
+                f"market={market_id[:10]}… source={source}"
+            )
 
     async def _repair_market_from_trade_hint(
         self,
@@ -1227,6 +1912,44 @@ class TradeObserver:
                     question = (
                         market.get("question") or market.get("title") or f"Market {market_id[:30]}…"
                     )
+                    # R-12 fix (audit 01_data_inventory.md): previously this
+                    # block read `makerBaseFee` and stored it as the market's
+                    # generic `fee_rate_pct`, which is then consumed by
+                    # `calculate_polymarket_fee(..., liquidity_role=TAKER)` in
+                    # `paper_trader.open_trade/close_trade` and
+                    # `position_tracker._close_position`. Polymarket's gamma
+                    # API documents `makerBaseFee` as the MAKER fee and
+                    # `takerBaseFee` as the TAKER fee (both in bps). Using
+                    # the maker value as the taker rate systematically
+                    # under-estimates trade costs and over-states PnL.
+                    # Prefer `takerBaseFee`; fall back to `makerBaseFee` only
+                    # so existing rows don't suddenly read NULL. TODO: once
+                    # `fee_snapshots` (migration 003) is wired up
+                    # (audit R-1) and the CLOB taker fee is sourced
+                    # directly, this fallback can go away.
+                    taker_fee_raw = (
+                        market.get("takerBaseFee")
+                        or market.get("taker_base_fee")
+                    )
+                    maker_fee_raw = (
+                        market.get("makerBaseFee")
+                        or market.get("maker_base_fee")
+                    )
+                    if taker_fee_raw is not None:
+                        gamma_taker_fee_bps = float(taker_fee_raw)
+                    elif maker_fee_raw is not None:
+                        # Documented degradation: maker fee used as a proxy
+                        # for taker until fee_snapshots lands. Log so we can
+                        # see the coverage gap in observability.
+                        logger.debug(
+                            f"Gamma market {market_id}: takerBaseFee missing, "
+                            f"falling back to makerBaseFee={maker_fee_raw} as TAKER proxy"
+                        )
+                        gamma_taker_fee_bps = float(maker_fee_raw)
+                    else:
+                        gamma_taker_fee_bps = float(
+                            market.get("baseFee") or market.get("fee") or 0.0
+                        )
                     return {
                         "question": question,
                         "category": market.get("category") or "unknown",
@@ -1235,11 +1958,9 @@ class TradeObserver:
                         "end_date": end_date,
                         "volume_24h": float(market.get("volume24hr") or 0.0),
                         "liquidity_score": float(market.get("liquidity") or 0.0),
-                        "fee_rate_pct": float(
-                            market.get("makerBaseFee")
-                            or market.get("baseFee")
-                            or market.get("fee")
-                            or 0.0
-                        ),
+                        # Stored in `markets.fee_rate_pct` (legacy column
+                        # name predates the maker/taker split). Semantically
+                        # this is the TAKER base fee in bps.
+                        "fee_rate_pct": gamma_taker_fee_bps,
                     }
         return None

@@ -4,14 +4,24 @@ Runs at BATCH_HOUR_UTC (default 3 AM UTC). Each step logs timing.
 Failed steps are logged but do not abort the batch.
 
 Usage:
-    python scripts/batch_runner.py
+    python scripts/batch_runner.py                     # normal run
+    python scripts/batch_runner.py --dry-run           # report retention impact only
+
+Retention sweep (Phase 0 Task D, audit R-6):
+    The historic `step_cleanup_old_trades` (trades_observed 90d) is now joined
+    by `step_apply_retention_policies`, which sweeps the rest of the unbounded
+    tables flagged by the audit. The sweep is OFF BY DEFAULT — set
+    RETENTION_ENABLED=true in the environment to opt in. The companion
+    migration is `docs/migrations/011_retention_policies.sql`.
 """
 
+import argparse
 import asyncio
 import os
 import sys
 import time
 from datetime import datetime, timedelta, timezone
+from typing import NamedTuple
 
 import redis.asyncio as redis_async
 from loguru import logger
@@ -134,11 +144,196 @@ async def step_cleanup_old_trades() -> None:
     logger.info(f"Cleanup: deleted old trades before {cutoff.date()}")
 
 
-async def _run_steps(redis_client, falcon: FalconClient) -> None:
+# --------------------------------------------------------------------------- #
+# Retention policies (Phase 0 Task D — audit R-6)                              #
+# --------------------------------------------------------------------------- #
+#
+# Each entry below maps an unbounded PG table to (time_column, default days).
+# The defaults are derived from per-table volume estimates in
+# docs/audit/01_data_inventory.md and are overridable via env variables of the
+# form `RETENTION_<TABLE>_DAYS`. The whole sweep is gated by
+# `RETENTION_ENABLED=true` — operator must opt in.
+#
+# Defaults rationale:
+#   * decision_log (~1-5k rows/day, dashboard reads recent window)   -> 90d
+#   * book_quality_snapshots (10-100k rows/day, highest growth)      -> 30d
+#   * portfolio_equity (~1440 rows/day, equity curve)                -> 180d
+#   * decision_state_transitions (small, used by neural readiness)   -> 90d
+#   * live_orders (0 rows today, FK CASCADE from live_trades)        -> 180d
+#   * signal_audits (0 rows — dormant)                               -> 90d
+#   * fee_snapshots (0 rows — dormant)                               -> 90d
+#   * system_control_audit (1 row per killswitch flip)               -> 365d
+#   * risk_config_history (1 row per dashboard mutation)             -> 365d
+#
+# Audit/history tables keep a longer tail because their forensic value is
+# disproportionate to their row count.
+
+DEFAULT_RETENTION_DELETE_BATCH = 10_000
+
+
+class RetentionPolicy(NamedTuple):
+    table: str
+    time_column: str
+    default_days: int
+
+
+# Order matters only for log readability — each policy runs independently.
+RETENTION_POLICIES: tuple[RetentionPolicy, ...] = (
+    RetentionPolicy("decision_log", "time", 90),
+    RetentionPolicy("book_quality_snapshots", "observed_at", 30),
+    RetentionPolicy("portfolio_equity", "time", 180),
+    RetentionPolicy("decision_state_transitions", "created_at", 90),
+    RetentionPolicy("live_orders", "placed_at", 180),
+    RetentionPolicy("signal_audits", "created_at", 90),
+    RetentionPolicy("fee_snapshots", "captured_at", 90),
+    RetentionPolicy("system_control_audit", "changed_at", 365),
+    RetentionPolicy("risk_config_history", "changed_at", 365),
+)
+
+
+def _retention_env_var(table: str) -> str:
+    """Env var name for per-table override, e.g. RETENTION_DECISION_LOG_DAYS."""
+    return f"RETENTION_{table.upper()}_DAYS"
+
+
+def _resolve_retention_days(policy: RetentionPolicy) -> int:
+    """Resolve days for a policy from env (override) or default. Invalid env
+    values fall back to the default with a warning."""
+    raw = os.getenv(_retention_env_var(policy.table))
+    if raw is None or raw == "":
+        return policy.default_days
+    try:
+        days = int(raw)
+    except ValueError:
+        logger.warning(
+            f"Retention: bad value for {_retention_env_var(policy.table)}={raw!r}, "
+            f"falling back to default {policy.default_days}"
+        )
+        return policy.default_days
+    if days <= 0:
+        logger.warning(
+            f"Retention: non-positive value for {_retention_env_var(policy.table)}={days}, "
+            f"falling back to default {policy.default_days}"
+        )
+        return policy.default_days
+    return days
+
+
+def _retention_enabled() -> bool:
+    """Default OFF. Operator must explicitly opt in via env."""
+    return os.getenv("RETENTION_ENABLED", "false").strip().lower() in ("1", "true", "yes", "on")
+
+
+async def _apply_one_retention_policy(
+    policy: RetentionPolicy,
+    *,
+    dry_run: bool,
+    batch_size: int = DEFAULT_RETENTION_DELETE_BATCH,
+    max_batches: int = 10_000,
+) -> int:
+    """Apply a single retention policy. Returns rows deleted (or rows that
+    WOULD be deleted in dry-run mode).
+
+    Implementation note: PG does not support `DELETE ... LIMIT`. We use the
+    CTID-pagination idiom (`WHERE ctid IN (SELECT ctid ... LIMIT N)`) so the
+    delete is bounded per round and we can yield back to the event loop —
+    avoiding a multi-minute lock on a big table.
+    """
+    days = _resolve_retention_days(policy)
+    cutoff = datetime.now(tz=timezone.utc) - timedelta(days=days)
+    label = f"retention[{policy.table}]"
+
+    if dry_run:
+        async with get_db() as conn:
+            count = await conn.fetchval(
+                f"SELECT COUNT(*) FROM {policy.table} WHERE {policy.time_column} < $1",
+                cutoff,
+            )
+        count = int(count or 0)
+        logger.info(
+            f"{label}: dry-run — would delete {count} rows older than "
+            f"{cutoff.isoformat()} (retention={days}d)"
+        )
+        return count
+
+    total_deleted = 0
+    rounds = 0
+    while rounds < max_batches:
+        async with get_db() as conn:
+            # CTID-based pagination: pick up to `batch_size` qualifying rows
+            # by their physical tuple id, then delete those. Guarantees the
+            # loop terminates (each round shrinks the qualifying set).
+            tag = await conn.execute(
+                f"""
+                DELETE FROM {policy.table}
+                WHERE ctid IN (
+                    SELECT ctid FROM {policy.table}
+                    WHERE {policy.time_column} < $1
+                    LIMIT {batch_size}
+                )
+                """,
+                cutoff,
+            )
+        # asyncpg returns the command tag, e.g. "DELETE 1234"
+        try:
+            deleted_this_round = int(tag.split()[-1])
+        except (AttributeError, ValueError, IndexError):
+            deleted_this_round = 0
+
+        total_deleted += deleted_this_round
+        rounds += 1
+        if deleted_this_round < batch_size:
+            break
+        # Yield to the event loop so the cleanup never monopolises the pool.
+        await asyncio.sleep(0)
+
+    logger.info(
+        f"{label}: deleted {total_deleted} rows older than {cutoff.isoformat()} "
+        f"(retention={days}d, {rounds} batch(es))"
+    )
+    return total_deleted
+
+
+async def step_apply_retention_policies(*, dry_run: bool = False) -> None:
+    """Step I: Apply per-table retention policies (audit R-6).
+
+    Gated by RETENTION_ENABLED — default false. In dry-run mode the gate is
+    bypassed so operators can inspect impact before flipping the switch.
+
+    Each policy runs independently: a failure on one table is logged but does
+    NOT abort the rest of the sweep.
+    """
+    if not dry_run and not _retention_enabled():
+        logger.info(
+            "Retention: RETENTION_ENABLED is false (default), skipping policy sweep. "
+            "Set RETENTION_ENABLED=true to opt in, or run with --dry-run to preview."
+        )
+        return
+
+    if dry_run:
+        logger.info("Retention: DRY-RUN — no rows will be deleted.")
+
+    for policy in RETENTION_POLICIES:
+        try:
+            await _apply_one_retention_policy(policy, dry_run=dry_run)
+        except Exception as e:  # noqa: BLE001 — intentional broad catch (per-policy isolation)
+            logger.error(
+                f"retention[{policy.table}]: failed — {e}. Continuing with next policy."
+            )
+
+
+async def _run_steps(
+    redis_client,
+    falcon: FalconClient,
+    *,
+    dry_run: bool = False,
+) -> None:
     """Execute the batch pipeline against already-initialised infrastructure.
 
     Safe to call from inside a long-running process (the nightly scheduler)
     because it does NOT open or close the asyncpg pool.
+
+    `dry_run` is forwarded to retention so operators can preview impact.
     """
     steps = [
         ("refresh_registry", step_refresh_registry, (falcon,)),
@@ -149,12 +344,23 @@ async def _run_steps(redis_client, falcon: FalconClient) -> None:
         ("refit_error_models", step_refit_error_models, ()),
         ("precompute_confidence_cache", step_precompute_confidence_cache, (redis_client,)),
         ("cleanup_old_trades", step_cleanup_old_trades, ()),
+        (
+            "apply_retention_policies",
+            step_apply_retention_policies,
+            (),
+            {"dry_run": dry_run},
+        ),
     ]
 
-    for name, fn, args in steps:
+    for entry in steps:
+        if len(entry) == 4:
+            name, fn, args, kwargs = entry
+        else:
+            name, fn, args = entry
+            kwargs = {}
         t0 = time.time()
         try:
-            await fn(*args)
+            await fn(*args, **kwargs)
             elapsed = time.time() - t0
             logger.info(f"Batch step '{name}' completed in {elapsed:.1f}s")
         except Exception as e:
@@ -162,13 +368,20 @@ async def _run_steps(redis_client, falcon: FalconClient) -> None:
             logger.error(f"Batch step '{name}' failed after {elapsed:.1f}s: {e}")
 
 
-async def run_batch(*, manage_infrastructure: bool = True) -> None:
+async def run_batch(
+    *,
+    manage_infrastructure: bool = True,
+    dry_run: bool = False,
+) -> None:
     """Standalone entry point.
 
     When invoked via `python scripts/batch_runner.py` (manage_infrastructure=True)
     we open/close the pool ourselves.  When the in-process scheduler calls us
     (manage_infrastructure=False) we reuse the already-open pool and only
     create short-lived redis + Falcon clients.
+
+    `dry_run=True` only affects the retention sweep (it forces a count-only
+    pass). All other steps still run normally.
     """
     if manage_infrastructure:
         await initialize_pool(
@@ -180,7 +393,7 @@ async def run_batch(*, manage_infrastructure: bool = True) -> None:
     redis_client = redis_async.from_url(settings.REDIS_URL, decode_responses=True)
     falcon = FalconClient(redis_client=redis_client)
     try:
-        await _run_steps(redis_client, falcon)
+        await _run_steps(redis_client, falcon, dry_run=dry_run)
     finally:
         if manage_infrastructure:
             await close_pool()
@@ -189,5 +402,17 @@ async def run_batch(*, manage_infrastructure: bool = True) -> None:
     logger.info("Batch run complete")
 
 
+def _parse_cli_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Polymarket bot nightly batch runner.")
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Report what retention WOULD delete without performing any DELETE. "
+             "Bypasses the RETENTION_ENABLED gate. Other batch steps still run.",
+    )
+    return parser.parse_args(argv)
+
+
 if __name__ == "__main__":
-    asyncio.run(run_batch())
+    cli_args = _parse_cli_args()
+    asyncio.run(run_batch(dry_run=cli_args.dry_run))

@@ -40,6 +40,10 @@ dependencies = [
     # archives to Cloudflare R2. Sync API — that's fine, the backup
     # service is a stand-alone process with one job/night.
     "boto3==1.34.69",
+    # Prometheus metrics (Phase 1 Task M). Single-process registry; the
+    # /metrics endpoint is scraped over LAN. See docs/audit/phase1/
+    # M_metrics_foundation.md for the full contract.
+    "prometheus-client==0.20.0",
 ]
 
 [project.optional-dependencies]

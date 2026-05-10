@@ -14,6 +14,7 @@ import aiohttp
 from loguru import logger
 
 from src.config import settings
+from src.observer.trade_observer import _market_type_label
 from src.registry.falcon_client import FalconAPIError, FalconClient
 from src.registry.models import Leader, LeaderClassification
 
@@ -344,16 +345,54 @@ class LeaderRegistry:
             except Exception:
                 end_date = None
             volume_24h = float(m.get("volume24hr") or m.get("volume_24h") or 0)
-            liquidity = float(m.get("liquidity") or 0)
             fee_rate = float(m.get("makerBaseFee") or 0)
+
+            # Phase 0 Task C fix (audit MG-3): `markets.liquidity_score`
+            # must come from Falcon agent 575 (Market Insights) — the
+            # documented source per master CLAUDE.md §6,
+            # `src/profiler/CLAUDE.md:172` and `error_model.py:83/220`.
+            # The previous implementation wrote agent 574's raw
+            # `liquidity` field, which is a USD depth, not a normalized
+            # 0–1 score, and silently desynced from the documented
+            # methodology. We now try 575 first and only fall through
+            # to 574's `liquidity` (and Gamma's `liquidity`) so the
+            # legacy callers don't lose their value when 575 is
+            # transiently unavailable. The `liquidity_score_source`
+            # column tags each row with provenance so a backfill audit
+            # can distinguish 575 / 574 / gamma rows.
+            liquidity_score: float | None = None
+            liquidity_source: str | None = None
+            try:
+                insights = await self.falcon.get_market_insights(mid)
+            except Exception as exc:  # defensive — get_market_insights swallows FalconAPIError
+                logger.debug(f"Market Insights call raised for {mid}: {exc}")
+                insights = None
+            if insights is not None:
+                liquidity_score = float(insights.liquidity_score)
+                liquidity_source = "falcon_575"
+            elif m.get("liquidity") is not None:
+                # Fallback A: agent 574's raw `liquidity` field, or the
+                # Gamma response (which uses the same field name). This
+                # is the pre-Task-C behaviour — kept as a transitional
+                # safety net so the column doesn't go NULL on every row
+                # the day agent 575 is rate-limited.
+                liquidity_score = float(m.get("liquidity") or 0)
+                liquidity_source = (
+                    "gamma" if m.get("clobTokenIds") or m.get("endDateIso") else "falcon_574"
+                )
 
             try:
                 await conn.execute(
                     """
                     INSERT INTO markets
                         (market_id, question, category, token_yes, token_no,
-                         end_date, volume_24h, liquidity_score, fee_rate_pct, updated_at)
-                    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,NOW())
+                         end_date, volume_24h, liquidity_score, fee_rate_pct,
+                         liquidity_score_updated_at, liquidity_score_source,
+                         updated_at)
+                    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,
+                            CASE WHEN $8::numeric IS NULL THEN NULL ELSE NOW() END,
+                            $10,
+                            NOW())
                     ON CONFLICT (market_id) DO UPDATE SET
                         question       = EXCLUDED.question,
                         category       = EXCLUDED.category,
@@ -361,7 +400,18 @@ class LeaderRegistry:
                         token_no       = COALESCE(EXCLUDED.token_no, markets.token_no),
                         end_date       = COALESCE(EXCLUDED.end_date, markets.end_date),
                         volume_24h     = EXCLUDED.volume_24h,
-                        liquidity_score= EXCLUDED.liquidity_score,
+                        liquidity_score= COALESCE(
+                            EXCLUDED.liquidity_score,
+                            markets.liquidity_score
+                        ),
+                        liquidity_score_updated_at = CASE
+                            WHEN EXCLUDED.liquidity_score IS NOT NULL THEN NOW()
+                            ELSE markets.liquidity_score_updated_at
+                        END,
+                        liquidity_score_source = COALESCE(
+                            EXCLUDED.liquidity_score_source,
+                            markets.liquidity_score_source
+                        ),
                         fee_rate_pct   = EXCLUDED.fee_rate_pct,
                         updated_at     = NOW()
                     """,
@@ -372,8 +422,9 @@ class LeaderRegistry:
                     token_no,
                     end_date,
                     volume_24h,
-                    liquidity,
+                    liquidity_score,
                     fee_rate,
+                    liquidity_source,
                 )
                 count += 1
             except Exception as exc:
@@ -423,6 +474,70 @@ class LeaderRegistry:
         )
         return {r["market_id"] for r in rows}
 
+    async def recategorize_unknowns(self, conn: Any, max_markets: int = 1000) -> dict:
+        """Re-run text inference on markets stuck at category='unknown'.
+
+        These are typically markets whose first trade arrived via WebSocket
+        without a question hint, so `_repair_market_from_trade_hint` short-
+        circuited and the stub stayed at 'unknown'. Once Falcon enrichment
+        or a later REST poll populates the question, the inference can
+        succeed — but only if something re-runs it. This method is that
+        retry, called once per registry cycle.
+
+        Also propagates the new category to historical trades_observed and
+        positions_reconstructed rows so wallet-centric aggregations see the
+        upgraded value immediately.
+        """
+        rows = await conn.fetch(
+            """
+            SELECT market_id, question, category
+            FROM markets
+            WHERE COALESCE(NULLIF(category, ''), 'unknown') IN ('unknown', 'none', 'null')
+              AND question IS NOT NULL
+              AND question NOT LIKE 'Market 0x%'
+            LIMIT $1
+            """,
+            max_markets,
+        )
+        upgraded = 0
+        unchanged = 0
+        for row in rows:
+            mid = row["market_id"]
+            new_cat = _market_type_label(row["category"], row["question"])
+            if new_cat == "unknown" or new_cat == (row["category"] or ""):
+                unchanged += 1
+                continue
+            try:
+                await conn.execute(
+                    "UPDATE markets SET category = $2, updated_at = NOW() WHERE market_id = $1",
+                    mid, new_cat,
+                )
+                # Backfill the denormalized columns on historical rows.
+                await conn.execute(
+                    """
+                    UPDATE trades_observed
+                    SET category = $2
+                    WHERE market_id = $1
+                      AND COALESCE(NULLIF(category, ''), 'unknown') IN ('unknown', 'none', 'null')
+                    """,
+                    mid, new_cat,
+                )
+                await conn.execute(
+                    """
+                    UPDATE positions_reconstructed
+                    SET category = $2
+                    WHERE market_id = $1
+                      AND COALESCE(NULLIF(category, ''), 'unknown') IN ('unknown', 'none', 'null')
+                    """,
+                    mid, new_cat,
+                )
+                upgraded += 1
+            except Exception as exc:
+                logger.debug(f"recategorize_unknowns failed for {mid}: {exc}")
+        if upgraded or unchanged:
+            logger.info(f"recategorize_unknowns: {upgraded} upgraded, {unchanged} still unknown")
+        return {"upgraded": upgraded, "unchanged": unchanged, "scanned": len(rows)}
+
     async def run(self) -> None:
         logger.info("LeaderRegistry started")
         while not self._stop.is_set():
@@ -433,6 +548,7 @@ class LeaderRegistry:
                     await self.refresh_leaderboard(conn)
                     await self.enrich_leaders(conn)
                     await self.sync_markets(conn)  # FIX 1
+                    await self.recategorize_unknowns(conn)
             except Exception as exc:
                 logger.exception(f"LeaderRegistry cycle error: {exc}")
 

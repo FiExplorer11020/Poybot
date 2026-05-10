@@ -37,16 +37,45 @@ def _make_decision(
 
 
 def _make_db_cm(fetchrow_return=None, execute_return=None):
-    """Return a context-manager mock that yields an asyncpg-like connection."""
+    """Return a context-manager mock that yields an asyncpg-like connection.
+
+    `conn.transaction()` returns a no-op async context manager so production
+    code wrapping multi-statement chains in `async with conn.transaction():`
+    works under unit tests.
+    """
     conn = AsyncMock()
     conn.fetchrow = AsyncMock(return_value=fetchrow_return)
     conn.execute = AsyncMock(return_value=execute_return)
+
+    @asynccontextmanager
+    async def _tx():
+        yield None
+
+    # `transaction()` is sync (returns the Transaction object); only the
+    # returned object is an async CM. Hence MagicMock, not AsyncMock.
+    conn.transaction = MagicMock(side_effect=lambda *a, **kw: _tx())
 
     @asynccontextmanager
     async def _cm():
         yield conn
 
     return _cm, conn
+
+
+def _attach_transaction(conn) -> None:
+    """Attach a no-op `transaction()` async-CM to a mock asyncpg connection.
+
+    Production code now wraps multi-statement write chains in
+    `async with conn.transaction():` — without this attachment the bare
+    AsyncMock's `transaction()` returns a coroutine, not an async CM, and
+    every test that exercises a write path explodes with TypeError.
+    """
+
+    @asynccontextmanager
+    async def _tx():
+        yield None
+
+    conn.transaction = MagicMock(side_effect=lambda *a, **kw: _tx())
 
 
 def _make_redis():
@@ -96,6 +125,7 @@ class TestOpenTrade:
 
             mock_conn.fetchrow = AsyncMock(side_effect=fetchrow)
             mock_conn.execute = AsyncMock()
+            _attach_transaction(mock_conn)
             yield mock_conn
 
         with patch("src.engine.paper_trader.get_db", _multi_cm):
@@ -213,6 +243,7 @@ class TestOpenTrade:
             else:
                 conn.fetchrow = AsyncMock(return_value={"opened_at": datetime.now(tz=timezone.utc)})
             conn.execute = AsyncMock()
+            _attach_transaction(conn)
             yield conn
 
         with patch("src.engine.paper_trader.get_db", _multi_cm):
@@ -243,6 +274,7 @@ class TestOpenTrade:
                     }
                 )
             conn.execute = AsyncMock()
+            _attach_transaction(conn)
             yield conn
 
         with patch("src.engine.paper_trader.get_db", _multi_cm):

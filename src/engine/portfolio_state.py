@@ -5,10 +5,16 @@ The PaperTrader's bankroll, peak capital, and consecutive-loss counter used to
 live only in memory, so every restart reset the P&L and broke the drawdown
 circuit breaker.  This module owns the `portfolio_state` singleton row plus
 the `portfolio_equity` time-series used by the dashboard equity curve.
+
+`save_state` and `record_equity` accept an optional `conn`; when supplied,
+they run on the caller's connection so the write can participate in an
+existing `conn.transaction()` block (see paper_trader's open/close trade
+flows). When omitted, they acquire their own pooled connection as before.
 """
 
 from __future__ import annotations
 
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
@@ -18,6 +24,20 @@ from src.config import settings
 from src.database.connection import get_db
 
 _SINGLETON_ID = 1
+
+
+@asynccontextmanager
+async def _conn_ctx(conn):
+    """Yield `conn` if provided, else acquire one from the pool.
+
+    Keeps caller code identical whether or not the connection is being
+    threaded through from an outer transaction.
+    """
+    if conn is not None:
+        yield conn
+        return
+    async with get_db() as acquired:
+        yield acquired
 
 
 @dataclass
@@ -65,11 +85,16 @@ async def load_state() -> PortfolioState:
         return PortfolioState.default()
 
 
-async def save_state(state: PortfolioState) -> None:
-    """Upsert the singleton row."""
+async def save_state(state: PortfolioState, *, conn=None) -> None:
+    """Upsert the singleton row.
+
+    If `conn` is given, the UPSERT runs on the caller's connection (and
+    therefore inside any active `conn.transaction()` it owns). Otherwise a
+    pooled connection is acquired and released here.
+    """
     try:
-        async with get_db() as conn:
-            await conn.execute(
+        async with _conn_ctx(conn) as c:
+            await c.execute(
                 """
                 INSERT INTO portfolio_state
                     (id, capital, peak_capital, realized_pnl_cum,
@@ -101,13 +126,18 @@ async def record_equity(
     realized_pnl_cum: float,
     open_positions: int,
     when: datetime | None = None,
+    conn=None,
 ) -> None:
-    """Append a mark-to-market sample to `portfolio_equity`."""
+    """Append a mark-to-market sample to `portfolio_equity`.
+
+    Pass `conn` to participate in an outer transaction; omit to acquire a
+    fresh pooled connection.
+    """
     ts = when or datetime.now(tz=timezone.utc)
     equity = capital + unrealized_pnl
     try:
-        async with get_db() as conn:
-            await conn.execute(
+        async with _conn_ctx(conn) as c:
+            await c.execute(
                 """
                 INSERT INTO portfolio_equity
                     (time, capital, equity, unrealized_pnl,

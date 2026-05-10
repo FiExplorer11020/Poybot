@@ -225,8 +225,13 @@ class PaperTrader:
                 )
             )
 
-    async def _persist_state(self) -> None:
-        """Write current in-memory state back to the singleton row."""
+    async def _persist_state(self, conn=None) -> None:
+        """Write current in-memory state back to the singleton row.
+
+        Accepts an optional `conn` so the UPSERT can run inside an outer
+        `conn.transaction()` (used by open_trade / close_trade to keep the
+        paper_trades INSERT/UPDATE atomic with the portfolio_state write).
+        """
         await save_state(
             PortfolioState(
                 capital=self._capital,
@@ -234,7 +239,8 @@ class PaperTrader:
                 realized_pnl_cum=self._realized_pnl_cum,
                 consecutive_losses=self._consecutive_losses_from_risk(),
                 open_positions=len(self._open_trades),
-            )
+            ),
+            conn=conn,
         )
 
     def _consecutive_losses_from_risk(self) -> int:
@@ -256,8 +262,12 @@ class PaperTrader:
             total += pct * trade.size_usdc
         return round(total, 2)
 
-    async def _record_equity_sample(self) -> None:
-        """Take a mark-to-market snapshot and store it in `portfolio_equity`."""
+    async def _record_equity_sample(self, conn=None) -> None:
+        """Take a mark-to-market snapshot and store it in `portfolio_equity`.
+
+        Accepts an optional `conn` so the INSERT can participate in an outer
+        transaction; otherwise a fresh pooled connection is used.
+        """
         try:
             unrealized = await self._compute_unrealized_pnl()
             await record_equity(
@@ -265,6 +275,7 @@ class PaperTrader:
                 unrealized_pnl=unrealized,
                 realized_pnl_cum=self._realized_pnl_cum,
                 open_positions=len(self._open_trades),
+                conn=conn,
             )
         except Exception as exc:
             logger.debug(f"equity sample skipped: {exc}")
@@ -492,41 +503,17 @@ class PaperTrader:
 
         now = datetime.now(tz=timezone.utc)
 
-        try:
-            async with get_db() as conn:
-                row = await conn.fetchrow(
-                    """
-                    INSERT INTO paper_trades
-                        (opened_at, market_id, token_id, direction, entry_price, size_usdc,
-                         fee_paid_usdc, strategy, leader_wallet, leader_context, confidence, status,
-                         strategy_track, economic_model_version, size_shares, entry_fee_usdc)
-                    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10::jsonb,$11,'open',$12,$13,$14,$15)
-                    RETURNING id
-                    """,
-                    now,
-                    market_id,
-                    actual_token_id,
-                    direction,
-                    entry_price,
-                    size_usdc,
-                    entry_fee,
-                    strategy,
-                    leader_wallet,
-                    json.dumps(decision),
-                    confidence,
-                    strategy_track,
-                    ECONOMIC_MODEL_VERSION,
-                    size_shares,
-                    entry_fee,
-                )
-                trade_id = row["id"]
-        except Exception as e:
-            logger.error(f"Failed to open paper trade: {e}")
-            return None
-
+        # F-01 fix: the paper_trades INSERT and the portfolio_state UPSERT
+        # (which encodes the bankroll deduction triggered by this open) must
+        # commit atomically. Without a transaction wrapper, a crash between
+        # the INSERT and `_persist_state()` would leave an "open" row in
+        # paper_trades while portfolio_state still reflects the pre-trade
+        # bankroll. We update the in-memory `_capital` / `_open_trades` BEFORE
+        # the persist so the UPSERT carries the post-trade values, and only
+        # commit them in Python after the DB transaction succeeds.
         self._capital -= size_usdc
         open_trade = OpenPaperTrade(
-            id=trade_id,
+            id=0,  # populated after the INSERT returns
             market_id=market_id,
             token_id=actual_token_id,
             direction=direction,
@@ -545,9 +532,47 @@ class PaperTrader:
         )
         self._open_trades.append(open_trade)
 
-        # Persistence: bankroll + open_positions moved; equity should reflect it.
-        await self._persist_state()
-        await self._record_equity_sample()
+        try:
+            async with get_db() as conn:
+                async with conn.transaction():
+                    row = await conn.fetchrow(
+                        """
+                        INSERT INTO paper_trades
+                            (opened_at, market_id, token_id, direction, entry_price, size_usdc,
+                             fee_paid_usdc, strategy, leader_wallet, leader_context, confidence, status,
+                             strategy_track, economic_model_version, size_shares, entry_fee_usdc)
+                        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10::jsonb,$11,'open',$12,$13,$14,$15)
+                        RETURNING id
+                        """,
+                        now,
+                        market_id,
+                        actual_token_id,
+                        direction,
+                        entry_price,
+                        size_usdc,
+                        entry_fee,
+                        strategy,
+                        leader_wallet,
+                        json.dumps(decision),
+                        confidence,
+                        strategy_track,
+                        ECONOMIC_MODEL_VERSION,
+                        size_shares,
+                        entry_fee,
+                    )
+                    trade_id = row["id"]
+                    open_trade.id = trade_id
+                    # Persistence: bankroll + open_positions are part of the
+                    # same atomic unit as the paper_trades INSERT.
+                    await self._persist_state(conn=conn)
+                    await self._record_equity_sample(conn=conn)
+        except Exception as e:
+            # Roll the in-memory bookkeeping back so we don't leak phantom
+            # state when the DB write failed.
+            self._open_trades = [t for t in self._open_trades if t is not open_trade]
+            self._capital += size_usdc
+            logger.error(f"Failed to open paper trade: {e}")
+            return None
 
         logger.info(
             f"Opened paper {strategy} trade #{trade_id} on {market_id}: "
@@ -607,57 +632,83 @@ class PaperTrader:
         pnl_pct = float(pnl.pnl_pct)
 
         now = datetime.now(tz=timezone.utc)
+        outcome = "win" if pnl_usdc > 0 else "loss"
+        # F-01 fix: paper_trades UPDATE, decision_log UPDATE, and the
+        # portfolio_state UPSERT must commit as one unit. Previously the two
+        # UPDATEs lived in the same `async with get_db()` block but ran
+        # under asyncpg's per-statement autocommit, so a crash between them
+        # left the trade marked closed with decision_log.outcome still NULL.
+        # We mutate in-memory bookkeeping AFTER the transaction succeeds so
+        # nothing leaks out on rollback.
         try:
             async with get_db() as conn:
-                await conn.execute(
-                    """
-                    UPDATE paper_trades
-                    SET closed_at=$2,
-                        exit_price=$3,
-                        pnl_usdc=$4,
-                        status='closed',
-                        close_reason=$5,
-                        exit_fee_usdc=$6,
-                        gross_pnl_usdc=$7,
-                        net_pnl_usdc=$8,
-                        economic_model_version=$9
-                    WHERE id=$1
-                    """,
-                    trade_id,
-                    now,
-                    exit_price,
-                    round(pnl_usdc, 2),
-                    close_reason,
-                    exit_fee,
-                    gross_pnl_usdc,
-                    pnl_usdc,
-                    trade.economic_model_version,
-                )
-
-                # --- FIX 2: Update decision_log.outcome ---
-                outcome = "win" if pnl_usdc > 0 else "loss"
-                await conn.execute(
-                    """
-                    UPDATE decision_log SET outcome = $3
-                    WHERE id = (
-                        SELECT id FROM decision_log
-                        WHERE leader_wallet = $1 AND market_id = $2
-                          AND outcome IS NULL AND action IN ('follow', 'fade')
-                        ORDER BY time DESC LIMIT 1
+                async with conn.transaction():
+                    await conn.execute(
+                        """
+                        UPDATE paper_trades
+                        SET closed_at=$2,
+                            exit_price=$3,
+                            pnl_usdc=$4,
+                            status='closed',
+                            close_reason=$5,
+                            exit_fee_usdc=$6,
+                            gross_pnl_usdc=$7,
+                            net_pnl_usdc=$8,
+                            economic_model_version=$9
+                        WHERE id=$1
+                        """,
+                        trade_id,
+                        now,
+                        exit_price,
+                        round(pnl_usdc, 2),
+                        close_reason,
+                        exit_fee,
+                        gross_pnl_usdc,
+                        pnl_usdc,
+                        trade.economic_model_version,
                     )
-                    """,
-                    trade.leader_wallet,
-                    trade.market_id,
-                    outcome,
-                )
+
+                    # --- FIX 2: Update decision_log.outcome ---
+                    await conn.execute(
+                        """
+                        UPDATE decision_log SET outcome = $3
+                        WHERE id = (
+                            SELECT id FROM decision_log
+                            WHERE leader_wallet = $1 AND market_id = $2
+                              AND outcome IS NULL AND action IN ('follow', 'fade')
+                            ORDER BY time DESC LIMIT 1
+                        )
+                        """,
+                        trade.leader_wallet,
+                        trade.market_id,
+                        outcome,
+                    )
+
+                    # Update in-memory bookkeeping inside the transaction so
+                    # the portfolio_state UPSERT below sees the post-close
+                    # bankroll. If the transaction rolls back we restore the
+                    # original snapshot in the except block.
+                    prev_open_trades = list(self._open_trades)
+                    prev_capital = self._capital
+                    prev_peak = self._peak_capital
+                    prev_realized = self._realized_pnl_cum
+                    self._open_trades = [t for t in self._open_trades if t.id != trade_id]
+                    self._capital += trade.size_usdc + pnl_usdc
+                    self._peak_capital = max(self._peak_capital, self._capital)
+                    self._realized_pnl_cum += pnl_usdc
+
+                    await self._persist_state(conn=conn)
+                    await self._record_equity_sample(conn=conn)
         except Exception as e:
+            # Restore the pre-close snapshot if anything in the transaction
+            # raised — names only exist if we got that far, hence the guard.
+            if "prev_open_trades" in locals():
+                self._open_trades = prev_open_trades
+                self._capital = prev_capital
+                self._peak_capital = prev_peak
+                self._realized_pnl_cum = prev_realized
             logger.error(f"Failed to close paper trade #{trade_id}: {e}")
             return False
-
-        self._open_trades = [t for t in self._open_trades if t.id != trade_id]
-        self._capital += trade.size_usdc + pnl_usdc
-        self._peak_capital = max(self._peak_capital, self._capital)
-        self._realized_pnl_cum += pnl_usdc
 
         learning_feedback = {"reason_codes": [], "penalty": 0.0}
         if self._confidence_engine is not None:
@@ -724,10 +775,9 @@ class PaperTrader:
         except Exception:
             pass
 
-        # Persistence: save singleton state + equity sample on every close so
-        # bankroll, peak, and realized PnL survive restarts.
-        await self._persist_state()
-        await self._record_equity_sample()
+        # `_persist_state` + `_record_equity_sample` already ran inside the
+        # `conn.transaction()` above so bankroll/peak/realized PnL are
+        # already durable. Skipping a second round-trip here.
 
         logger.info(
             f"Closed paper trade #{trade_id}: pnl={pnl_usdc:.2f} "

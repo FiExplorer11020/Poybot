@@ -1,5 +1,10 @@
 """
 Unit tests for src/observer/trade_observer.py
+
+Phase 1 Task O note: `_process_trade` is now a producer that enqueues onto
+`obs._write_queue`; the actual DB insert happens in `_db_writer_loop`. Tests
+that need to assert post-insert state must call `await obs._writer_run_once()`
+to drain the queue synchronously through the writer's batch path.
 """
 
 import json
@@ -28,16 +33,67 @@ def _make_redis_mock(duplicate: bool = False):
 
 
 def _make_conn(*, trade_insert_id: int | None = 1):
-    """Build a fake asyncpg conn.
+    """Build a fake asyncpg conn for the Phase 1 batched writer.
 
-    `trade_insert_id` is the value `fetchval(...)` returns for the trades_observed
-    INSERT … ON CONFLICT … RETURNING id call. Set to None to simulate a DB-level
-    duplicate (the new S1.3 idempotency safety net).
+    The writer issues:
+      - `executemany(markets stub upsert, [...])`
+      - `fetch(SELECT category FROM markets WHERE market_id = ANY($1))`
+      - `fetch(multi-row INSERT trades_observed ... RETURNING natural_key)`
+      - `fetch(SELECT FROM leaders WHERE wallet_address = ANY($1))`
+      - `fetchrow(SELECT FROM markets WHERE market_id=$1)` per inserted row
+      - `execute(UPDATE trades_observed SET category)` per refined row
+
+    `trade_insert_id` controls what the multi-row INSERT … RETURNING fetch
+    yields back. `1` → every record in the batch maps to a row with id=1
+    (i.e. inserted). `None` → empty result set, simulating a DB-level dupe
+    that ON CONFLICT DO NOTHING swallowed.
     """
     conn = AsyncMock()
     conn.fetchrow = AsyncMock(return_value=None)
     conn.execute = AsyncMock()
+    conn.executemany = AsyncMock()
     conn.fetchval = AsyncMock(return_value=trade_insert_id)
+
+    @asynccontextmanager
+    async def _tx():
+        yield None
+
+    conn.transaction = MagicMock(side_effect=lambda *a, **kw: _tx())
+
+    # Smart `fetch`: dispatch based on the SQL string so tests can use this
+    # one mock for all three fetch sites in the writer's atomic batch path.
+    async def _fetch(sql: str, *args):
+        if "FROM trades_observed" in sql or "INSERT INTO trades_observed" in sql:
+            # Multi-row INSERT … RETURNING. Synthesize one returned row per
+            # INSERT VALUES tuple in `args` so the writer thinks every
+            # record was inserted (or none, if trade_insert_id is None).
+            if trade_insert_id is None:
+                return []
+            # Each VALUES tuple has 10 positional params:
+            # (time, market_id, token_id, wallet, side, price, size, source, is_leader, category)
+            rows: list[dict] = []
+            for i in range(0, len(args), 10):
+                chunk = args[i : i + 10]
+                if len(chunk) < 10:
+                    break
+                rows.append({
+                    "id": trade_insert_id,
+                    "wallet_address": chunk[3],
+                    "market_id": chunk[1],
+                    "time": chunk[0],
+                    "side": chunk[4],
+                    "price": chunk[5],
+                    "size_usdc": chunk[6],
+                })
+            return rows
+        if "NULLIF(category" in sql or "FROM markets" in sql:
+            # Initial-category lookup: empty = "all unknown".
+            return []
+        if "FROM leaders" in sql:
+            return []
+        return []
+
+    conn.fetch = AsyncMock(side_effect=_fetch)
     return conn
 
 
@@ -88,6 +144,11 @@ _LEADER_WALLET = "0xleader1"
 
 @pytest.mark.asyncio
 async def test_process_trade_inserts_to_db():
+    """Phase 1 Task O: `_process_trade` now enqueues. The actual INSERT
+    happens in `_writer_run_once()`'s batched path via `conn.fetch` on a
+    multi-row VALUES INSERT … RETURNING (asyncpg's `executemany` doesn't
+    return rows). We assert on the SQL string emitted by that fetch.
+    """
     obs, redis, _ = _make_observer(leader_wallets={_LEADER_WALLET})
     conn = _make_conn()
 
@@ -102,11 +163,16 @@ async def test_process_trade_inserts_to_db():
             trade_time=_TRADE_TIME,
             source="websocket",
         )
+        # Drain the queue through the writer's batch path.
+        await obs._writer_run_once()
 
-    # The trade insert now goes through fetchval (RETURNING id pattern).
-    conn.fetchval.assert_awaited_once()
-    insert_sql = conn.fetchval.call_args_list[0].args[0]
-    assert "INSERT INTO trades_observed" in insert_sql
+    # Find the multi-row INSERT call in the fetch history.
+    insert_calls = [
+        c for c in conn.fetch.call_args_list
+        if "INSERT INTO trades_observed" in c.args[0]
+    ]
+    assert insert_calls, "writer did not run a trades_observed INSERT"
+    insert_sql = insert_calls[0].args[0]
     assert "ON CONFLICT" in insert_sql
     assert "DO NOTHING" in insert_sql
     assert "RETURNING id" in insert_sql
@@ -120,6 +186,9 @@ async def test_process_trade_inserts_to_db():
 
 @pytest.mark.asyncio
 async def test_process_trade_deduplicates():
+    """Redis dedup hit must short-circuit BEFORE the trade is enqueued —
+    the producer never touches the DB or the queue on a dedup hit.
+    """
     obs, redis, _ = _make_observer(duplicate=True)
     conn = _make_conn()
 
@@ -135,9 +204,11 @@ async def test_process_trade_deduplicates():
             source="websocket",
         )
 
-    # Redis dedup short-circuits before any DB call (fast path).
+    # Producer is Redis-fast — no DB calls and nothing in the queue.
     conn.execute.assert_not_awaited()
     conn.fetchval.assert_not_awaited()
+    conn.fetch.assert_not_awaited()
+    assert obs._write_queue is None or obs._write_queue.qsize() == 0
     assert obs.inserted_count == 0
 
 
@@ -148,11 +219,12 @@ async def test_process_trade_deduplicates():
 
 @pytest.mark.asyncio
 async def test_process_trade_db_layer_dedup_short_circuits():
-    """Simulate Redis NOT catching a dupe (cold cache / flush) and the unique
-    constraint in trades_observed catching it instead. fetchval returns None,
-    which means ON CONFLICT DO NOTHING swallowed the row. We must not bump the
-    inserted counter, must not publish to Redis, and must not run any of the
-    market-enrichment side effects.
+    """Phase 1 Task O update: the writer's batched RETURNING query yields
+    no rows (simulating ON CONFLICT DO NOTHING swallowing the trade).
+    Expectations: no per-row enrichment, no leader fetch, no pub/sub
+    publish, no inserted-counter bump. The markets stub upsert + initial-
+    category fetch + the multi-row INSERT itself still run because they're
+    batch-level setup that fires whether or not any individual row commits.
     """
     obs, redis, _ = _make_observer(leader_wallets={_LEADER_WALLET})
     conn = _make_conn(trade_insert_id=None)  # <-- DB says "dupe"
@@ -168,10 +240,22 @@ async def test_process_trade_db_layer_dedup_short_circuits():
             trade_time=_TRADE_TIME,
             source="websocket",
         )
+        await obs._writer_run_once()
 
-    conn.fetchval.assert_awaited_once()
-    # No market stub insert, no fetchrow for market/leader, no enrichment write.
-    conn.execute.assert_not_awaited()
+    # Markets stub upsert runs as `executemany` (batched).
+    assert conn.executemany.await_count >= 1
+    stub_sql = conn.executemany.call_args_list[0].args[0]
+    assert "INSERT INTO markets" in stub_sql
+    assert "ON CONFLICT (market_id) DO NOTHING" in stub_sql
+
+    # The multi-row INSERT into trades_observed ran (returned no rows).
+    insert_calls = [
+        c for c in conn.fetch.call_args_list
+        if "INSERT INTO trades_observed" in c.args[0]
+    ]
+    assert len(insert_calls) == 1
+
+    # No per-row enrichment, no publish, no counter bump.
     conn.fetchrow.assert_not_awaited()
     redis.publish.assert_not_awaited()
     assert obs.inserted_count == 0
@@ -184,20 +268,40 @@ async def test_process_trade_db_layer_dedup_short_circuits():
 
 @pytest.mark.asyncio
 async def test_is_leader_flagged_correctly():
+    """Phase 1 Task O: capture is_leader from the multi-row INSERT params
+    that the writer sends to `conn.fetch`. Each VALUES tuple has 10
+    positional params; is_leader is at index 8 (0-based) within each tuple.
+    """
     obs, redis, _ = _make_observer(leader_wallets={_LEADER_WALLET})
     conn = _make_conn()
 
-    # Capture the trade-insert positional args via fetchval (the new code path
-    # for `INSERT INTO trades_observed … RETURNING id`).
-    captured_args: list = []
+    captured: list = []
 
-    async def capture_fetchval(sql, *args):
-        captured_args.extend(args)
-        return 1  # behave like a real successful insert
+    async def capture_fetch(sql, *args):
+        if "INSERT INTO trades_observed" in sql:
+            captured.append(args)
+            # Synthesize one returned row per VALUES tuple so the writer
+            # still bumps `inserted_count` for downstream assertions.
+            rows: list[dict] = []
+            for i in range(0, len(args), 10):
+                chunk = args[i : i + 10]
+                if len(chunk) < 10:
+                    break
+                rows.append({
+                    "id": 1,
+                    "wallet_address": chunk[3],
+                    "market_id": chunk[1],
+                    "time": chunk[0],
+                    "side": chunk[4],
+                    "price": chunk[5],
+                    "size_usdc": chunk[6],
+                })
+            return rows
+        return []
 
-    conn.fetchval = AsyncMock(side_effect=capture_fetchval)
+    conn.fetch = AsyncMock(side_effect=capture_fetch)
 
-    # Leader wallet
+    # Leader wallet — single-record batch.
     with _mock_get_db(conn):
         await obs._process_trade(
             market_id=_MARKET,
@@ -209,13 +313,17 @@ async def test_is_leader_flagged_correctly():
             trade_time=_TRADE_TIME,
             source="websocket",
         )
+        await obs._writer_run_once()
 
-    # is_leader is the 9th positional arg ($9)
-    assert captured_args[8] is True  # is_leader=True for leader wallet
+    # First captured INSERT call's args: (time, market_id, token_id,
+    # wallet, side, price, size, source, is_leader, category) repeated
+    # per VALUES tuple. Single-record batch → 10 args → is_leader at [8].
+    assert captured, "writer never sent the trades_observed INSERT"
+    assert captured[0][8] is True  # is_leader=True for leader wallet
 
-    # Reset
+    # Reset for non-leader trade.
     redis.set = AsyncMock(return_value=True)
-    captured_args.clear()
+    captured.clear()
 
     with _mock_get_db(conn):
         await obs._process_trade(
@@ -228,8 +336,10 @@ async def test_is_leader_flagged_correctly():
             trade_time=_TRADE_TIME,
             source="websocket",
         )
+        await obs._writer_run_once()
 
-    assert captured_args[8] is False  # is_leader=False for unknown wallet
+    assert captured, "writer never sent the trades_observed INSERT (non-leader)"
+    assert captured[0][8] is False  # is_leader=False for unknown wallet
 
 
 # ---------------------------------------------------------------------------
@@ -253,6 +363,7 @@ async def test_process_trade_publishes_to_redis():
             trade_time=_TRADE_TIME,
             source="websocket",
         )
+        await obs._writer_run_once()
 
     redis.publish.assert_awaited_once()
     channel, payload = redis.publish.call_args[0]
@@ -297,10 +408,20 @@ async def test_backfill_from_falcon():
 
     with _mock_get_db(conn):
         await obs._backfill_from_falcon()
+        # Drain any enqueued records — the Falcon path enqueues 2 records
+        # which fit in a single batch.
+        await obs._writer_run_once()
 
     assert falcon.query.await_count == 1
-    # 2 trades → 2 trades_observed inserts via fetchval.
-    assert conn.fetchval.await_count == 2
+    # The writer's batched INSERT runs once for both records.
+    insert_calls = [
+        c for c in conn.fetch.call_args_list
+        if "INSERT INTO trades_observed" in c.args[0]
+    ]
+    assert len(insert_calls) == 1
+    # The single multi-row INSERT carries 2 records × 10 args each = 20.
+    assert len(insert_calls[0].args) == 21  # +1 for the SQL string
+    assert obs.inserted_count == 2
 
 
 # ---------------------------------------------------------------------------
@@ -395,10 +516,16 @@ async def test_handle_ws_message_parses_trade():
 
     with _mock_get_db(conn):
         await obs._handle_ws_message(msg)
+        await obs._writer_run_once()
 
-    # Trade insert is fetchval (RETURNING id); markets stub is execute.
-    conn.fetchval.assert_awaited()
-    assert conn.execute.await_count >= 1
+    # Phase 1 Task O: trade insert is now `conn.fetch` on a multi-row
+    # VALUES INSERT … RETURNING; markets stub is `conn.executemany`.
+    insert_calls = [
+        c for c in conn.fetch.call_args_list
+        if "INSERT INTO trades_observed" in c.args[0]
+    ]
+    assert insert_calls
+    assert conn.executemany.await_count >= 1
 
 
 # ---------------------------------------------------------------------------
@@ -433,12 +560,22 @@ async def test_process_falcon_trade_ms_timestamp():
     conn = _make_conn()
     captured: list = []
 
-    async def capture(sql, *args):
-        captured.extend(args)
-        return 1  # simulate successful insert (RETURNING id)
+    async def capture_fetch(sql, *args):
+        if "INSERT INTO trades_observed" in sql:
+            captured.extend(args)
+            # Synthesize one returned row so the writer publishes downstream.
+            return [{
+                "id": 1,
+                "wallet_address": args[3],
+                "market_id": args[1],
+                "time": args[0],
+                "side": args[4],
+                "price": args[5],
+                "size_usdc": args[6],
+            }]
+        return []
 
-    # Trade insert path is fetchval now.
-    conn.fetchval = AsyncMock(side_effect=capture)
+    conn.fetch = AsyncMock(side_effect=capture_fetch)
 
     trade = {
         "market_id": _MARKET,
@@ -451,9 +588,10 @@ async def test_process_falcon_trade_ms_timestamp():
 
     with _mock_get_db(conn):
         await obs._process_falcon_trade(trade, _LEADER_WALLET)
+        await obs._writer_run_once()
 
-    conn.fetchval.assert_awaited_once()
-    # captured[0] is trade_time (the first $-arg after the SQL string).
+    assert captured, "writer never sent the INSERT"
+    # captured[0] is trade_time (first $-arg of the VALUES tuple).
     trade_time: datetime = captured[0]
     assert trade_time.tzinfo is not None
     # 1700000000000 ms = 1700000000 s → 2023-11-14T22:13:20Z
@@ -471,11 +609,21 @@ async def test_process_falcon_trade_s_timestamp():
     conn = _make_conn()
     captured: list = []
 
-    async def capture(sql, *args):
-        captured.extend(args)
-        return 1
+    async def capture_fetch(sql, *args):
+        if "INSERT INTO trades_observed" in sql:
+            captured.extend(args)
+            return [{
+                "id": 1,
+                "wallet_address": args[3],
+                "market_id": args[1],
+                "time": args[0],
+                "side": args[4],
+                "price": args[5],
+                "size_usdc": args[6],
+            }]
+        return []
 
-    conn.fetchval = AsyncMock(side_effect=capture)
+    conn.fetch = AsyncMock(side_effect=capture_fetch)
 
     trade = {
         "market_id": _MARKET,
@@ -488,8 +636,9 @@ async def test_process_falcon_trade_s_timestamp():
 
     with _mock_get_db(conn):
         await obs._process_falcon_trade(trade, _LEADER_WALLET)
+        await obs._writer_run_once()
 
-    conn.fetchval.assert_awaited_once()
+    assert captured
     trade_time: datetime = captured[0]
     assert trade_time.tzinfo is not None
     # 1700000000 s → 2023-11-14T22:13:20Z

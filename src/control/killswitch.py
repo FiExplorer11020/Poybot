@@ -86,15 +86,27 @@ class KillswitchService:
 
     # ------------------ public read API ------------------ #
 
-    async def get_state(self) -> KillswitchState:
+    async def get_state(self, *, bypass_cache: bool = False) -> KillswitchState:
         """
-        Returns the current killswitch state. Reads Redis cache first, falls
-        back to DB on miss. On infra failure, returns a SAFE state (everything
-        off) and logs the error.
+        Returns the current killswitch state.
+
+        By default, reads Redis cache first and falls back to DB on miss
+        (fast path, ~µs on hit). On infra failure, returns a SAFE state
+        (everything off) and logs the error.
+
+        ``bypass_cache=True`` skips the cache read and goes straight to
+        the DB. This closes the up-to-TTL_S leak window between a flip
+        committing in Postgres and the cache being refreshed (see
+        audit finding F-05). After a successful DB read the cache is
+        repopulated so subsequent fast-path readers also see the fresh
+        value as soon as possible. Use this on the live-trade gate;
+        keep the cache fast path for dashboard reads, paper trading
+        and the master-switch check in RiskManager.
         """
-        cached = await self._read_cache()
-        if cached is not None:
-            return cached
+        if not bypass_cache:
+            cached = await self._read_cache()
+            if cached is not None:
+                return cached
 
         try:
             state = await self._read_db()
@@ -102,15 +114,27 @@ class KillswitchService:
             logger.error(f"killswitch: DB read failed, defaulting to SAFE off: {e}")
             return _safe_off_state(reason=f"infra_failure:{e.__class__.__name__}")
 
+        # Refresh the cache regardless of which path we took. On
+        # bypass_cache=True this shortens the stale window for the next
+        # fast-path reader.
         await self._write_cache(state)
         return state
 
-    async def is_execution_enabled(self) -> bool:
-        state = await self.get_state()
+    async def is_execution_enabled(self, *, bypass_cache: bool = False) -> bool:
+        state = await self.get_state(bypass_cache=bypass_cache)
         return state.execution_enabled
 
-    async def is_real_execution_enabled(self) -> bool:
-        state = await self.get_state()
+    async def is_real_execution_enabled(self, *, bypass_cache: bool = False) -> bool:
+        """Returns True iff BOTH the master switch and the real-execution
+        switch are on.
+
+        Callers about to place a real (non-shadow, non-paper) order via
+        ``py-clob-client`` MUST pass ``bypass_cache=True`` so a flip is
+        observed within one DB roundtrip rather than within the cache
+        TTL (audit F-05). The dashboard/Telegram read paths can leave
+        the default to keep Redis absorbing the hot read load.
+        """
+        state = await self.get_state(bypass_cache=bypass_cache)
         # Real execution requires BOTH the master switch AND the real-specific switch.
         return state.execution_enabled and state.real_execution_enabled
 

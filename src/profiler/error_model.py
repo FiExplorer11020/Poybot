@@ -80,7 +80,11 @@ class ErrorModel:
             is_contrarian   bool  — whether the trade goes against recent price momentum
             deviation_score float — how much the trade deviates from leader's typical behaviour
             size_ratio      float — current size / typical EWMA size
-            liquidity_score float — from Falcon Market Insights (agent 575)
+            liquidity_score float — from Falcon Market Insights (agent 575),
+                                  written to `markets.liquidity_score` by
+                                  `LeaderRegistry.sync_markets` (Phase 0 Task C
+                                  fix for audit MG-3). May be NULL/0.5 default
+                                  when 575 is unavailable.
         """
         phase, profile, model_blob = await self._load_state(wallet)
         drift_alert = self._cusum_state.get(wallet, 0.0) > CUSUM_THRESHOLD
@@ -217,7 +221,8 @@ class ErrorModel:
           [1] is_contrarian    — 0.0 or 1.0
           [2] deviation_score  — float in [0, 1]
           [3] size_ratio       — current size / typical EWMA size
-          [4] liquidity_score  — from Falcon agent 575
+          [4] liquidity_score  — from Falcon agent 575 (Market Insights);
+                                 sourced via `LeaderRegistry.sync_markets`
           [5] process_score
           [6] flip_rate
           [7] scale_in_rate
@@ -485,6 +490,21 @@ class ErrorModel:
                         pr.size_usdc,
                         pr.pnl_usdc,
                         COALESCE(m.category, 'unknown') AS category,
+                        -- LEAKAGE: liquidity_score is the CURRENT
+                        -- markets.liquidity_score, not the as-of-trade-time
+                        -- value. A market that became liquid two weeks
+                        -- AFTER `pr.open_time` will look liquid in
+                        -- training but was illiquid at decision time.
+                        -- Phase 0 Task C (audit MG-3, docs/audit/05_ml_pipeline.md §3.1)
+                        -- adds `markets.liquidity_score_updated_at` so a
+                        -- future as-of read path becomes possible; the
+                        -- proper fix is a `market_liquidity_history`
+                        -- table fed by `sync_markets` and queried via
+                        -- `WHERE ts <= pr.open_time ORDER BY ts DESC LIMIT 1`.
+                        -- Tracked as Phase 3 feature-store work. Until
+                        -- then we accept the leakage rather than
+                        -- silently NULL-ing the feature, which would
+                        -- regress phase-2/3 training samples.
                         COALESCE(m.liquidity_score, 0.5) AS liquidity_score,
                         (
                             SELECT AVG(recent.price) FROM (

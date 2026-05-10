@@ -6,7 +6,12 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from src.registry.falcon_client import FalconAPIError, FalconClient
-from src.registry.models import FalconLeaderEntry, PnlLeaderEntry, WalletMetrics
+from src.registry.models import (
+    FalconLeaderEntry,
+    MarketInsights,
+    PnlLeaderEntry,
+    WalletMetrics,
+)
 
 
 def _make_client(redis=None) -> FalconClient:
@@ -312,6 +317,75 @@ class TestFalconClientQuery:
             result = await client.query(584, {})
 
         assert result == data
+
+    @pytest.mark.asyncio
+    async def test_get_market_insights_returns_score_from_agent_575(self):
+        """Phase 0 Task C / audit MG-3: get_market_insights must call
+        agent 575 with the condition_id and return the normalized
+        liquidity_score from the response."""
+        client = _make_client()
+        raw = [{"condition_id": "0xmkt", "liquidity_score": 0.62}]
+        with patch.object(client, "query", new=AsyncMock(return_value=raw)) as mock_query:
+            result = await client.get_market_insights("0xmkt")
+        assert isinstance(result, MarketInsights)
+        assert result.liquidity_score == 0.62
+        mock_query.assert_awaited_once_with(575, {"condition_id": "0xmkt"}, limit=1)
+
+    @pytest.mark.asyncio
+    async def test_get_market_insights_falls_back_to_slug(self):
+        """When condition_id returns no rows, agent 575 is retried with
+        market_slug — mirrors the 574 fallback pattern in sync_markets."""
+        client = _make_client()
+
+        async def fake_query(agent_id, params, limit=100, offset=0):
+            if params.get("condition_id"):
+                return []
+            if params.get("market_slug"):
+                return [{"liquidity_score": 0.31}]
+            return []
+
+        with patch.object(client, "query", new=AsyncMock(side_effect=fake_query)):
+            result = await client.get_market_insights("some-slug")
+        assert result is not None
+        assert result.liquidity_score == 0.31
+
+    @pytest.mark.asyncio
+    async def test_get_market_insights_returns_none_on_empty(self):
+        client = _make_client()
+        with patch.object(client, "query", new=AsyncMock(return_value=[])):
+            result = await client.get_market_insights("0xmkt")
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_get_market_insights_returns_none_on_falcon_error(self):
+        """Transient Falcon failures must not break sync_markets — the
+        caller is expected to fall back to agent 574's `liquidity`."""
+        client = _make_client()
+        with patch.object(
+            client, "query", new=AsyncMock(side_effect=FalconAPIError("575 down"))
+        ):
+            result = await client.get_market_insights("0xmkt")
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_get_market_insights_clamps_score_to_unit_interval(self):
+        """USD-denominated depth payloads must be squashed to [0,1] so
+        `_build_features` slot [4] stays in range."""
+        client = _make_client()
+        raw = [{"condition_id": "0xmkt", "liquidity_score": 1_000_000.0}]
+        with patch.object(client, "query", new=AsyncMock(return_value=raw)):
+            result = await client.get_market_insights("0xmkt")
+        assert result is not None
+        assert 0.0 <= result.liquidity_score <= 1.0
+
+    @pytest.mark.asyncio
+    async def test_get_market_insights_clamps_negative_score(self):
+        client = _make_client()
+        raw = [{"condition_id": "0xmkt", "liquidity_score": -5.0}]
+        with patch.object(client, "query", new=AsyncMock(return_value=raw)):
+            result = await client.get_market_insights("0xmkt")
+        assert result is not None
+        assert result.liquidity_score == 0.0
 
     @pytest.mark.asyncio
     async def test_close_closes_session(self):

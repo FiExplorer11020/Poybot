@@ -10,6 +10,7 @@ from src.registry.models import (
     FalconLeaderEntry,
     Leader,
     LeaderClassification,
+    MarketInsights,
     PnlLeaderEntry,
     WalletMetrics,
 )
@@ -21,6 +22,10 @@ def _make_registry() -> tuple[LeaderRegistry, MagicMock]:
     falcon.get_leaderboard = AsyncMock()
     falcon.get_wallet360 = AsyncMock()
     falcon.get_pnl_leaderboard = AsyncMock()
+    # MG-3 fix (Phase 0 Task C): liquidity_score now comes from agent 575
+    # via get_market_insights. Default to None so legacy tests (which
+    # exercised the agent 574 fallback) still hit the fallback path.
+    falcon.get_market_insights = AsyncMock(return_value=None)
     registry = LeaderRegistry(falcon_client=falcon)
     return registry, falcon
 
@@ -450,3 +455,96 @@ class TestSyncMarkets:
         assert args[1] == "0xmkt"
         assert args[2] == "Will BTC be above $100k?"
         assert args[3] == "crypto"
+
+    @pytest.mark.asyncio
+    async def test_sync_markets_writes_575_score_when_available(self):
+        """Phase 0 Task C / audit MG-3: liquidity_score must come from
+        agent 575 (Market Insights) — NOT agent 574's raw `liquidity`
+        field. When 575 returns a score, the row must be tagged
+        `liquidity_score_source='falcon_575'`."""
+        registry, falcon = _make_registry()
+        # Agent 574 surfaces standard market metadata
+        falcon.query = AsyncMock(
+            return_value=[
+                {
+                    "question": "Will ETH flip BTC?",
+                    "category": "crypto",
+                    "clob_token_ids": ["tok_yes", "tok_no"],
+                    "volume24hr": 5000.0,
+                    "liquidity": 0.42,  # WRONG field — must be overridden by 575
+                    "makerBaseFee": 0.015,
+                }
+            ]
+        )
+        # Agent 575 surfaces the documented normalized 0–1 liquidity score
+        falcon.get_market_insights = AsyncMock(
+            return_value=MarketInsights(condition_id="0xmkt", liquidity_score=0.73)
+        )
+        conn = _make_conn()
+        conn.fetch = AsyncMock(return_value=[{"market_id": "0xmkt"}])
+
+        count = await registry.sync_markets(conn)
+        assert count == 1
+        falcon.get_market_insights.assert_awaited_once_with("0xmkt")
+
+        args = conn.execute.call_args.args
+        # SQL signature: $1 mid, $2 question, $3 category, $4 token_yes,
+        # $5 token_no, $6 end_date, $7 volume_24h, $8 liquidity_score,
+        # $9 fee_rate, $10 liquidity_score_source
+        assert args[8] == 0.73  # 575's value wins over 574's 0.42
+        assert args[10] == "falcon_575"
+
+    @pytest.mark.asyncio
+    async def test_sync_markets_falls_back_to_574_when_575_unavailable(self):
+        """When agent 575 returns None, sync_markets must fall through
+        to agent 574's `liquidity` field — but tag the row
+        `liquidity_score_source='falcon_574'` so the audit can find
+        rows that bypassed the documented source."""
+        registry, falcon = _make_registry()
+        falcon.query = AsyncMock(
+            return_value=[
+                {
+                    "question": "Will ETH flip BTC?",
+                    "category": "crypto",
+                    "clob_token_ids": ["tok_yes", "tok_no"],
+                    "volume24hr": 5000.0,
+                    "liquidity": 0.42,
+                    "makerBaseFee": 0.015,
+                }
+            ]
+        )
+        falcon.get_market_insights = AsyncMock(return_value=None)
+        conn = _make_conn()
+        conn.fetch = AsyncMock(return_value=[{"market_id": "0xmkt"}])
+
+        count = await registry.sync_markets(conn)
+        assert count == 1
+        args = conn.execute.call_args.args
+        assert args[8] == 0.42
+        assert args[10] == "falcon_574"
+
+    @pytest.mark.asyncio
+    async def test_sync_markets_writes_null_score_when_no_source_has_data(self):
+        """When neither 575 nor 574 nor Gamma supplies a liquidity
+        field, we must write NULL (not 0) so callers can distinguish
+        'no data' from 'genuinely illiquid'."""
+        registry, falcon = _make_registry()
+        falcon.query = AsyncMock(
+            return_value=[
+                {
+                    "question": "Q",
+                    "category": "crypto",
+                    "clob_token_ids": ["tok_yes", "tok_no"],
+                    # No `liquidity` field at all
+                    "volume24hr": 100.0,
+                }
+            ]
+        )
+        falcon.get_market_insights = AsyncMock(return_value=None)
+        conn = _make_conn()
+        conn.fetch = AsyncMock(return_value=[{"market_id": "0xmkt"}])
+
+        await registry.sync_markets(conn)
+        args = conn.execute.call_args.args
+        assert args[8] is None
+        assert args[10] is None

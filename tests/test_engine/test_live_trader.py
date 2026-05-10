@@ -67,6 +67,22 @@ def _make_redis():
     return r
 
 
+@pytest.fixture(autouse=True)
+def _stub_killswitch(monkeypatch):
+    """Stub the strict-path killswitch lookup that ``LiveTrader.open_trade``
+    now performs before insertion (audit F-05 fix). Tests that need to
+    exercise the killswitch veto override this fixture explicitly.
+
+    Default: real-execution allowed, so existing assertions still hold.
+    """
+    fake = MagicMock()
+    fake.is_real_execution_enabled = AsyncMock(return_value=True)
+    monkeypatch.setattr(
+        "src.engine.live_trader.get_killswitch", lambda: fake
+    )
+    return fake
+
+
 def _decision(**overrides):
     base = {
         "market_id": "0xMarket",
@@ -396,3 +412,96 @@ async def test_reload_open_trades_rehydrates_from_db(monkeypatch):
     assert a.leader_context == {"k": "v"}
     b = next(t for t in trader.open_trades if t.id == 2)
     assert b.leader_context == {}
+
+
+# --------------------------------------------------------------------------- #
+# Strict-path killswitch gate (audit F-05)                                     #
+# --------------------------------------------------------------------------- #
+
+
+async def test_open_trade_vetoes_when_killswitch_real_off(monkeypatch, _stub_killswitch):
+    """When the killswitch reports real_execution_enabled=False on the
+    strict path, LiveTrader must refuse the order BEFORE inserting any
+    DB row or calling OrderManager. This closes the F-05 2s leak window
+    where a stale Redis cache could otherwise let a trade slip through.
+    """
+    _stub_killswitch.is_real_execution_enabled = AsyncMock(return_value=False)
+
+    conn = MagicMock()
+    conn.fetchval = AsyncMock(return_value=0)
+    conn.fetch = AsyncMock(return_value=[])
+    conn.execute = AsyncMock()
+    _patch_db(monkeypatch, conn)
+
+    trader = _trader(conn=conn, dry_run=False)
+    res = await trader.open_trade(_decision())
+
+    assert res is None, "must refuse the live order"
+    # The killswitch must have been consulted on the STRICT path.
+    _stub_killswitch.is_real_execution_enabled.assert_awaited_once_with(
+        bypass_cache=True
+    )
+    # No DB write happened (no INSERT, no UPDATE).
+    conn.fetchval.assert_not_called()
+    conn.execute.assert_not_called()
+    # And no order was placed.
+    trader._order_manager.place_for_position.assert_not_called()
+    assert trader.open_trades == []
+
+
+async def test_open_trade_strict_path_used_not_cached(monkeypatch, _stub_killswitch):
+    """LiveTrader must call is_real_execution_enabled with bypass_cache=True
+    (not the cached fast path). Documents the API contract."""
+    conn = MagicMock()
+    conn.fetchval = AsyncMock(side_effect=[0, 1])  # no conflict, INSERT id=1
+    conn.fetch = AsyncMock(return_value=[])
+    conn.execute = AsyncMock()
+    _patch_db(monkeypatch, conn)
+
+    trader = _trader(conn=conn, dry_run=False)
+    await trader.open_trade(_decision())
+
+    _stub_killswitch.is_real_execution_enabled.assert_awaited_once_with(
+        bypass_cache=True
+    )
+
+
+async def test_open_trade_skips_killswitch_check_in_dry_run(monkeypatch, _stub_killswitch):
+    """In dry_run mode no real order goes out, so the strict-path
+    killswitch check is a no-op (we preserve shadow-row behavior for
+    benchmark comparisons). Tested explicitly to lock this contract."""
+    conn = MagicMock()
+    conn.fetchval = AsyncMock(side_effect=[0, 42])
+    conn.fetch = AsyncMock(return_value=[])
+    conn.execute = AsyncMock()
+    _patch_db(monkeypatch, conn)
+
+    om_outcome = OrderOutcome(
+        filled=False, filled_size_shares=0.0, avg_fill_price=0.0,
+        fee_paid_usdc=0.0, last_clob_order_id=None, attempts=1,
+        final_state="shadow",
+    )
+    trader = _trader(conn=conn, dry_run=True, om_outcome=om_outcome)
+    res = await trader.open_trade(_decision())
+
+    assert res == 42  # shadow row was inserted normally
+    _stub_killswitch.is_real_execution_enabled.assert_not_called()
+
+
+async def test_open_trade_killswitch_read_failure_refuses_trade(monkeypatch, _stub_killswitch):
+    """If the strict-path read itself raises, fail SAFE — never assume ON."""
+    _stub_killswitch.is_real_execution_enabled = AsyncMock(
+        side_effect=ConnectionError("redis+db down")
+    )
+
+    conn = MagicMock()
+    conn.fetchval = AsyncMock()
+    conn.execute = AsyncMock()
+    _patch_db(monkeypatch, conn)
+
+    trader = _trader(conn=conn, dry_run=False)
+    res = await trader.open_trade(_decision())
+
+    assert res is None
+    conn.fetchval.assert_not_called()
+    trader._order_manager.place_for_position.assert_not_called()

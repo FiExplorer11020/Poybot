@@ -7,6 +7,8 @@ Serves templates/dashboard.html at GET / and exposes JSON endpoints + a live Web
 
 import asyncio
 import copy
+import hashlib
+import json
 import time
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
@@ -14,7 +16,7 @@ from pathlib import Path
 
 import asyncpg
 import redis.asyncio as redis_async
-from fastapi import FastAPI, HTTPException, Query, WebSocket
+from fastapi import FastAPI, HTTPException, Query, Request, Response, WebSocket
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from loguru import logger
@@ -27,16 +29,21 @@ from src.config import settings
 from src.control.killswitch import get_killswitch
 from src.control.runtime_config import (
     ALLOWED_KEYS as RUNTIME_CONFIG_ALLOWED_KEYS,
+)
+from src.control.runtime_config import (
     BOUNDS as RUNTIME_CONFIG_BOUNDS,
+)
+from src.control.runtime_config import (
     get_runtime_config,
     init_runtime_config,
 )
-from src.logging_setup import configure_logging
 from src.engine.neural_readiness import ReadinessInputs, build_neural_readiness_snapshot
 from src.engine.readiness_persistence import (
     load_recent_persisted_transitions,
     persist_readiness_snapshot,
 )
+from src.logging_setup import configure_logging
+from src.monitoring.metrics import export_latest as export_metrics_latest
 from src.registry.falcon_client import FalconClient
 
 # ---------------------------------------------------------------------------
@@ -808,6 +815,59 @@ async def api_leader_detail(wallet: str):
     return detail
 
 
+@app.get("/api/wallet/{wallet}/markets")
+async def api_wallet_markets(wallet: str, window_days: int = 30, limit: int = 20):
+    """Per-wallet market drilldown — list of markets the wallet has traded
+    in the last N days, with category, volume, PnL, and a category breakdown."""
+    async with _pool.acquire() as conn:
+        return await queries.wallet_markets(conn, wallet, window_days=window_days, limit=limit)
+
+
+@app.get("/api/ml/diagnostics")
+async def api_ml_diagnostics():
+    """High-signal ML pipeline indicators for tracking development."""
+    async with _pool.acquire() as conn:
+        return await queries.ml_diagnostics(conn)
+
+
+@app.get("/api/data-quality/markets")
+async def api_data_quality_markets(issue: str, limit: int = 100):
+    """Drill-down list of markets / leaders affected by a specific DQ issue.
+
+    issue ∈ {unmapped_tokens, expired_still_active, orphan_market_ids,
+             stale_leaders, stale_profiles}
+    """
+    async with _pool.acquire() as conn:
+        return await queries.data_quality_markets(conn, issue=issue, limit=limit)
+
+
+@app.get("/api/wallet/{wallet}/profile")
+async def api_wallet_profile(wallet: str):
+    """Full per-wallet profile (categories, accuracy, sizing, edges, decisions)."""
+    async with _pool.acquire() as conn:
+        result = await queries.wallet_profile(conn, wallet)
+    if result is None:
+        raise HTTPException(status_code=404, detail="Wallet profile not found")
+    return result
+
+
+@app.get("/api/decision/{decision_id}")
+async def api_decision_detail(decision_id: int):
+    """Full reasoning panel for a single decision_log row."""
+    async with _pool.acquire() as conn:
+        result = await queries.decision_detail(conn, decision_id)
+    if result is None:
+        raise HTTPException(status_code=404, detail="Decision not found")
+    return result
+
+
+@app.get("/api/risk/history")
+async def api_risk_history(limit: int = 50):
+    """Recent runtime config changes for the Risk cockpit audit panel."""
+    async with _pool.acquire() as conn:
+        return await queries.risk_history(conn, limit=limit)
+
+
 @app.get("/api/positions")
 async def api_positions():
     async with _pool.acquire() as conn:
@@ -936,8 +996,29 @@ async def api_data_quality():
 
 
 @app.get("/api/v1/live-summary")
-async def api_live_summary_v1():
-    return {"data": await _get_terminal_snapshot()}
+async def api_live_summary_v1(request: Request, response: Response):
+    """Full snapshot endpoint with conditional-GET (ETag / If-None-Match).
+
+    The dashboard polls this every 5 s. Hashing the serialized snapshot and
+    returning 304 Not Modified when nothing changed cuts the wire payload
+    (~50–200 KB) and JSON parse time on the client to near-zero on idle ticks.
+    The snapshot itself is already cached in-process for ≤ 1 s
+    (_get_terminal_snapshot), so this is a pure additive optimisation.
+    """
+    snap = await _get_terminal_snapshot()
+    payload = json.dumps({"data": snap}, default=str, separators=(",", ":"))
+    etag = '"' + hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16] + '"'
+
+    inm = request.headers.get("if-none-match")
+    if inm and inm == etag:
+        response.status_code = 304
+        response.headers["ETag"] = etag
+        # 304 must have an empty body — FastAPI's Response handles that.
+        return Response(status_code=304, headers={"ETag": etag})
+
+    response.headers["ETag"] = etag
+    response.headers["Cache-Control"] = "private, no-cache, must-revalidate"
+    return Response(content=payload, media_type="application/json", headers={"ETag": etag})
 
 
 @app.get("/api/inspector/snapshot")
@@ -1037,6 +1118,17 @@ async def health():
     return JSONResponse(payload, status_code=code)
 
 
+# Phase 1 Task M — Prometheus scrape endpoint. Single-process default REGISTRY;
+# the trade observer (Task O) and Falcon backfill (Task F) emit metrics into it
+# from the same process. No auth in Phase 1 (LAN-only scrape).
+# TODO(Phase 2): add bearer-token auth + per-IP rate-limit before exposing this
+# beyond the prod LAN. Tracked in docs/audit/phase1/M_metrics_foundation.md.
+@app.get("/metrics")
+async def metrics():
+    payload, content_type = export_metrics_latest()
+    return Response(content=payload, media_type=content_type)
+
+
 @app.get("/api/control/state")
 async def api_control_state():
     """Returns the current killswitch state (cached read)."""
@@ -1082,6 +1174,9 @@ async def api_risk_update(payload: _RiskConfigUpdate):
     effective config so the dashboard can refresh its display without
     waiting for the next snapshot push.
     """
+    # Snapshot the *previous* effective config so we can diff and persist an
+    # audit trail of which keys actually changed.
+    previous = await get_runtime_config().effective()
     try:
         merged = await get_runtime_config().set_overrides(
             payload.edits or {},
@@ -1093,6 +1188,23 @@ async def api_risk_update(payload: _RiskConfigUpdate):
     # call surfaces the new values immediately.
     _terminal_snapshot_cache["data"] = None
     _terminal_snapshot_cache["last_built"] = 0.0
+
+    # Append history rows — best-effort, never blocks the response.
+    try:
+        async with _pool.acquire() as conn:
+            for k in (payload.edits or {}):
+                old_v = previous.get(k)
+                new_v = merged.get(k)
+                if old_v == new_v:
+                    continue  # no real change — skip noise
+                await queries.log_risk_change(
+                    conn, k, old_v, new_v,
+                    actor=payload.actor or "dashboard",
+                    source="dashboard",
+                )
+    except Exception as exc:
+        logger.debug(f"risk_history logging failed: {exc}")
+
     return {"config": merged}
 
 

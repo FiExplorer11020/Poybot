@@ -6,7 +6,7 @@ import json
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from decimal import Decimal
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -53,10 +53,22 @@ def _make_tracker(fee_rate=None):
 
 
 def _make_conn(fee_row=None):
-    """Return a mock asyncpg connection."""
+    """Return a mock asyncpg connection.
+
+    `conn.transaction()` returns a no-op async context manager so production
+    code calling `async with conn.transaction():` works under unit tests.
+    """
     conn = AsyncMock()
     conn.execute = AsyncMock()
     conn.fetchrow = AsyncMock(return_value=fee_row)
+
+    @asynccontextmanager
+    async def _tx():
+        yield None
+
+    # `transaction()` itself is sync (returns the Transaction object) — only
+    # the returned object is an async CM. Hence MagicMock, not AsyncMock.
+    conn.transaction = MagicMock(side_effect=lambda *a, **kw: _tx())
     return conn
 
 

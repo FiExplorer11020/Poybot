@@ -8,6 +8,7 @@ Usage:
 
 from pathlib import Path
 
+from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -39,6 +40,25 @@ class Settings(BaseSettings):
     FALCON_REFRESH_INTERVAL_S: int = 1800  # 30min — was 3600, faster convergence
     FALCON_CACHE_TTL_S: int = 172800  # 48h — survive Falcon downtime
     FALCON_MAX_REQUESTS_PER_MINUTE: int = 60
+    # Phase 1 Task F (audit HP-2 fix #1): in-flight Falcon HTTP concurrency.
+    # The previous Semaphore(1) serialised every Falcon call across the whole
+    # process; the actual ceiling is the 60 RPM token bucket below
+    # (`FALCON_MAX_REQUESTS_PER_MINUTE`). With 8 in flight, the rate limiter
+    # is the bound (correct), and stall recovery is ~8× faster — one slow
+    # call no longer freezes every other agent_id. Validated 1..32: above 32
+    # the rate limiter would just queue everyone anyway and cancellation
+    # latency dominates. Override via env FALCON_MAX_CONCURRENCY.
+    FALCON_MAX_CONCURRENCY: int = 8
+    # Phase 1 Task F (audit HP-1 fix #2): wallet-trade backfill fan-out.
+    # `_backfill_wallet_trades` iterates ~200 leader wallets each cycle with
+    # an 8 s per-request timeout; serial worst-case is 200 × 8 s = 26 min.
+    # With 20 concurrent workers and the 60 RPM Falcon limiter sustaining
+    # ~1 call/s, throughput stays at ~60/min but a single stuck wallet no
+    # longer blocks the other 19 — that's where the audit's "~16×" claim
+    # comes from. Separate from FALCON_MAX_CONCURRENCY because backfill is
+    # one logical batch and may want different bounds than ad-hoc Falcon
+    # calls. Validated 1..64. Override via env REGISTRY_BACKFILL_CONCURRENCY.
+    REGISTRY_BACKFILL_CONCURRENCY: int = 20
 
     # ------------------------------------------------------------------ #
     # Leader Registry (CLAUDE.md § 9)                                     #
@@ -56,7 +76,28 @@ class Settings(BaseSettings):
     # cover the top tier by 24h volume + leader-active markets, which is
     # where 90%+ of leader signal lives.
     TOP_MARKETS_COUNT: int = 200
-    TRADE_OBSERVER_POLL_INTERVAL_S: int = 30
+    # HP-1 fix #1 (audit docs/audit/04_perf_hotpaths.md): cut from 30 s → 5 s.
+    # The CLOB market WS channel carries no wallet attribution, so every
+    # leader-attributed trade is gated by this REST poll. At 30 s the median
+    # leader-trade-to-react latency was ~16 s; at 5 s we expect ~2-3 s p50.
+    # Bounded [MIN, MAX] in the post-init validator so an env override can't
+    # tighten to a hammering loop or drift back to 30 s by accident.
+    TRADE_OBSERVER_POLL_INTERVAL_S: int = 5
+    TRADE_OBSERVER_POLL_INTERVAL_S_MIN: int = 1
+    TRADE_OBSERVER_POLL_INTERVAL_S_MAX: int = 60
+    # HP-1 fix #3: bounded queue between WS+REST producers and the dedicated
+    # DB writer task. 10k @ ~1 KB/record ≈ 10 MB worst case. At burst the WS
+    # coroutine should not block on Postgres — if the queue fills, drop the
+    # trade and increment `observer_queue_drops_total`. Drop-on-full is
+    # better than producer-side deadlock that cascades into WS pong misses.
+    TRADE_OBSERVER_QUEUE_MAX: int = 10_000
+    # Batch sizing: drain up to 200 rows OR 100 ms, whichever first. 200 was
+    # chosen as the largest batch that still fits in a single asyncpg frame
+    # without pushing parse/plan past the per-statement budget; 100 ms is
+    # the target tail latency for trade-to-DB-commit (well below the 5 s
+    # poll cadence so a batch never spans poll cycles in steady state).
+    TRADE_OBSERVER_BATCH_MAX: int = 200
+    TRADE_OBSERVER_BATCH_FLUSH_MS: int = 100
     # 500 → 1500: more historical depth on each leader_markets backfill so
     # we don't miss trades on lower-volume markets a leader is active on.
     DATA_API_GLOBAL_TRADES_LIMIT: int = 1500
@@ -293,6 +334,48 @@ class Settings(BaseSettings):
     LOG_FILE_ROTATION: str = "daily"
     # How many rotated files to keep before deleting the oldest.
     LOG_FILE_RETENTION: str = "14 days"
+
+    # ------------------------------------------------------------------ #
+    # Validators (Phase 1 Task F)                                         #
+    # ------------------------------------------------------------------ #
+    @field_validator("FALCON_MAX_CONCURRENCY")
+    @classmethod
+    def _validate_falcon_concurrency(cls, v: int) -> int:
+        if not 1 <= v <= 32:
+            raise ValueError(
+                f"FALCON_MAX_CONCURRENCY must be in [1, 32], got {v}. "
+                "The 60 RPM rate limiter is the real cap; values above 32 "
+                "just queue under the limiter."
+            )
+        return v
+
+    @field_validator("REGISTRY_BACKFILL_CONCURRENCY")
+    @classmethod
+    def _validate_backfill_concurrency(cls, v: int) -> int:
+        if not 1 <= v <= 64:
+            raise ValueError(
+                f"REGISTRY_BACKFILL_CONCURRENCY must be in [1, 64], got {v}. "
+                "Higher than 64 doesn't help — the Falcon RPM limiter is the bound."
+            )
+        return v
+
+    @field_validator("TRADE_OBSERVER_POLL_INTERVAL_S")
+    @classmethod
+    def _validate_observer_poll_interval(cls, v: int, info) -> int:
+        # Phase 1 Task O / HP-1 fix #1. Bounds are themselves env-overridable
+        # for ops debugging (e.g. tighten MIN to 1 in a load-test env), but
+        # the runtime value must fall inside the configured window. Reads
+        # MIN/MAX from `info.data` so test envs that override either bound
+        # are honoured; falls back to the class defaults (1, 60) otherwise.
+        lo = int(info.data.get("TRADE_OBSERVER_POLL_INTERVAL_S_MIN", 1))
+        hi = int(info.data.get("TRADE_OBSERVER_POLL_INTERVAL_S_MAX", 60))
+        if not lo <= v <= hi:
+            raise ValueError(
+                f"TRADE_OBSERVER_POLL_INTERVAL_S must be in [{lo}, {hi}], got {v}. "
+                "Below MIN risks rate-limit bans; above MAX defeats the HP-1 "
+                "freshness goal."
+            )
+        return v
 
 
 settings = Settings()

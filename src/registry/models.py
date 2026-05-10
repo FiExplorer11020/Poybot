@@ -39,6 +39,37 @@ class PnlLeaderEntry(BaseModel):
     model_config = ConfigDict(extra="ignore", populate_by_name=True)
 
 
+class MarketInsights(BaseModel):
+    """One row from agent 575 (Polymarket Market Insights).
+
+    The audited methodology for `markets.liquidity_score` (master
+    CLAUDE.md §6, `src/profiler/CLAUDE.md:172`, `error_model.py:83`)
+    expects this agent's normalized 0–1 liquidity score, NOT agent
+    574's raw `liquidity` field. Field aliases below cover the names
+    we've seen Falcon use across agents for "liquidity"-like signals;
+    any non-finite or out-of-range value is coerced to a sane 0–1
+    score in `FalconClient.get_market_insights`.
+
+    `extra="allow"` keeps the rest of the payload (concentration,
+    trend, depth, etc.) on the model so a future migration can add
+    new features without a model bump.
+    """
+
+    condition_id: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices("condition_id", "market_id", "market_slug"),
+    )
+    liquidity_score: float = Field(
+        default=0.0,
+        validation_alias=AliasChoices(
+            "liquidity_score",  # 575's documented field
+            "normalized_liquidity",  # observed alias
+            "liquidity",  # ultra-fallback if 575 reuses 574's name
+        ),
+    )
+    model_config = ConfigDict(extra="allow", populate_by_name=True)
+
+
 class LeaderClassification(BaseModel):
     strategy: str = "unknown"  # directional | structural | cognitive | unknown
     influence: str = "unknown"  # whale | top_trader | community | unknown
