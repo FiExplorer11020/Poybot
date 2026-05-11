@@ -27,10 +27,26 @@ is automatically inversely proportional to wallet count per tier.
 
 from __future__ import annotations
 
+import asyncio
 from enum import IntEnum
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+from loguru import logger
 
 from src.config import settings
+from src.database.connection import get_db
+
+try:  # pragma: no cover — metrics import is best-effort.
+    from src.monitoring.metrics import (  # type: ignore[attr-defined]
+        wallet_universe_promotions_total,
+        wallet_universe_tier_count,
+    )
+except Exception:  # pragma: no cover
+    wallet_universe_promotions_total = None  # type: ignore[assignment]
+    wallet_universe_tier_count = None  # type: ignore[assignment]
+
+if TYPE_CHECKING:
+    from src.crawler.universe import WalletUniverse
 
 
 class DepthTier(IntEnum):
@@ -108,35 +124,197 @@ class AdaptiveDepth:
     is essentially dormant.
     """
 
-    def __init__(self) -> None:
-        """No external dependencies — uses the project-wide DB pool +
-        the ``settings`` thresholds."""
-        # TODO: implement in Wave 2 — see ROUND_6_THE_SPINE.md § 3.4
-        raise NotImplementedError("Wave 2 — see ROUND_6_THE_SPINE.md § 3.4")
+    def __init__(self, universe: "WalletUniverse | None" = None) -> None:
+        """
+        Args:
+            universe: Optional :class:`WalletUniverse` handle. The
+                review loop calls into it to refresh the
+                ``wallet_universe_tier_count`` gauge after each sweep.
+                Tests can pass None and the loop still functions — the
+                bulk SQL bypasses the universe object entirely.
+        """
+        self._universe = universe
 
     async def review_tiers(self) -> dict[DepthTier, int]:
         """Nightly promotion/demotion sweep.
 
-        Algorithm (Wave 2):
-          1. Aggregate per-wallet 30d activity stats:
-             ``SELECT wallet_address, SUM(size_usdc) AS volume_30d_usdc,
-                       COUNT(*) AS trades_30d
-                FROM trades_observed
-                WHERE time > NOW() - INTERVAL '30 days'
-                GROUP BY wallet_address``
-          2. For each wallet, compute ``expected = expected_tier(stats)``.
-          3. Compare against ``wallet_universe.depth_tier`` (current);
-             UPDATE if different.
-          4. Emit ``polybot_wallet_universe_promotions_total{from_tier, to_tier}``
-             counter increments for each transition.
-          5. Update ``wallet_universe.last_tier_review = NOW()``.
+        Performance contract: must run in <60 s against ~1.5M wallets.
+
+        Algorithm (the bulk-update pattern):
+
+          1. Single LEFT JOIN aggregation pulls every wallet's current
+             tier + 30d activity stats in one round-trip:
+
+               SELECT wu.wallet_address, wu.depth_tier,
+                      COALESCE(t.volume_30d, 0)  AS volume_30d_usdc,
+                      COALESCE(t.trades_30d, 0)  AS trades_30d
+               FROM   wallet_universe wu
+               LEFT JOIN (
+                   SELECT wallet_address,
+                          SUM(size_usdc) AS volume_30d,
+                          COUNT(*)       AS trades_30d
+                     FROM trades_observed
+                    WHERE time > NOW() - INTERVAL '30 days'
+                    GROUP BY wallet_address
+               ) t USING (wallet_address);
+
+          2. Classify every row in Python via ``expected_tier`` and
+             bucket the *transitions* by target tier so that we issue
+             at most 3 grouped UPDATEs (one per target tier):
+
+               UPDATE wallet_universe
+                  SET depth_tier = $1,
+                      last_tier_review = NOW()
+                WHERE wallet_address = ANY($2::text[]);
+
+             A per-wallet UPDATE at 1.5M rows is hopeless (~5 ms each
+             ≈ 2 hours); ``= ANY(text[])`` keeps the loop at 3 SQL
+             round-trips regardless of how many wallets transitioned.
+
+          3. Emit
+             ``polybot_wallet_universe_promotions_total{from_tier, to_tier}``
+             counter increments for each transition (one increment per
+             wallet, but they're cheap counter ops in-process).
+
+          4. Refresh the ``polybot_wallet_universe_tier_count{tier}``
+             gauge from the post-sweep counts.
 
         Returns:
-            Per-tier wallet counts AFTER the sweep, suitable for
-            logging and the ``polybot_wallet_universe_tier_count{tier}``
-            gauge update.
+            Per-tier wallet counts AFTER the sweep.
         """
-        raise NotImplementedError("Wave 2 — see ROUND_6_THE_SPINE.md § 3.4")
+        # Step 1 — single roll-up across wallet_universe × trades_observed.
+        select_sql = """
+            SELECT wu.wallet_address,
+                   wu.depth_tier,
+                   COALESCE(t.volume_30d_usdc, 0)::FLOAT8 AS volume_30d_usdc,
+                   COALESCE(t.trades_30d, 0)::BIGINT     AS trades_30d
+              FROM wallet_universe wu
+              LEFT JOIN (
+                  SELECT wallet_address,
+                         SUM(size_usdc) AS volume_30d_usdc,
+                         COUNT(*)       AS trades_30d
+                    FROM trades_observed
+                   WHERE time > NOW() - INTERVAL '30 days'
+                   GROUP BY wallet_address
+              ) t USING (wallet_address)
+        """
+
+        # Step 2 — bucket transitions by target tier.
+        buckets: dict[DepthTier, list[str]] = {
+            DepthTier.FULL: [],
+            DepthTier.PERIODIC: [],
+            DepthTier.LIGHT: [],
+        }
+        # Track promotions: list of (wallet, from_tier, to_tier) for the
+        # Prometheus counter increments after the UPDATEs land.
+        promotions: list[tuple[str, int, int]] = []
+        # Running post-sweep totals — we know the target tier of every
+        # row so we can compute the result counts without a second
+        # GROUP BY.
+        post_counts: dict[DepthTier, int] = {
+            DepthTier.FULL: 0,
+            DepthTier.PERIODIC: 0,
+            DepthTier.LIGHT: 0,
+        }
+
+        async with get_db() as conn:
+            rows = await conn.fetch(select_sql)
+            for row in rows:
+                wallet = row["wallet_address"]
+                current_tier = DepthTier(int(row["depth_tier"]))
+                stats = {
+                    "volume_30d_usdc": float(row["volume_30d_usdc"] or 0.0),
+                    "trades_30d": int(row["trades_30d"] or 0),
+                }
+                target = expected_tier(stats)
+                post_counts[target] = post_counts.get(target, 0) + 1
+                if target != current_tier:
+                    buckets[target].append(wallet)
+                    promotions.append(
+                        (wallet, int(current_tier), int(target))
+                    )
+
+            if any(buckets.values()):
+                update_sql = """
+                    UPDATE wallet_universe
+                       SET depth_tier = $1,
+                           last_tier_review = NOW()
+                     WHERE wallet_address = ANY($2::text[])
+                """
+                async with conn.transaction():
+                    for target_tier, wallets in buckets.items():
+                        if not wallets:
+                            continue
+                        await conn.execute(
+                            update_sql, int(target_tier), wallets
+                        )
+
+        # Step 3 — emit promotion counters (out of the DB tx).
+        if wallet_universe_promotions_total is not None and promotions:
+            for _wallet, from_tier, to_tier in promotions:
+                try:
+                    wallet_universe_promotions_total.labels(
+                        from_tier=str(from_tier), to_tier=str(to_tier)
+                    ).inc()
+                except Exception:  # pragma: no cover
+                    logger.debug(
+                        "wallet_universe_promotions_total.inc() failed",
+                        exc_info=True,
+                    )
+
+        # Step 4 — refresh the tier_count gauge.
+        if wallet_universe_tier_count is not None:
+            for tier_value, count in post_counts.items():
+                try:
+                    wallet_universe_tier_count.labels(
+                        tier=str(int(tier_value))
+                    ).set(count)
+                except Exception:  # pragma: no cover
+                    logger.debug(
+                        "wallet_universe_tier_count.set() failed",
+                        exc_info=True,
+                    )
+
+        logger.info(
+            "review_tiers: {} transitions, post-sweep counts={}",
+            len(promotions),
+            {int(k): v for k, v in post_counts.items()},
+        )
+        return post_counts
+
+    async def run_daemon_loop(self) -> None:
+        """Periodic review loop for the crawler daemon.
+
+        Wakes every ``WALLET_UNIVERSE_REVIEW_INTERVAL_S`` seconds, runs
+        one ``review_tiers`` sweep, then sleeps. Exits cleanly on
+        :class:`asyncio.CancelledError` so the systemd unit can do a
+        graceful shutdown.
+        """
+        interval_s = float(
+            getattr(settings, "WALLET_UNIVERSE_REVIEW_INTERVAL_S", 86_400)
+        )
+        logger.info(
+            "AdaptiveDepth.run_daemon_loop: starting (interval={}s)",
+            interval_s,
+        )
+        try:
+            while True:
+                try:
+                    counts = await self.review_tiers()
+                    logger.info(
+                        "AdaptiveDepth nightly sweep done: counts={}",
+                        {int(k): v for k, v in counts.items()},
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    logger.exception(
+                        f"AdaptiveDepth.review_tiers raised: {exc}"
+                    )
+                await asyncio.sleep(interval_s)
+        except asyncio.CancelledError:
+            logger.info("AdaptiveDepth.run_daemon_loop: cancelled")
+            raise
 
     def expected_tier(self, wallet_stats: dict[str, Any]) -> DepthTier:
         """Instance-method alias for the module-level ``expected_tier``.
