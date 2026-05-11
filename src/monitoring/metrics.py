@@ -385,6 +385,144 @@ hawkes_alpha_mu_ratio = Histogram(
     buckets=(0.0, 0.1, 0.3, 0.5, 1.0, 2.0, 5.0, 10.0),
 )
 
+# === Round 6 (The Spine) — Multi-RPC abstraction (src/rpc/) ===
+# Owned by ``src/rpc/client.py``. Every JSON-RPC call goes through one of
+# the providers in the pool; the labels let the dashboard tell "the local
+# Erigon is degraded" from "Alchemy is the slow one". Bucket choices mirror
+# the falcon_call_latency_seconds histogram so RPC and Falcon side-by-side
+# comparisons share a granularity. See docs/ROUND_6_THE_SPINE.md § 3.2.
+rpc_calls_total = Counter(
+    "polybot_rpc_calls_total",
+    "Total Polygon RPC calls",
+    # method: eth_subscribe|eth_call|eth_getLogs|eth_getBlockByNumber|...
+    # result: ok|empty|rate_limited|error|timeout|circuit_open
+    ["provider", "method", "result"],
+)
+rpc_latency_seconds = Histogram(
+    "polybot_rpc_latency_seconds",
+    "RPC call latency",
+    ["provider", "method"],
+    buckets=(0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0),
+)
+rpc_circuit_breaker_open = Gauge(
+    "polybot_rpc_circuit_breaker_open",
+    "1 iff the per-provider circuit breaker is currently OPEN or HALF_OPEN",
+    ["provider"],
+)
+rpc_fallback_total = Counter(
+    "polybot_rpc_fallback_total",
+    "Provider fall-throughs (priority N skipped, used priority M instead)",
+    ["from_provider", "to_provider"],
+)
+rpc_coalesced_calls_total = Counter(
+    "polybot_rpc_coalesced_calls_total",
+    "RPC calls deduplicated by in-flight coalescing",
+    ["provider", "method"],
+)
+
+# === Round 6 — On-chain CLOB ingestion (src/onchain/) ===
+# Owned by ``src/onchain/clob_listener.py``. The ingestion-latency
+# histogram is the headline acceptance criterion from § 6
+# ("p95 chain_ingestion_latency_seconds < 4.0"); buckets reach 30 s so a
+# tail spike is visible without being clipped.
+chain_blocks_processed_total = Counter(
+    "polybot_chain_blocks_processed_total",
+    "Polygon blocks the CLOB listener has decoded events from",
+)
+chain_blocks_behind = Gauge(
+    "polybot_chain_blocks_behind",
+    "Chain head minus our last_processed_block (lag in blocks)",
+)
+chain_events_decoded_total = Counter(
+    "polybot_chain_events_decoded_total",
+    "Successfully decoded CLOB events",
+    ["event_type"],  # OrderFilled|OrdersMatched|OrderCancelled|FeeRateUpdated|...
+)
+chain_events_failed_decode_total = Counter(
+    "polybot_chain_events_failed_decode_total",
+    "CLOB log events that failed to decode",
+    # reason: abi_mismatch|topic_unknown|asset_id_unmapped|exception
+    ["event_type", "reason"],
+)
+chain_ingestion_latency_seconds = Histogram(
+    "polybot_chain_ingestion_latency_seconds",
+    "Block timestamp → our chain:trades:stream publish time",
+    buckets=(0.5, 1.0, 2.0, 4.0, 8.0, 15.0, 30.0),
+)
+
+# === Round 6 — Wallet universe (src/crawler/) ===
+# Owned by ``src/crawler/universe.py`` (size + tier_count) and
+# ``src/crawler/depth_tiers.py`` (promotions). The promotions counter is
+# how we see the adaptive-depth review actually doing work each night.
+wallet_universe_size = Gauge(
+    "polybot_wallet_universe_size",
+    "Total wallets in wallet_universe (all tiers combined)",
+)
+wallet_universe_tier_count = Gauge(
+    "polybot_wallet_universe_tier_count",
+    "Wallets per depth_tier (0=FULL, 1=PERIODIC, 2=LIGHT)",
+    ["tier"],
+)
+wallet_universe_promotions_total = Counter(
+    "polybot_wallet_universe_promotions_total",
+    "Nightly tier transitions",
+    ["from_tier", "to_tier"],
+)
+
+# === Round 6 — Cold storage exporter (src/cold_storage/) ===
+# Owned by ``src/cold_storage/exporter.py``. One scrape after the nightly
+# export reveals how much data moved off the hot tier; ``bytes_total``
+# trending up lets ops budget the Hetzner Storage Box capacity.
+cold_export_rows_total = Counter(
+    "polybot_cold_export_rows_total",
+    "Rows written to Parquet across all nightly exports",
+    ["table"],
+)
+cold_export_bytes_total = Counter(
+    "polybot_cold_export_bytes_total",
+    "Bytes written to Parquet across all nightly exports",
+)
+cold_export_duration_seconds = Histogram(
+    "polybot_cold_export_duration_seconds",
+    "Wall time per nightly per-table export",
+    ["table"],
+    buckets=(1.0, 5.0, 15.0, 60.0, 300.0, 900.0, 1800.0),
+)
+
+# === Round 6 — Cross-source coverage reconciler (src/monitoring/coverage_reconciler.py) ===
+# The headline R6 deliverable: ``coverage_ratio{source} < 0.95`` is the
+# alert that catches data-acquisition holes BEFORE the operator notices.
+coverage_ratio = Gauge(
+    "polybot_coverage_ratio",
+    "Trades seen by source / trades seen on-chain (5-minute window)",
+    ["source"],  # onchain|websocket|api_market|api_wallet|falcon_556
+)
+coverage_disagreement_total = Counter(
+    "polybot_coverage_disagreement_total",
+    "Trades observed by primary source but missing from missed_by source",
+    ["primary", "missed_by"],
+)
+
+# === Round 6 — Ingestion daemon supervision (src/ingestion_daemon/) ===
+# Owned by ``src/ingestion_daemon/supervisor.py``. The ``up`` gauge feeds
+# the dashboard's "Bot Health" row; restart_total catches crash-loops
+# without grepping journalctl.
+ingestion_daemon_up = Gauge(
+    "polybot_ingestion_daemon_up",
+    "1 iff the named ingestion daemon is currently active per systemd/PID-file",
+    ["service"],  # engine|observer|onchain|crawler|falcon-refresher|api
+)
+ingestion_daemon_restarts_total = Counter(
+    "polybot_ingestion_daemon_restarts_total",
+    "NRestarts reported by systemd for each ingestion daemon",
+    ["service"],
+)
+ingestion_daemon_memory_bytes = Gauge(
+    "polybot_ingestion_daemon_memory_bytes",
+    "Current RSS reported by systemd's MemoryCurrent for each daemon",
+    ["service"],
+)
+
 
 # ---------------------------------------------------------------------------
 # Build info — best-effort. Surfaces version + git short-SHA on /metrics so a

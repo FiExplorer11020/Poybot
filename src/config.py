@@ -528,6 +528,141 @@ class Settings(BaseSettings):
             )
         return v
 
+    # ------------------------------------------------------------------ #
+    # Round 6 (The Spine) — Multi-RPC abstraction (src/rpc/)              #
+    # ------------------------------------------------------------------ #
+    # Comma-separated ordered list of provider names, lowest priority
+    # first. Wave 2 reads each name as a section key for the matching
+    # *_URL / *_API_KEY env var (e.g. provider 'alchemy' → ALCHEMY_RPC_URL,
+    # ALCHEMY_RPC_API_KEY). The local Erigon entry has no API key and
+    # uses an effectively-infinite token bucket. See ROUND_6_THE_SPINE.md
+    # § 3.2.
+    RPC_PROVIDER_PRIORITIES: str = "local_erigon,alchemy,quicknode"
+    # Per-provider connection URLs. Empty = "provider not configured";
+    # the pool simply skips empty entries at startup.
+    LOCAL_ERIGON_RPC_URL: str = "http://10.0.0.2:8545"  # private network IP
+    LOCAL_ERIGON_WS_URL: str = "ws://10.0.0.2:8546"
+    ALCHEMY_RPC_URL: str = ""
+    ALCHEMY_RPC_API_KEY: str = ""
+    QUICKNODE_RPC_URL: str = ""
+    QUICKNODE_RPC_API_KEY: str = ""
+    # Circuit-breaker tuning. 5 consecutive failures trip the breaker;
+    # 60 s cooldown before the HALF_OPEN probe. See
+    # src/rpc/circuit_breaker.py.
+    RPC_CIRCUIT_BREAKER_THRESHOLD: int = 5
+    RPC_CIRCUIT_BREAKER_COOLDOWN_S: float = 60.0
+    # How often the ProviderPool's background health-check loop probes
+    # each provider with a cheap eth_blockNumber call and inserts a
+    # row into rpc_health_history (migration 023).
+    RPC_HEALTHCHECK_INTERVAL_S: int = 60
+
+    # ------------------------------------------------------------------ #
+    # Round 6 — On-chain CLOB listener (src/onchain/)                     #
+    # ------------------------------------------------------------------ #
+    # Polymarket CTF Exchange contract on Polygon mainnet. The official
+    # address from Polymarket's docs — pin here so a misconfigured env
+    # can't silently point the listener at the wrong contract.
+    # Wave 2 verifies this against the Etherscan-verified contract.
+    POLYMARKET_CLOB_CONTRACT_ADDRESS: str = (
+        "0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E"
+    )
+    # Alert threshold for the polybot_chain_blocks_behind gauge. Polygon
+    # produces a block every ~2s, so 30 blocks = ~1 min behind. Default
+    # to 30 — the operator gets pinged before the lag crosses the
+    # § 3.1 "node must be at chain-head within 60s" invariant.
+    CHAIN_HEAD_LAG_ALERT_BLOCKS: int = 30
+    # How far back the listener subscribes from on first boot when
+    # chain_sync_state is empty (or on a "reset cursor" recovery).
+    # 256 blocks ≈ 8 min of history, enough to bridge a typical
+    # rollout window without re-decoding hours of unrelated traffic.
+    CHAIN_BOOTSTRAP_LOOKBACK_BLOCKS: int = 256
+    # Batch-commit cadence: persist the chain_sync_state cursor after
+    # this many blocks OR this many seconds, whichever first. Keeps the
+    # cursor close enough to head that a crash never replays more than
+    # ~5s of work, while still batching DB writes.
+    CHAIN_BATCH_COMMIT_BLOCKS: int = 50
+    CHAIN_BATCH_COMMIT_INTERVAL_S: float = 5.0
+
+    # ------------------------------------------------------------------ #
+    # Round 6 — Wallet Universe Crawler (src/crawler/)                    #
+    # ------------------------------------------------------------------ #
+    # Tier-decision volume thresholds. Wallets with 30d USDC volume at
+    # or above the FULL threshold sit in tier 0 (full Falcon refresh
+    # daily); at or above PERIODIC sit in tier 1 (weekly Falcon);
+    # everyone else in tier 2 (on-chain only). See
+    # src/crawler/depth_tiers.py::expected_tier.
+    WALLET_UNIVERSE_FULL_TIER_VOLUME_THRESHOLD_USDC: float = 1_000_000.0
+    WALLET_UNIVERSE_PERIODIC_TIER_VOLUME_THRESHOLD_USDC: float = 50_000.0
+    # How often the AdaptiveDepth nightly review runs. Default once
+    # daily (86400 s); set lower in test envs.
+    WALLET_UNIVERSE_REVIEW_INTERVAL_S: int = 86_400
+
+    # ------------------------------------------------------------------ #
+    # Round 6 — Cold storage (src/cold_storage/)                          #
+    # ------------------------------------------------------------------ #
+    # Local-disk root for the Parquet tree. On production this is the
+    # mount of the Hetzner volume (or a Storage Box bind-mount).
+    COLD_EXPORT_BASE_PATH: str = "/data/cold"
+    # Comma-separated list of tables to export nightly. Order is the
+    # iteration order in ColdExporter.run_nightly. Default mirrors
+    # ROUND_6_THE_SPINE.md § 3.6.
+    COLD_EXPORT_TABLES: str = (
+        "trades_observed,"
+        "book_quality_snapshots,"
+        "orderbook_features_minute,"
+        "decision_log,"
+        "positions_reconstructed"
+    )
+    # Retention for Parquet files. Default 0 = "keep everything";
+    # cold storage is cheap and the goal of this tier is research
+    # depth, not retention pressure.
+    COLD_RETENTION_DAYS: int = 0
+
+    # ------------------------------------------------------------------ #
+    # Round 6 — Coverage reconciler (src/monitoring/)                     #
+    # ------------------------------------------------------------------ #
+    # Width of each reconciliation window in seconds. The reconciler
+    # wakes every WINDOW_S and compares the previous WINDOW_S of trades
+    # across every source. 300 s = 5 min matches the spec.
+    COVERAGE_RECONCILER_WINDOW_S: int = 300
+    # Minimum acceptable coverage_ratio{source} before the
+    # TradeIngestionCoverageLow alert fires. 0.95 = "REST/WS must see
+    # at least 95% of the trades on-chain ingestion catches".
+    COVERAGE_ALERT_THRESHOLD: float = 0.95
+
+    @field_validator("RPC_CIRCUIT_BREAKER_THRESHOLD")
+    @classmethod
+    def _validate_rpc_breaker_threshold(cls, v: int) -> int:
+        # Round 6 § 3.2: 5 consecutive failures is the documented contract.
+        # Hard bounds keep a misconfigured env from disabling the breaker
+        # (v=0) or hiding real-world flakiness (v=10000).
+        if not 1 <= v <= 100:
+            raise ValueError(
+                f"RPC_CIRCUIT_BREAKER_THRESHOLD must be in [1, 100], got {v}."
+            )
+        return v
+
+    @field_validator("RPC_CIRCUIT_BREAKER_COOLDOWN_S")
+    @classmethod
+    def _validate_rpc_breaker_cooldown(cls, v: float) -> float:
+        if not 1.0 <= v <= 3600.0:
+            raise ValueError(
+                f"RPC_CIRCUIT_BREAKER_COOLDOWN_S must be in [1, 3600], got {v}."
+            )
+        return v
+
+    @field_validator("COVERAGE_ALERT_THRESHOLD")
+    @classmethod
+    def _validate_coverage_alert_threshold(cls, v: float) -> float:
+        # Coverage is a ratio in [0, 1]; an operator setting 1.0 disables
+        # the alert (everything is "low coverage"), and a negative would
+        # be silently always-firing.
+        if not 0.0 <= v <= 1.0:
+            raise ValueError(
+                f"COVERAGE_ALERT_THRESHOLD must be in [0, 1], got {v}."
+            )
+        return v
+
 
 settings = Settings()
 

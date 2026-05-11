@@ -1,0 +1,22 @@
+[Unit]
+Description=Polymarket Trade Observer (WebSocket + REST polling)
+After=network-online.target postgresql.service redis-server.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=polymarket
+Group=polymarket
+WorkingDirectory=/opt/polymarket-bot/
+EnvironmentFile=/opt/polymarket-bot/.env
+ExecStart=/opt/polymarket-bot/.venv/bin/python -m src.observer.main
+Restart=always
+RestartSec=5s
+StandardOutput=journal
+StandardError=journal
+
+# Round 6 § 3.5 memory budget.
+MemoryMax=400M
+
+[Install]
+WantedBy=multi-user.target

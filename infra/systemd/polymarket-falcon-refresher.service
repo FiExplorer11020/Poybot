@@ -1,0 +1,23 @@
+[Unit]
+Description=Polymarket Falcon Refresher (event-driven wallet enrichment)
+After=network-online.target postgresql.service redis-server.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=polymarket
+Group=polymarket
+WorkingDirectory=/opt/polymarket-bot/
+EnvironmentFile=/opt/polymarket-bot/.env
+# Wave 2 adds src/registry/refresher_main.py as the daemon entrypoint.
+ExecStart=/opt/polymarket-bot/.venv/bin/python -m src.registry.refresher_main
+Restart=always
+RestartSec=5s
+StandardOutput=journal
+StandardError=journal
+
+# Round 6 § 3.5 memory budget.
+MemoryMax=200M
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,22 @@
+[Unit]
+Description=Polymarket Dashboard API (FastAPI)
+After=network-online.target postgresql.service redis-server.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=polymarket
+Group=polymarket
+WorkingDirectory=/opt/polymarket-bot/
+EnvironmentFile=/opt/polymarket-bot/.env
+ExecStart=/opt/polymarket-bot/.venv/bin/python -m uvicorn src.api.main:app --host 127.0.0.1 --port 8000
+Restart=always
+RestartSec=5s
+StandardOutput=journal
+StandardError=journal
+
+# Round 6 § 3.5 memory budget.
+MemoryMax=300M
+
+[Install]
+WantedBy=multi-user.target

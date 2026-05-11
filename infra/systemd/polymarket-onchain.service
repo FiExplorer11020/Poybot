@@ -1,0 +1,23 @@
+[Unit]
+Description=Polymarket On-Chain CLOB Listener (Polygon chain ingestion)
+After=network-online.target postgresql.service redis-server.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=polymarket
+Group=polymarket
+WorkingDirectory=/opt/polymarket-bot/
+EnvironmentFile=/opt/polymarket-bot/.env
+# Wave 2 adds src/onchain/main.py as the daemon entrypoint.
+ExecStart=/opt/polymarket-bot/.venv/bin/python -m src.onchain.main
+Restart=always
+RestartSec=5s
+StandardOutput=journal
+StandardError=journal
+
+# Round 6 § 3.5 memory budget.
+MemoryMax=400M
+
+[Install]
+WantedBy=multi-user.target
