@@ -52,12 +52,17 @@ dependencies = [
     # event topic-0 hashes at module import.
     "eth-abi>=4.0,<6.0",
     "eth-hash[pycryptodome]>=0.5.0,<1.0",
+    # Round 6 — cold storage (src/cold_storage/). Both libs are mandatory
+    # on prod because cold export is part of the nightly batch, not an
+    # optional research tool. pyarrow used to live in the optional
+    # `backtest` extra; it's promoted to main deps here. duckdb is new.
+    "pyarrow>=14.0,<25.0",
+    "duckdb>=0.10,<2.0",
 ]
 
 [project.optional-dependencies]
 backtest = [
     "pandas>=2.0",
-    "pyarrow>=14.0",
 ]
 dev = [
     "pytest==8.1.0",

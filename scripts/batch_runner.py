@@ -441,6 +441,60 @@ async def _apply_one_retention_policy(
     return total_deleted
 
 
+# --------------------------------------------------------------------------- #
+# Cold storage export (Round 6 § 3.6 — Wave-2 Agent E)                         #
+# --------------------------------------------------------------------------- #
+#
+# Nightly Parquet export of yesterday's data from the hot Postgres tier to
+# /data/cold/<table>/year=YYYY/month=MM/day=DD/part-00000.parquet. Gated by
+# `COLD_EXPORT_ENABLED=true` so operator opts in (paths must exist + be
+# writable on the prod host). Per-table failures are logged but never abort
+# the rest of the sweep.
+
+
+def _cold_export_enabled() -> bool:
+    """Default OFF. Operator must opt in via env."""
+    return os.getenv("COLD_EXPORT_ENABLED", "false").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+
+
+async def step_cold_export() -> None:
+    """Step J: Export yesterday's data from hot Postgres tables to Parquet.
+
+    Sits AFTER `step_cleanup_old_trades` / `step_apply_retention_policies`
+    so the cold tier captures the post-retention shape of each table (the
+    operator is unlikely to want recently-deleted rows back, and exporting
+    BEFORE retention would briefly duplicate them on disk).
+    """
+    if not _cold_export_enabled():
+        logger.info(
+            "Cold export: COLD_EXPORT_ENABLED is false (default), skipping. "
+            "Set COLD_EXPORT_ENABLED=true to opt in."
+        )
+        return
+
+    # Import locally so the batch can run on hosts that don't yet have
+    # pyarrow/duckdb installed (legacy dev environments).
+    from src.cold_storage.exporter import ColdExporter
+
+    exporter = ColdExporter()
+    results = await exporter.run_nightly()
+
+    ok = sum(1 for r in results.values() if r.error is None)
+    failed = [t for t, r in results.items() if r.error is not None]
+    total_rows = sum(r.rows_exported for r in results.values())
+    total_bytes = sum(r.bytes_written for r in results.values())
+    logger.info(
+        f"Cold export: {ok}/{len(results)} table(s) ok, "
+        f"{total_rows} row(s), {total_bytes} byte(s) written"
+        + (f" — failed: {failed}" if failed else "")
+    )
+
+
 async def step_apply_retention_policies(*, dry_run: bool = False) -> None:
     """Step I: Apply per-table retention policies (audit R-6).
 
@@ -497,6 +551,9 @@ async def _run_steps(
             (),
             {"dry_run": dry_run},
         ),
+        # Cold export runs LAST so it captures the post-retention shape of
+        # each table — see step_cold_export docstring for rationale.
+        ("cold_export", step_cold_export, ()),
     ]
 
     for entry in steps:
