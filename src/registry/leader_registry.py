@@ -722,6 +722,41 @@ class LeaderRegistry:
                     liquidity_source,
                 )
                 count += 1
+
+                # Phase 3 Round 2 Agent Y (audit MG-3 §3.1): APPEND-ONLY
+                # dual-write to `market_features_history`. Every refresh
+                # creates a fresh row stamped at NOW() — the error model
+                # then reads the most-recent row at-or-before
+                # `pr.open_time` (the position's decision time) via a
+                # LATERAL JOIN, eliminating the AS-OF-NOW leakage the
+                # audit raised. We INSERT unconditionally so the
+                # provenance trail is complete (even rows that only
+                # carried a 574/gamma fallback are useful — the source
+                # tag tells consumers what they're reading). On failure
+                # we LOG-and-CONTINUE: a missing history row degrades
+                # gracefully to the live-`markets` fallback in
+                # `error_model._fetch_training_data`. We do NOT want a
+                # history write failure to abort the markets upsert.
+                try:
+                    await conn.execute(
+                        """
+                        INSERT INTO market_features_history
+                            (market_id, captured_at, liquidity_score,
+                             volume_24h, category, fee_rate_pct, source)
+                        VALUES ($1, NOW(), $2, $3, $4, $5, $6)
+                        """,
+                        mid,
+                        liquidity_score,
+                        volume_24h,
+                        category,
+                        fee_rate,
+                        liquidity_source,
+                    )
+                except Exception as exc:
+                    logger.debug(
+                        f"sync_markets: market_features_history insert "
+                        f"failed for {mid}: {exc}"
+                    )
             except Exception as exc:
                 logger.debug(f"sync_markets upsert failed for {mid}: {exc}")
         if count:

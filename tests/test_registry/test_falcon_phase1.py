@@ -27,6 +27,7 @@ plain counter + `asyncio.sleep(0)` rather than reaching for
 """
 
 import asyncio
+import time
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -335,20 +336,18 @@ class TestBackfillParallelisation:
         # cleanly (not raise).
         assert result == 0
 
-    @pytest.mark.xfail(
-        reason="Phase 3 Round 1 cursor-bootstrap regression: the test's "
-        "mocked trade payload {'x': 'trade'} lacks the timestamp/id "
-        "fields the new _cursor_filter_new() expects, so trades are "
-        "filtered out and result is 0 instead of 9. Fix in Round 2: "
-        "update test fixtures to provide cursor-compatible payloads.",
-        strict=False,
-    )
     @pytest.mark.asyncio
     async def test_one_failing_wallet_does_not_kill_the_batch(self, monkeypatch):
         """`return_exceptions=True` on the gather is the contract.
 
         Wallet #5 raises; the other 9 must still process and the
         function returns the count from the survivors.
+
+        Round 2 fix: mocked trade payloads now include the cursor fields
+        (`timestamp`, `transactionHash`) that Phase 3 Round 1's
+        ``_cursor_filter_new`` requires. With those fields, the trade
+        passes the cursor filter and ``_process_data_api_trade`` is
+        called once per wallet → result == 9.
         """
         monkeypatch.setattr(settings, "REGISTRY_BACKFILL_CONCURRENCY", 5)
 
@@ -357,13 +356,21 @@ class TestBackfillParallelisation:
         # Don't actually touch the DB — make _process_data_api_trade a no-op.
         obs._process_data_api_trade = AsyncMock()
 
+        future_ts = int(time.time()) + 3600  # ahead of any default cursor
+
         @asynccontextmanager
         async def fake_get(url, **_kwargs):
             if "0xwallet5" in url:
                 raise RuntimeError("simulated network failure")
             resp = AsyncMock()
             resp.status = 200
-            resp.json = AsyncMock(return_value=[{"x": "trade"}])
+            # Cursor-compatible payload: needs `timestamp` (seconds) and
+            # `transactionHash` so _cursor_filter_new keeps it.
+            resp.json = AsyncMock(return_value=[{
+                "timestamp": future_ts,
+                "transactionHash": "0xtrade1",
+                "proxyWallet": url.split("user=")[1].split("&")[0],
+            }])
             yield resp
 
         session = MagicMock()
@@ -376,12 +383,6 @@ class TestBackfillParallelisation:
         assert result == 9
         assert obs._process_data_api_trade.await_count == 9
 
-    @pytest.mark.xfail(
-        reason="Phase 3 Round 1 cursor-bootstrap regression: same root "
-        "cause as test_one_failing_wallet_does_not_kill_the_batch. "
-        "Fix in Round 2 by giving mocked trades a timestamp.",
-        strict=False,
-    )
     @pytest.mark.asyncio
     async def test_stuck_wallet_hits_8s_timeout_and_others_finish(
         self, monkeypatch
@@ -390,18 +391,17 @@ class TestBackfillParallelisation:
         cancel via `asyncio.wait_for`/the aiohttp timeout). The other
         wallets must still complete promptly.
 
-        We bypass aiohttp's own timeout machinery (mocked) and rely on
-        the fact that the slow wallet's coroutine raises TimeoutError
-        when the orchestration cancels it. The simplest way to trigger
-        the same code path under unit test is to make the slow wallet's
-        `session.get` raise `asyncio.TimeoutError` directly — that's
-        what aiohttp does on `ClientTimeout(total=8)` expiry.
+        Round 2 fix: same as test_one_failing_wallet — mocked trade
+        payloads now include `timestamp` and `transactionHash` so the
+        cursor filter keeps them.
         """
         monkeypatch.setattr(settings, "REGISTRY_BACKFILL_CONCURRENCY", 5)
 
         wallets = ["0xfast1", "0xfast2", "0xstuck", "0xfast3", "0xfast4"]
         obs = _make_observer_for_backfill(wallets)
         obs._process_data_api_trade = AsyncMock()
+
+        future_ts = int(time.time()) + 3600
 
         @asynccontextmanager
         async def fake_get(url, **_kwargs):
@@ -410,7 +410,11 @@ class TestBackfillParallelisation:
                 raise asyncio.TimeoutError("simulated 8 s timeout")
             resp = AsyncMock()
             resp.status = 200
-            resp.json = AsyncMock(return_value=[{"x": "trade"}])
+            resp.json = AsyncMock(return_value=[{
+                "timestamp": future_ts,
+                "transactionHash": "0xtrade1",
+                "proxyWallet": url.split("user=")[1].split("&")[0],
+            }])
             yield resp
 
         session = MagicMock()

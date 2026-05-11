@@ -424,6 +424,20 @@ class TestGetLeaderMarkets:
         assert "leaders" in sql
 
 
+def _markets_upsert_args(conn) -> tuple:
+    """Phase 3 Round 2 Agent Y: sync_markets now performs TWO execute()
+    calls per market — the markets UPSERT and the
+    market_features_history dual-write INSERT. The legacy assertions
+    used `conn.execute.call_args` which captures the LAST call (now the
+    history INSERT). This helper finds the markets UPSERT call so the
+    pre-existing assertions still pass."""
+    for call in conn.execute.await_args_list:
+        sql = call.args[0]
+        if "INSERT INTO markets" in sql:
+            return call.args
+    raise AssertionError("no markets UPSERT call found")
+
+
 class TestSyncMarkets:
     @pytest.mark.asyncio
     async def test_sync_markets_falls_back_to_gamma_when_falcon_unavailable(self):
@@ -450,8 +464,10 @@ class TestSyncMarkets:
             count = await registry.sync_markets(conn)
 
         assert count == 1
-        conn.execute.assert_awaited_once()
-        args = conn.execute.call_args.args
+        # Phase 3 Round 2 Agent Y dual-write: expect 2 execute() calls
+        # (markets UPSERT + market_features_history INSERT).
+        assert conn.execute.await_count == 2
+        args = _markets_upsert_args(conn)
         assert args[1] == "0xmkt"
         assert args[2] == "Will BTC be above $100k?"
         assert args[3] == "crypto"
@@ -487,7 +503,7 @@ class TestSyncMarkets:
         assert count == 1
         falcon.get_market_insights.assert_awaited_once_with("0xmkt")
 
-        args = conn.execute.call_args.args
+        args = _markets_upsert_args(conn)
         # SQL signature: $1 mid, $2 question, $3 category, $4 token_yes,
         # $5 token_no, $6 end_date, $7 volume_24h, $8 liquidity_score,
         # $9 fee_rate, $10 liquidity_score_source
@@ -519,7 +535,7 @@ class TestSyncMarkets:
 
         count = await registry.sync_markets(conn)
         assert count == 1
-        args = conn.execute.call_args.args
+        args = _markets_upsert_args(conn)
         assert args[8] == 0.42
         assert args[10] == "falcon_574"
 
@@ -545,6 +561,6 @@ class TestSyncMarkets:
         conn.fetch = AsyncMock(return_value=[{"market_id": "0xmkt"}])
 
         await registry.sync_markets(conn)
-        args = conn.execute.call_args.args
+        args = _markets_upsert_args(conn)
         assert args[8] is None
         assert args[10] is None

@@ -327,6 +327,14 @@ RETENTION_POLICIES: tuple[RetentionPolicy, ...] = (
     RetentionPolicy("fee_snapshots", "captured_at", 90),
     RetentionPolicy("system_control_audit", "changed_at", 365),
     RetentionPolicy("risk_config_history", "changed_at", 365),
+    # Phase 3 Round 2 Agent Y — market_features_history is APPEND-ONLY
+    # (~100 rows/day = ~36k rows/year). The error model reads at-or-
+    # before `pr.open_time`, so the practical retention floor is the
+    # phase-2 training lookback (90d) + some slack for late-resolved
+    # positions. Default 540d = 18 months gives a comfortable buffer
+    # for phase-3 retraining over multi-year windows and still keeps
+    # the table at <60k rows even at 2x volume.
+    RetentionPolicy("market_features_history", "captured_at", 540),
 )
 
 

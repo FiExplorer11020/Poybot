@@ -12,9 +12,12 @@ from loguru import logger
 
 from src.config import settings
 from src.control.redis_pubsub import Subscriber
+from src.control.redis_streams import StreamConsumer
 from src.database.connection import get_db
 
 REDIS_TRADES_CHANNEL = "trades:observed"
+TRADES_STREAM_NAME = "trades:stream"
+TRADES_STREAM_GROUP = "graph"
 
 
 class GraphEngine:
@@ -28,14 +31,34 @@ class GraphEngine:
         # F-04: dedicated pub/sub client with reconnect+resubscribe. The
         # previous code shared `self._redis` with command callers and
         # silently lost subscriptions on disconnect.
+        # TODO(round3): remove pubsub subscription once stream consumer has soaked.
         self._subscriber = Subscriber(settings.REDIS_URL, name="graph.engine")
         self._subscriber.register(REDIS_TRADES_CHANNEL, self._on_trade_message)
+        # Phase 3 Round 2 (re-add deferred from Round 1): durable Streams
+        # consumer with consumer-group + at-least-once + dead-letter. The
+        # graph's per-market deque already dedupes by (wallet, time, side)
+        # on the hot path, so receiving the same event from both pubsub
+        # and the stream is a harmless no-op until the pubsub safety net
+        # is removed.
+        self._trades_consumer = StreamConsumer(
+            settings.REDIS_URL,
+            stream=TRADES_STREAM_NAME,
+            group=TRADES_STREAM_GROUP,
+            consumer_name=f"{TRADES_STREAM_GROUP}.1",
+        )
+        self._trades_consumer.register(self._on_trade_stream_entry)
+
+    async def _on_trade_stream_entry(self, entry_id: str, payload: dict, *_args, **_kwargs) -> None:
+        """Adapter: StreamConsumer hands us (entry_id, payload); the
+        existing pub/sub handler takes (payload, channel). Forward."""
+        await self._on_trade_message(payload, REDIS_TRADES_CHANNEL)
 
     async def start(self) -> None:
         self._running = True
         self._stop_event.clear()
         await self._hydrate_recent_trades()
         await self._subscriber.start()
+        await self._trades_consumer.start()
         # Keep the coroutine alive so the watchdog's restart-on-completion
         # contract still holds. We sleep on the stop_event; the subscriber
         # owns its own task and reconnect loop.
@@ -48,6 +71,7 @@ class GraphEngine:
         self._running = False
         self._stop_event.set()
         await self._subscriber.stop()
+        await self._trades_consumer.stop()
 
     async def _on_trade_message(self, trade: dict, _channel: str) -> None:
         """Subscriber handler — payload is already JSON-decoded."""

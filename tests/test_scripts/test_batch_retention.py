@@ -275,8 +275,10 @@ def test_cli_default_is_not_dry_run():
 
 def test_retention_policies_cover_all_audit_r6_tables():
     """R-6 in docs/audit/01_data_inventory.md lists nine tables; make sure
-    the registry covers each one."""
-    expected = {
+    the registry covers each one. Later phases may ADD tables (e.g. Phase
+    3 R2 adds `market_features_history`), so we assert SUPERSET rather
+    than equality."""
+    audit_r6 = {
         "decision_log",
         "book_quality_snapshots",
         "portfolio_equity",
@@ -288,7 +290,8 @@ def test_retention_policies_cover_all_audit_r6_tables():
         "risk_config_history",
     }
     actual = {p.table for p in batch_runner.RETENTION_POLICIES}
-    assert actual == expected
+    missing = audit_r6 - actual
+    assert not missing, f"audit R-6 tables not covered by retention: {missing}"
 
 
 def test_retention_policies_have_positive_defaults():

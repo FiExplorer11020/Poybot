@@ -1,5 +1,14 @@
 """
 Unit tests for src/graph/hawkes_fitter.py
+
+NOTE — legacy, deprecated by bivariate refactor (Phase 3 Round 2 Task X).
+The univariate `hawkes_log_likelihood` helper has been kept as a backwards-
+compatible alias so the log-likelihood tests below still exercise the legacy
+NLL shape. The canonical fit tests live in `test_hawkes_bivariate.py`. Tests
+that asserted univariate behavior on `fit_edge`/`run_batch` or the exact
+UPDATE SQL shape have been adapted to the new contract: more columns are now
+written, and `_fit` now takes `(leader_times, follower_times, window_end)`
+and returns a (params, convergence_label) tuple.
 """
 
 from contextlib import asynccontextmanager
@@ -130,26 +139,30 @@ def test_hawkes_log_likelihood_empty_timestamps():
 
 def test_fit_recovers_approximate_params():
     """
-    Generate synthetic timestamps and verify fit returns a dict with expected keys
-    and valid numeric values.
+    Generate synthetic leader + follower timestamps and verify the bivariate
+    fit returns a (params, label) pair with positive μ, β and non-negative α.
+
+    Updated for the bivariate refactor: `_fit` now takes (leader_times,
+    follower_times, window_end) and returns ((mu, alpha, beta), label).
     """
     from src.graph.hawkes_fitter import HawkesFitter
 
     fitter = HawkesFitter()
-    # Generate 20 events via inter-arrival exponential (simple Poisson approximation)
     rng = np.random.default_rng(seed=123)
-    timestamps = np.cumsum(rng.exponential(10.0, 20))
-    window_end = float(timestamps[-1]) + 1.0
+    # Two independent Poisson-ish streams — fit should still succeed.
+    leader_times = np.cumsum(rng.exponential(10.0, 30))
+    follower_times = np.cumsum(rng.exponential(8.0, 30))
+    window_end = float(max(leader_times[-1], follower_times[-1])) + 1.0
 
-    result = fitter._fit(timestamps, window_end)
+    result, label = fitter._fit(leader_times, follower_times, window_end)
 
-    # Should return a 3-tuple (mu, alpha, beta)
     assert result is not None
     assert len(result) == 3
     mu, alpha, beta = result
     assert mu > 0
-    assert alpha > 0
+    assert alpha >= 0
     assert beta > 0
+    assert label in {"converged", "fallback_nelder_mead"}
 
 
 @pytest.mark.asyncio
@@ -253,6 +266,10 @@ async def test_run_batch_updates_edges():
         "alpha": 0.3,
         "beta": 1.0,
         "alpha_mu_ratio": 3.0,
+        "log_likelihood": -42.5,
+        "n_leader_events": 17,
+        "n_follower_events": 21,
+        "convergence": "converged",
     }
 
     with (
@@ -264,10 +281,14 @@ async def test_run_batch_updates_edges():
     assert updated == 1
     assert conn_update.execute.called
     execute_args = conn_update.execute.call_args[0]
-    # First arg is SQL with UPDATE
+    # First arg is SQL with UPDATE — the bivariate refactor writes more
+    # columns but still updates the legacy alpha_mu column for backward compat.
     assert "UPDATE follower_edges" in execute_args[0]
     assert "hawkes_alpha_mu" in execute_args[0]
-    # Second arg is the rounded alpha_mu_ratio
+    assert "hawkes_alpha" in execute_args[0]
+    assert "hawkes_mu" in execute_args[0]
+    assert "hawkes_beta" in execute_args[0]
+    # Second arg is the rounded alpha_mu_ratio (legacy column position).
     assert float(execute_args[1]) == pytest.approx(3.0, abs=0.001)
 
 

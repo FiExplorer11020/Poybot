@@ -23,6 +23,10 @@ from src.config import settings
 from src.database.connection import get_db
 from src.economics.models import ECONOMIC_MODEL_VERSION
 from src.economics.versioning import valid_position_filter, valid_profile_learning_filter
+from src.profiler.feature_store import (
+    get_market_features_asof_batch,
+    record_fallback_live,
+)
 from src.profiler.behavior_profiler import (
     _compute_deviation_score,
     _compute_maturity,
@@ -490,21 +494,23 @@ class ErrorModel:
                         pr.size_usdc,
                         pr.pnl_usdc,
                         COALESCE(m.category, 'unknown') AS category,
-                        -- LEAKAGE: liquidity_score is the CURRENT
-                        -- markets.liquidity_score, not the as-of-trade-time
-                        -- value. A market that became liquid two weeks
-                        -- AFTER `pr.open_time` will look liquid in
-                        -- training but was illiquid at decision time.
-                        -- Phase 0 Task C (audit MG-3, docs/audit/05_ml_pipeline.md §3.1)
-                        -- adds `markets.liquidity_score_updated_at` so a
-                        -- future as-of read path becomes possible; the
-                        -- proper fix is a `market_liquidity_history`
-                        -- table fed by `sync_markets` and queried via
-                        -- `WHERE ts <= pr.open_time ORDER BY ts DESC LIMIT 1`.
-                        -- Tracked as Phase 3 feature-store work. Until
-                        -- then we accept the leakage rather than
-                        -- silently NULL-ing the feature, which would
-                        -- regress phase-2/3 training samples.
+                        -- Phase 3 Round 2 Agent Y (audit MG-3 §3.1):
+                        -- the liquidity_score read below is the
+                        -- CURRENT `markets.liquidity_score` and is
+                        -- used ONLY as the legacy fallback for
+                        -- positions whose `open_time` predates the
+                        -- `market_features_history` dual-write start.
+                        -- The point-in-time-correct read happens
+                        -- below via `get_market_features_asof_batch`,
+                        -- which queries `market_features_history`
+                        -- with `captured_at <= pr.open_time` for
+                        -- every (market_id, open_time) pair in a
+                        -- single LATERAL JOIN. The fallback rate is
+                        -- tracked via the
+                        -- polybot_feature_store_lookups_total
+                        -- Prometheus counter (label result=fallback_live)
+                        -- so the legacy-row footprint can be observed
+                        -- shrinking as the dual-write history accumulates.
                         COALESCE(m.liquidity_score, 0.5) AS liquidity_score,
                         (
                             SELECT AVG(recent.price) FROM (
@@ -575,6 +581,21 @@ class ErrorModel:
                     """,
                     wallet,
                 )
+
+                # Phase 3 Round 2 Agent Y (audit MG-3 §3.1): batched
+                # point-in-time feature read. For each historical
+                # position we ask `market_features_history` for the
+                # most-recent row with `captured_at <= pr.open_time`.
+                # This replaces the AS-OF-NOW read of
+                # `markets.liquidity_score` that the audit flagged as
+                # leakage. Single roundtrip via LATERAL JOIN — no N+1
+                # even for thousands of positions.
+                asof_queries: list[tuple[str, datetime]] = [
+                    (str(r["market_id"]), r["open_time"]) for r in rows
+                ]
+                asof_features = await get_market_features_asof_batch(
+                    conn, asof_queries
+                )
         except Exception as e:
             logger.error(f"Fetch training data error: {e}")
             return None
@@ -584,6 +605,7 @@ class ErrorModel:
         _ensure_profile_schema(rolling_profile)
         trade_index = 0
         edge_first_observed = [row["first_observed"] for row in follower_edges]
+        fallback_live_count = 0
 
         for row in rows:
             open_time = row["open_time"]
@@ -636,12 +658,26 @@ class ErrorModel:
                 int(rolling_profile["accuracy"].get("resolved_count", 0) or 0),
                 confirmed_followers,
             )
+            # Phase 3 Round 2 Agent Y: as-of liquidity_score lookup.
+            # If `market_features_history` has a row at-or-before
+            # `open_time` for this market, use that value. Otherwise
+            # fall back to the live `markets.liquidity_score` (captured
+            # in `row["liquidity_score"]`) and bump the fallback
+            # counter — this is the legacy-row path for positions
+            # whose `open_time` predates the dual-write start.
+            asof_row = asof_features.get((str(row["market_id"]), open_time))
+            if asof_row is not None and asof_row.get("liquidity_score") is not None:
+                liquidity_value = float(asof_row["liquidity_score"])
+            else:
+                liquidity_value = float(row["liquidity_score"] or 0.5)
+                fallback_live_count += 1
+
             trade_context = {
                 "category": category,
                 "is_contrarian": is_contrarian,
                 "deviation_score": _compute_deviation_score(rolling_profile, trade),
                 "size_ratio": _size_ratio_from_profile(rolling_profile, trade["size_usdc"]),
-                "liquidity_score": float(row["liquidity_score"] or 0.5),
+                "liquidity_score": liquidity_value,
                 "process_score": process_insights["process_score"],
                 "flip_rate": process_insights["flip_rate"],
                 "scale_in_rate": process_insights["scale_in_rate"],
@@ -674,6 +710,17 @@ class ErrorModel:
                 rolling_profile.setdefault("loss_analysis", {})["last_position_loss_at"] = (
                     close_time.isoformat() if close_time is not None else open_time.isoformat()
                 )
+
+        # Phase 3 Round 2 Agent Y: surface the fallback rate through
+        # the feature-store metrics so dashboards can watch the legacy-
+        # row footprint shrink as `market_features_history` accumulates.
+        if fallback_live_count > 0:
+            record_fallback_live(fallback_live_count)
+            logger.debug(
+                f"Fetch training data for {wallet}: {fallback_live_count}/{len(rows)} "
+                "positions used live `markets.liquidity_score` fallback "
+                "(no market_features_history row at-or-before open_time)"
+            )
 
         return {"X": features, "y": y}
 

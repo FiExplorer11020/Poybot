@@ -260,6 +260,37 @@ falcon_daily_budget_remaining = Gauge(
     "Calls remaining in today's Falcon event-driven refresh budget",
 )
 
+# === Phase 3 Round 2 — Point-in-time feature store (Agent Y) ===
+# Owned by ``src/profiler/feature_store.py``. The feature store closes
+# audit MG-3 / §3.1 (training leakage via AS-OF-NOW reads of
+# `markets.liquidity_score`). These three metrics expose:
+#   1. Lookup outcome (asof_hit | fallback_live | miss) so dashboards
+#      can track how often the training path is forced to fall back
+#      to the live `markets` row for pre-dual-write legacy positions.
+#      `fallback_live` trending down over time is the success signal.
+#   2. Batch size distribution — the typical training pass batches
+#      hundreds to thousands of (market_id, asof) tuples through a
+#      single LATERAL JOIN, so the histogram exposes the N+1
+#      avoidance guarantee at a glance.
+#   3. Lookup latency, bucketed by batch size (so single-row hot-path
+#      reads and 5k-row training reads don't share a histogram).
+feature_store_lookups_total = Counter(
+    "polybot_feature_store_lookups_total",
+    "market_features_history lookups",
+    ["table", "result"],  # result: asof_hit|fallback_live|miss
+)
+feature_store_batch_size = Histogram(
+    "polybot_feature_store_batch_size",
+    "Number of (market_id, asof) tuples per batched lookup",
+    buckets=(1, 10, 100, 1000, 10000),
+)
+feature_store_lookup_latency_seconds = Histogram(
+    "polybot_feature_store_lookup_latency_seconds",
+    "Lookup latency",
+    ["batch_size_bucket"],
+    buckets=(0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0),
+)
+
 # === Phase 3 Round 1 — Ingest Health Watchdog (Agent D) ===
 # Owned by ``src/monitoring/ingest_health.py``. The IngestHealthMonitor
 # tracks freshness of every ingestion source (WS, REST data-api, Falcon
@@ -294,6 +325,64 @@ ingest_threshold_breaches_active = Gauge(
     "polybot_ingest_threshold_breaches_active",
     "Currently-active gap states (1=active, 0=closed)",
     ["source"],
+)
+
+# === Phase 3 Round 2 — Order-book imbalance feature pipeline (Agent Z) ===
+# Owned by ``src/observer/orderbook_observer.py`` (rollup loop) and
+# ``src/profiler/feature_store.py`` (read path). Closes the "highest-ROI
+# new data source" recommendation in docs/audit/05_ml_pipeline.md
+# summary. The rollup runs every 60 s with a 70 s lookback. The `source`
+# label on the ingest counter lets us tell apart live WS-driven writes
+# vs operator-driven backfill once `scripts/orderbook_backfill.py`
+# lands. The `result` label on the rollup counter distinguishes a normal
+# run (`ok`), a window with zero raw snapshots (`empty` — common during
+# quiet hours), and a DB / parse error (`error` — should be rare; see
+# the rollup loop's broad except handler).
+orderbook_snapshots_ingested_total = Counter(
+    "polybot_orderbook_snapshots_ingested_total",
+    "Raw book_quality_snapshots rows written",
+    ["source"],  # ws|backfill
+)
+orderbook_rollup_runs_total = Counter(
+    "polybot_orderbook_rollup_runs_total",
+    "Per-minute rollup invocations",
+    ["result"],  # ok|empty|error
+)
+orderbook_rollup_rows_per_run = Histogram(
+    "polybot_orderbook_rollup_rows_per_run",
+    "Markets x tokens with non-zero snapshots per rollup",
+    buckets=(0, 5, 25, 100, 500, 2000),
+)
+orderbook_features_lookup_total = Counter(
+    "polybot_orderbook_features_lookup_total",
+    "Feature store orderbook lookups",
+    ["result"],  # hit|stale|miss
+)
+
+# === Phase 3 Round 2 — Bivariate Hawkes fitter (Agent X) ===
+# Owned by ``src/graph/hawkes_fitter.py``. The legacy fitter was univariate
+# and silently confirmed every clustered retail trader as a follower (see
+# docs/audit/05_ml_pipeline.md § MG-5). The new fitter is bivariate
+# leader→follower with closed-form MLE; these three metrics let the
+# dashboard see (a) how many fits land on each solver path, (b) wall-time
+# per fit (the cold path's budget is ~10 min for the whole nightly), and
+# (c) the distribution of α/μ ratios — a sanity check that the gate
+# threshold (>1.0 = confirmed) is hitting meaningful tails, not 100% of
+# edges (the symptom of the old bug).
+hawkes_fits_total = Counter(
+    "polybot_hawkes_fits_total",
+    "Bivariate Hawkes fits performed",
+    ["result"],  # converged|fallback_nelder_mead|degenerate|failed
+)
+hawkes_fit_duration_seconds = Histogram(
+    "polybot_hawkes_fit_duration_seconds",
+    "Wall time per Hawkes fit",
+    buckets=(0.01, 0.05, 0.1, 0.5, 1.0, 5.0, 30.0),
+)
+hawkes_alpha_mu_ratio = Histogram(
+    "polybot_hawkes_alpha_mu_ratio",
+    "Distribution of fitted alpha/mu ratios - sanity check on follower-edge quality",
+    buckets=(0.0, 0.1, 0.3, 0.5, 1.0, 2.0, 5.0, 10.0),
 )
 
 

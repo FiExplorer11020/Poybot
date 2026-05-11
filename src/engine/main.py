@@ -36,6 +36,7 @@ from src.monitoring.ingest_health import (
     SOURCE_WS_MARKET_FEED,
     get_health_monitor,
 )
+from src.observer.orderbook_observer import OrderBookObserver
 from src.profiler.behavior_profiler import BehaviorProfiler
 from src.profiler.error_model import ErrorModel
 from src.telegram_bot import TelegramBot
@@ -170,6 +171,14 @@ async def main() -> None:
     # the last 30 minutes of trades_observed so a restart doesn't lose
     # in-flight follower windows.
     graph = GraphEngine(redis_client=redis_client)
+    # OrderBookObserver (Phase 3 Round 2 Agent Z): per-minute rollup of
+    # `book_quality_snapshots` → `orderbook_features_minute`. The raw
+    # feed is written by the trade observer container (`trade_observer.
+    # _record_book_metrics` → `_persist_book_quality_snapshot`); this
+    # rollup is read-only on the source. Sleep cadence is 60 s with a
+    # 70 s lookback for boundary safety. Best-effort: a missed minute
+    # is missed (backfill is explicit, not live-path).
+    orderbook_observer = OrderBookObserver(redis_client=redis_client)
     # TelegramBot (S3.9): receives push alerts for opens/closes/killswitch/
     # crash and exposes /status, /pnl, /positions, /mode, /killswitch,
     # /pause, /resume. Disabled by default — see TELEGRAM_ENABLED in
@@ -239,6 +248,11 @@ async def main() -> None:
     await watchdog.register("paper_trader", paper_trader.start)
     await watchdog.register("graph", graph.start)
     await watchdog.register("telegram_bot", telegram_bot.start)
+    # Wired AFTER graph so the source-of-truth raw feed (written by the
+    # trade observer container) has had time to flow — the rollup
+    # tolerates an empty window cleanly but starting the loop earlier
+    # buys us nothing.
+    await watchdog.register("orderbook_observer", orderbook_observer.start)
 
     scheduler = Scheduler()
     scheduler.add_cron(
@@ -295,6 +309,10 @@ async def main() -> None:
         await paper_trader.stop()
         await graph.stop()
         await telegram_bot.stop()
+        try:
+            await orderbook_observer.stop()
+        except Exception:
+            pass
         try:
             await get_runtime_config().stop_pubsub()
         except Exception:
