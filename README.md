@@ -4,6 +4,26 @@ Bot de trading orienté intelligence de wallets Polymarket. Le système observe 
 
 Le bot est déployé en production sur Hetzner Helsinki (CX23, Ubuntu 22.04, 2 vCPU / 4 GB) et tourne 24/7 en mode paper trading. Le live trading est gated par flags (`LIVE_TRADING_DRY_RUN=true` par défaut).
 
+## Strategic documents — read these first
+
+- **[VISION.md](VISION.md)** — the product we are building, the thesis ("trade
+  the volatility the leader creates, not the leader's signal"), the 5 pillars
+  nobody else has wired together, success criteria.
+- **[ROADMAP.md](ROADMAP.md)** — Rounds 6–12 sequenced. ~30 weeks single-dev
+  from today's foundation to the end-state. Each round has deliverables,
+  effort, risk, acceptance criteria.
+- **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)** — the target end-state
+  architecture, module by module. Includes current state, target state, data
+  contracts, and the cross-cutting principles (point-in-time correctness,
+  Redis Streams for durability, append-only logs, the sacred killswitch).
+- **[docs/audit/CHANGELOG.md](docs/audit/CHANGELOG.md)** — full retrospective
+  of every change since the audit started: 8 commits, +258 unit tests, 50
+  Prometheus series, 9 new SQL migrations.
+
+The README below describes the **current state** (Phase 3 Round 5). The
+**target state** is in the docs above. Start there if you want to understand
+where we're going, not just where we are.
+
 ## Capabilities at a glance
 
 - **Leader registry** Falcon API (10 agents : leaderboard, Wallet360, trades, PnL, market insights, etc.)
