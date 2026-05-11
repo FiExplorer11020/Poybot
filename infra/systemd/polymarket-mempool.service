@@ -1,0 +1,29 @@
+[Unit]
+Description=Polymarket Bot — Mempool Watcher + LeaderIntent publisher
+Documentation=https://github.com/your-org/polymarket-bot/blob/main/docs/ROUND_7_MEMPOOL_AND_PREFILL.md
+After=network-online.target redis-server.service polymarket-onchain.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=polymarket
+Group=polymarket
+WorkingDirectory=/opt/polymarket-bot/
+EnvironmentFile=/opt/polymarket-bot/.env
+ExecStart=/opt/polymarket-bot/.venv/bin/python -m src.mempool
+Restart=always
+RestartSec=5s
+
+# Per Round 7 § 2.2 memory budget — 300 MB ceiling.
+# Mempool subscription state + bloom filter + nonce tracker fit
+# comfortably inside this.
+MemoryMax=300M
+
+StandardOutput=journal
+StandardError=journal
+
+# Logging tag for journalctl filtering.
+SyslogIdentifier=polymarket-mempool
+
+[Install]
+WantedBy=multi-user.target

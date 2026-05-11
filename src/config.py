@@ -663,6 +663,135 @@ class Settings(BaseSettings):
             )
         return v
 
+    # ------------------------------------------------------------------ #
+    # Round 7 (The Front Door) — Mempool watcher + pre-signed order pool  #
+    # ------------------------------------------------------------------ #
+    # See docs/ROUND_7_MEMPOOL_AND_PREFILL.md § 3.5-3.6 for the spec.
+    #
+    # POLYMARKET_CLOB_CONTRACT_ADDRESS is REUSED from the R6 onchain
+    # block above — DO NOT redeclare it here. The mempool tx decoder
+    # uses the same address as the on-chain log decoder.
+
+    # Size bucket schedule for PreSignedPool. The pool pre-signs one
+    # order per (market × token × direction × bucket) combination; on
+    # fire we pick the largest bucket <= the leader's intended size.
+    # 4 buckets is the architect's pick — adding more buckets squares
+    # the pool size (~3200 → ~6400 at 6 buckets) for diminishing
+    # alpha-capture gains.
+    PREFILL_POOL_SIZE_BUCKETS_USDC: list[int] = [500, 2000, 10_000, 50_000]
+    # How long a single pre-signed order stays valid before the
+    # rotation task drops it. 5 min is the architect's pick: matches
+    # the natural rotation cadence and gives the pool a 10× safety
+    # margin vs PREFILL_ROTATION_INTERVAL_S below.
+    PREFILL_ORDER_VALIDITY_S: int = 300
+    # How often the rotation background task scans for expired sigs
+    # AND triggers re-signs to keep the pool warm. 30 s × 10 cycles
+    # = 5 min — exactly one full validity window per re-sign cadence.
+    PREFILL_ROTATION_INTERVAL_S: int = 30
+    # How many markets the pool warms at boot. Top-100 by 24h volume
+    # captures >95% of leader signal; below 100 we'd start missing
+    # mid-tier markets where some leaders specialise.
+    PREFILL_TOP_MARKETS: int = 100
+    # Headline latency budget for the IntentRouter (intent_received →
+    # fire_complete). R7 § 6 acceptance gate is p50 < 250 ms. We
+    # surface this as a config knob so the dashboard alert can read
+    # the same number the code targets.
+    MEMPOOL_INTENT_LATENCY_BUDGET_MS: int = 250
+    # How often the WatchedWalletIndex rebuild loop polls
+    # wallet_universe. Matches the R6 AdaptiveDepth review cadence
+    # so tier transitions propagate to the bloom within 5 min.
+    WATCHED_WALLET_INDEX_REFRESH_S: int = 300
+    # Master shadow-mode switch. Wave-2 plumbs this through
+    # RuntimeConfig.get_value('prefill_live_enabled', default=False)
+    # so the operator can flip it at runtime via /api/risk/update.
+    # The static default here is the safe "shadow mode" — fire only
+    # paper trades on detected intents until the 30-day soak proves
+    # the strategy works on paper.
+    PREFILL_LIVE_ENABLED: bool = False
+
+    @field_validator("PREFILL_POOL_SIZE_BUCKETS_USDC")
+    @classmethod
+    def _validate_prefill_buckets(cls, v: list[int]) -> list[int]:
+        # Architect contract: ascending, positive, at most 8 buckets.
+        # Empty list disables prefill entirely (operator can flip to []
+        # to short-circuit the path without redeploying).
+        if not isinstance(v, list):
+            raise ValueError(
+                f"PREFILL_POOL_SIZE_BUCKETS_USDC must be a list, got {type(v)}"
+            )
+        if len(v) > 8:
+            raise ValueError(
+                f"PREFILL_POOL_SIZE_BUCKETS_USDC: at most 8 buckets, got {len(v)}"
+            )
+        if v != sorted(v):
+            raise ValueError(
+                f"PREFILL_POOL_SIZE_BUCKETS_USDC must be ascending, got {v}"
+            )
+        if any(b <= 0 for b in v):
+            raise ValueError(
+                f"PREFILL_POOL_SIZE_BUCKETS_USDC must be all positive, got {v}"
+            )
+        return v
+
+    @field_validator("PREFILL_ORDER_VALIDITY_S")
+    @classmethod
+    def _validate_prefill_validity(cls, v: int) -> int:
+        # Architect bounds: validity must comfortably exceed rotation
+        # interval (safety margin) and not balloon past 1 h (stale
+        # signatures are a liability). 60 s lower bound matches the
+        # smallest reasonable rotation cadence.
+        if not 60 <= v <= 3600:
+            raise ValueError(
+                f"PREFILL_ORDER_VALIDITY_S must be in [60, 3600], got {v}."
+            )
+        return v
+
+    @field_validator("PREFILL_ROTATION_INTERVAL_S")
+    @classmethod
+    def _validate_prefill_rotation(cls, v: int) -> int:
+        # Bounds keep the rotation reasonable. >300 s would lose the
+        # safety-margin property; <5 s would hammer the signing path.
+        if not 5 <= v <= 300:
+            raise ValueError(
+                f"PREFILL_ROTATION_INTERVAL_S must be in [5, 300], got {v}."
+            )
+        return v
+
+    @field_validator("PREFILL_TOP_MARKETS")
+    @classmethod
+    def _validate_prefill_top_markets(cls, v: int) -> int:
+        if not 0 <= v <= 1000:
+            raise ValueError(
+                f"PREFILL_TOP_MARKETS must be in [0, 1000], got {v}. "
+                "0 disables warm; 1000 is far past the realistic top tier."
+            )
+        return v
+
+    @field_validator("MEMPOOL_INTENT_LATENCY_BUDGET_MS")
+    @classmethod
+    def _validate_mempool_latency_budget(cls, v: int) -> int:
+        # Architect bounds: < 50 ms is unachievable on a Polygon-public
+        # mempool. > 5 s means we've lost the alpha (followers see
+        # confirmation in 5-10 s under the R3 5s poll cadence). The
+        # acceptance gate from R7 § 6 is 250 ms p50.
+        if not 50 <= v <= 5000:
+            raise ValueError(
+                f"MEMPOOL_INTENT_LATENCY_BUDGET_MS must be in [50, 5000], got {v}."
+            )
+        return v
+
+    @field_validator("WATCHED_WALLET_INDEX_REFRESH_S")
+    @classmethod
+    def _validate_watched_wallet_refresh(cls, v: int) -> int:
+        # Below 30 s the rebuild becomes the dominant SQL load on
+        # wallet_universe. Above 1h tier transitions take too long to
+        # propagate to the bloom.
+        if not 30 <= v <= 3600:
+            raise ValueError(
+                f"WATCHED_WALLET_INDEX_REFRESH_S must be in [30, 3600], got {v}."
+            )
+        return v
+
 
 settings = Settings()
 

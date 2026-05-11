@@ -10,6 +10,7 @@ topology (see `docs/ROUND_6_THE_SPINE.md` § 3.5).
 | `polymarket-onchain.service`           | `src.onchain.main` *(Wave 2)*   | 400 MB        |
 | `polymarket-crawler.service`           | `src.crawler.main` *(Wave 2)*   | 200 MB        |
 | `polymarket-falcon-refresher.service`  | `src.registry.refresher_main` *(Wave 2)* | 200 MB |
+| `polymarket-mempool.service`           | `src.mempool` *(Round 7)*       | 300 MB        |
 | `polymarket-api.service`               | `src.api.main` (uvicorn)        | 300 MB        |
 
 Total budget: ~2.3 GB (CX23 has 4 GB; leaves headroom for Postgres + Redis).
@@ -53,6 +54,7 @@ sudo systemctl enable --now polymarket-observer.service
 sudo systemctl enable --now polymarket-onchain.service
 sudo systemctl enable --now polymarket-crawler.service
 sudo systemctl enable --now polymarket-falcon-refresher.service
+sudo systemctl enable --now polymarket-mempool.service
 sudo systemctl enable --now polymarket-api.service
 
 # 4. Verify everything is active (running).

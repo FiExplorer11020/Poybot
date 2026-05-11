@@ -523,6 +523,108 @@ ingestion_daemon_memory_bytes = Gauge(
     ["service"],
 )
 
+# === Round 7 (The Front Door) — Mempool watcher (src/mempool/) ===
+# Owned by src.mempool.{node_client,tx_decoder,event_emitter}. Five
+# metrics cover the firehose: how many tx Erigon hands us, how many we
+# successfully decode, how many target a watched wallet, and the
+# distribution of replacement-chain depths. The latency budget itself
+# is measured by intent_router_latency_seconds further down; these are
+# the pure-ingestion volume / quality signals. See
+# docs/ROUND_7_MEMPOOL_AND_PREFILL.md § 5.
+mempool_subscriptions_active = Gauge(
+    "polybot_mempool_subscriptions_active",
+    "1 iff the named mempool provider has an active eth_subscribe socket",
+    ["provider"],  # local_erigon|alchemy|quicknode (the RPC pool labels)
+)
+mempool_tx_received_total = Counter(
+    "polybot_mempool_tx_received_total",
+    "Pending tx the mempool subscription handed to the decoder",
+    ["source"],  # erigon|fallback (paid provider without filter support)
+)
+mempool_tx_decoded_total = Counter(
+    "polybot_mempool_tx_decoded_total",
+    "Outcome of every decode attempt on a received mempool tx",
+    ["result"],  # decoded|not_clob|decode_failed
+)
+mempool_wallet_matches_total = Counter(
+    "polybot_mempool_wallet_matches_total",
+    "Mempool tx whose from-address matched the WatchedWalletIndex",
+)
+mempool_replacement_chain_length = Histogram(
+    "polybot_mempool_replacement_chain_length",
+    "Distribution of (wallet,nonce) replacement-chain lengths at confirmation",
+    # Most chains are length 1 (no replacement). Long chains hint at
+    # gas-war / deception behavior — fingerprint for the R8 strategy
+    # classifier.
+    buckets=(1, 2, 3, 5, 8, 13, 21, 34, 55),
+)
+
+# === Round 7 — Pre-signed order pool (src/execution/prefill/pool.py) ===
+# Owned by PreSignedPool. The size gauge feeds the dashboard's "are we
+# warm?" panel; the misses counter is the headline acceptance metric
+# (acceptance criteria in R7 § 6 want filled > pool_miss in steady
+# state). signing_seconds tracks the background latency budget so a
+# regression in py-clob-client signing surfaces immediately.
+prefill_pool_size = Gauge(
+    "polybot_prefill_pool_size",
+    "Pre-signed orders currently warehoused, keyed by market and direction",
+    ["market", "direction"],  # direction: buy|sell
+)
+prefill_pool_misses_total = Counter(
+    "polybot_prefill_pool_misses_total",
+    "Pool lookups that found no matching pre-signed order",
+    # reason: no_signature|below_min_bucket|signature_expired|all_in_flight
+    ["reason"],
+)
+prefill_pool_signing_seconds = Histogram(
+    "polybot_prefill_pool_signing_seconds",
+    "Wall time per pre-sign call (background warm path)",
+    # Typical signing is 30–80 ms; tail rare > 250 ms.
+    buckets=(0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5),
+)
+
+# === Round 7 — Intent router (src/execution/prefill/intent_router.py) ===
+# Owned by IntentRouter. The decision counter explains every branch of
+# the R7 § 3.6 decision tree (killswitch / confidence / size / cooldown
+# / pool_miss / filled). The latency histogram is the headline R7
+# acceptance metric: p50 < 250 ms, p99 < 3 s.
+intent_router_decisions_total = Counter(
+    "polybot_intent_router_decisions_total",
+    "IntentRouter decision outcomes per consumed mempool intent",
+    # result: filled|pool_miss|killswitch_off|risk_blocked|cooldown|
+    #         confidence_skip|size_cap|shadow|error
+    ["result"],
+)
+intent_router_latency_seconds = Histogram(
+    "polybot_intent_router_latency_seconds",
+    "intent_received -> fire_complete wall time (R7 § 6 acceptance gate)",
+    # Tight low-end buckets — the whole point of R7 is sub-second
+    # latency. Buckets per the architect spec (25 ms ... 5 s).
+    buckets=(0.025, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0),
+)
+
+# === Round 7 — End-to-end latency + shadow-vs-live calibration ===
+# intent_to_confirm_seconds is the §6 acceptance gate
+# ("p50 ≤ Polygon's 2 s block time"), measured fire → chain confirm
+# (reconciler updates mempool_observations.confirmed_at). The
+# shadow_vs_live_pnl_diff gauge surfaces the running drift between the
+# paper-traded shadow path and what the live path would have produced;
+# operators watch this during the 30-day soak.
+mempool_intent_to_confirm_seconds = Histogram(
+    "polybot_mempool_intent_to_confirm_seconds",
+    "fire_complete -> chain confirmation wall time",
+    # Polygon block time is ~2 s; tail ~10 s on network congestion.
+    buckets=(0.5, 1.0, 2.0, 4.0, 8.0, 15.0, 30.0),
+)
+mempool_shadow_vs_live_pnl_diff_usdc = Gauge(
+    "polybot_mempool_shadow_vs_live_pnl_diff_usdc",
+    "Running PnL diff: live-would-have - shadow-actual, USDC. "
+    "During the 30-day soak the IntentRouter logs both; the diff "
+    "tells operators whether shipping live is justified.",
+    # Unlabelled — single global signal for the dashboard
+    # comparison panel.
+)
+
 
 # ---------------------------------------------------------------------------
 # Build info — best-effort. Surfaces version + git short-SHA on /metrics so a
