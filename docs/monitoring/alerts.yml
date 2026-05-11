@@ -147,3 +147,54 @@ groups:
             Messages are being routed to the deadletter stream — the
             consumer-group is dropping work it can't process. Inspect the
             stream and drain manually.
+
+  # ---------------------------------------------------------------------- #
+  # Round 6 — Cross-source coverage reconciler + on-chain ingest health    #
+  # ---------------------------------------------------------------------- #
+  - name: polybot_coverage
+    interval: 30s
+    rules:
+      # The headline R6 alert: REST/WS ingestion missing ≥5% of the
+      # on-chain truth for 10 min = a real hole in our data acquisition.
+      - alert: TradeIngestionCoverageLow
+        expr: polybot_coverage_ratio < 0.95
+        for: 10m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Source {{ $labels.source }} seeing <95% of on-chain trades"
+          description: >
+            Coverage ratio is {{ $value | humanizePercentage }}. Either a
+            hole in our REST polling or the data-api itself is dropping
+            trades. Investigate via the Inspector dashboard's source-mix
+            panel.
+
+      # Cross-source disagreement rate. Some disagreement is normal due
+      # to async commit timing across the three ingest paths; sustained
+      # disagreement at this rate means a real ingestion bug.
+      - alert: TradeIngestionCoverageDisagreementHigh
+        expr: rate(polybot_coverage_disagreement_total[10m]) > 0.5
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Cross-source trade disagreement rate elevated"
+          description: >
+            {{ $value }} trades/min are being seen by one source but not
+            another. Some disagreement is normal due to timing; sustained
+            means a real ingestion bug.
+
+      # On-chain ingestion liveness — if the listener stops processing
+      # blocks the coverage_ratio gauges would silently flatline at zero
+      # (no onchain denominator), so this is the underlying alert that
+      # explains an otherwise-confusing coverage drop.
+      - alert: ChainIngestionNotProgressing
+        expr: rate(polybot_chain_blocks_processed_total[5m]) == 0
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "On-chain ingestion has stopped processing blocks"
+          description: >
+            polymarket-onchain.service either crashed or lost RPC
+            connection. Check journalctl -u polymarket-onchain.service.
