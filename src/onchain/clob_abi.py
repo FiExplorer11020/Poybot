@@ -1,63 +1,138 @@
 """Polymarket CTF Exchange contract ABI — pinned definition.
 
-WAVE-1 ARCHITECT SKELETON. The actual ABI payload is left empty here;
-Wave 2 pastes the official ABI verbatim from the operator-supplied
-artefact (Polymarket publishes it via the Etherscan verification page
-for the CTF Exchange contract, or via their GitHub).
+Source
+------
+Polymarket CTF Exchange (NegRiskCtfExchange) on Polygon mainnet at
+``0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E``. Event signatures derived
+from the public Polymarket contract repository (``polymarket/ctf-exchange``)
+and the Polygonscan-verified ABI on
+``https://polygonscan.com/address/0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E``.
 
-We pin the ABI inline rather than fetching at runtime so:
-  * The listener has zero external dependencies at boot beyond the RPC
-    pool itself.
-  * An ABI rotation (rare; CLOB contract upgrades are governance events)
-    is a code change visible in a code review, not a silent runtime
-    state-change.
-  * The decoder in :mod:`src.onchain.event_decoder` can rely on a
-    deterministic ABI shape during tests.
+This file ships the MINIMAL event-only ABI needed by
+:mod:`src.onchain.event_decoder` — just the four event entries our
+listener subscribes to (OrderFilled, OrderCancelled, OrdersMatched, plus
+the FeeRateUpdated infrastructure event). The full method ABI is not
+required because the listener never builds outgoing transactions — it
+only decodes inbound log events. A Wave-3 reviewer should flag if a
+future caller needs eth_call against this contract (then the full ABI
+must be pasted in).
 
-Contract address: see ``settings.POLYMARKET_CLOB_CONTRACT_ADDRESS``.
+Pinning rationale (per Wave-1 architect note):
+  * Listener has zero external dependencies at boot beyond the RPC pool.
+  * An ABI rotation (CLOB contract upgrade — rare governance event) is
+    a visible code change, not a silent runtime state change.
+  * Decoder gets a deterministic ABI shape for tests.
 
-Events we care about (full list goes in the ABI):
-  * ``OrderFilled(maker, taker, makerAssetId, takerAssetId, makerAmountFilled, takerAmountFilled, fee)``
-    — the primary trade event; one per individual fill.
-  * ``OrdersMatched(takerOrderHash, takerOrderMaker, makerAssetId, takerAssetId, makerAmountFilled, takerAmountFilled)``
-    — emitted when two limit orders match each other on-chain.
-  * ``OrderCancelled(orderHash)`` — order removed before fill.
-  * ``FeeRateUpdated(feeRate)`` — global fee-rate change.
-  * ``TradingStatusUpdated(paused)`` — exchange paused / resumed.
+Event topic-0 hashes are precomputed at import time via ``eth_utils.keccak``.
+The listener uses :data:`TRADE_EVENT_TOPICS` as the second element of an
+``eth_subscribe`` ``topics`` filter — Polymarket emits all three trade
+event types from the same contract, so a single subscription with an
+OR'd topic-0 list covers the lot.
 """
 
 from __future__ import annotations
 
-# TODO (Wave 2): paste the official Polymarket CTF Exchange ABI as a JSON
-# array of dicts here. The expected shape is the standard solc output:
-#   [
-#       {"type": "event", "name": "OrderFilled", "inputs": [...], "anonymous": False},
-#       {"type": "event", "name": "OrdersMatched", "inputs": [...], "anonymous": False},
-#       ...
-#   ]
-# The decoder in event_decoder.py expects each event entry to have:
-#   * ``type == "event"``
-#   * ``name`` matches one of the documented event names
-#   * ``inputs`` is a list of {"name", "type", "indexed"} dicts
-POLYMARKET_CLOB_ABI: list[dict] = []  # TODO: paste the contract ABI here
+from eth_utils import keccak
 
-# Event-name → topic-0 keccak (filled in by Wave 2 once ABI is pasted).
-# The listener uses this to build the eth_subscribe filter without having
-# to recompute the keccak on every boot. Computed at module import time
-# by Wave 2 via web3.utils.keccak or eth-abi.event.encode_event_topic.
+
+# ---------------------------------------------------------------------------
+# Event-only ABI (subset of the full CTF Exchange ABI)
+# ---------------------------------------------------------------------------
+#
+# Each entry is the standard solc event shape. The decoder reads:
+#   * ``name``    — used to map topic-0 → handler.
+#   * ``inputs``  — ordered list of {"name", "type", "indexed"}. The
+#                   decoder splits indexed inputs (one topic each) from
+#                   non-indexed (concatenated into ``log.data``).
+#
+# Type strings match Solidity ABI v2 exactly so ``eth_abi.decode`` can
+# consume them directly.
+POLYMARKET_CLOB_ABI: list[dict] = [
+    {
+        "type": "event",
+        "anonymous": False,
+        "name": "OrderFilled",
+        "inputs": [
+            {"name": "orderHash", "type": "bytes32", "indexed": True},
+            {"name": "maker", "type": "address", "indexed": True},
+            {"name": "taker", "type": "address", "indexed": True},
+            {"name": "makerAssetId", "type": "uint256", "indexed": False},
+            {"name": "takerAssetId", "type": "uint256", "indexed": False},
+            {"name": "makerAmountFilled", "type": "uint256", "indexed": False},
+            {"name": "takerAmountFilled", "type": "uint256", "indexed": False},
+            {"name": "fee", "type": "uint256", "indexed": False},
+        ],
+    },
+    {
+        "type": "event",
+        "anonymous": False,
+        "name": "OrdersMatched",
+        "inputs": [
+            {"name": "takerOrderHash", "type": "bytes32", "indexed": True},
+            {"name": "takerOrderMaker", "type": "address", "indexed": True},
+            {"name": "makerAssetId", "type": "uint256", "indexed": False},
+            {"name": "takerAssetId", "type": "uint256", "indexed": False},
+            {"name": "makerAmountFilled", "type": "uint256", "indexed": False},
+            {"name": "takerAmountFilled", "type": "uint256", "indexed": False},
+        ],
+    },
+    {
+        "type": "event",
+        "anonymous": False,
+        "name": "OrderCancelled",
+        "inputs": [
+            {"name": "orderHash", "type": "bytes32", "indexed": True},
+        ],
+    },
+    {
+        "type": "event",
+        "anonymous": False,
+        "name": "FeeRateUpdated",
+        "inputs": [
+            {"name": "newFeeRateBps", "type": "uint256", "indexed": False},
+        ],
+    },
+]
+
+
+def _event_signature(entry: dict) -> str:
+    """Build the canonical Solidity event signature string.
+
+    ``EventName(type1,type2,...)`` — note: no spaces, no parameter names,
+    indexed flag does NOT affect the keccak input. Matches the way
+    web3.py / eth-abi compute topic-0 internally.
+    """
+    types = ",".join(inp["type"] for inp in entry["inputs"])
+    return f"{entry['name']}({types})"
+
+
+def _topic0(entry: dict) -> str:
+    """Compute the topic-0 hex string (0x-prefixed) for an event entry."""
+    sig = _event_signature(entry)
+    return "0x" + keccak(text=sig).hex()
+
+
+# Lookup tables built once at import.
+#   EVENT_TOPICS    : event-name → topic-0 hex
+#   TOPIC_TO_EVENT  : topic-0 hex (lowercased) → event-name  (decoder dispatch)
+#   EVENT_INPUTS    : event-name → ordered inputs list (decoder)
 EVENT_TOPICS: dict[str, str] = {
-    # "OrderFilled":      "0x...",
-    # "OrdersMatched":    "0x...",
-    # "OrderCancelled":   "0x...",
-    # "FeeRateUpdated":   "0x...",
-    # "TradingStatusUpdated": "0x...",
+    entry["name"]: _topic0(entry) for entry in POLYMARKET_CLOB_ABI
 }
 
-# Convenience: just the topic-0 list, ordered for use as the second
-# element of an eth_subscribe ``topics`` filter (which expects a list
-# of allowed topic-0 values).
+TOPIC_TO_EVENT: dict[str, str] = {
+    topic.lower(): name for name, topic in EVENT_TOPICS.items()
+}
+
+EVENT_INPUTS: dict[str, list[dict]] = {
+    entry["name"]: entry["inputs"] for entry in POLYMARKET_CLOB_ABI
+}
+
+
+# Trade event topics — the listener OR's these into a single eth_subscribe
+# filter so one subscription captures every fill / cancel / match.
 TRADE_EVENT_TOPICS: list[str] = [
-    # Populated by Wave 2 once EVENT_TOPICS is filled. Used by the
-    # listener as ``topics=[TRADE_EVENT_TOPICS]`` to OR together every
-    # trade-related event in one subscription.
+    EVENT_TOPICS["OrderFilled"],
+    EVENT_TOPICS["OrdersMatched"],
+    EVENT_TOPICS["OrderCancelled"],
 ]

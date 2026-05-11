@@ -44,6 +44,14 @@ dependencies = [
     # /metrics endpoint is scraped over LAN. See docs/audit/phase1/
     # M_metrics_foundation.md for the full contract.
     "prometheus-client==0.20.0",
+    # Round 6 — On-chain CLOB ingestion (src/onchain/). eth-abi is the
+    # minimal log decoder we need; the full web3.py stack would pull
+    # tens of transitive deps for no upside since the listener only
+    # decodes inbound logs (no contract calls / tx building). The
+    # pycryptodome extra wires the keccak backend used to compute
+    # event topic-0 hashes at module import.
+    "eth-abi>=4.0,<6.0",
+    "eth-hash[pycryptodome]>=0.5.0,<1.0",
 ]
 
 [project.optional-dependencies]
