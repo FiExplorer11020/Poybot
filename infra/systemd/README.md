@@ -14,35 +14,83 @@ topology (see `docs/ROUND_6_THE_SPINE.md` § 3.5).
 
 Total budget: ~2.3 GB (CX23 has 4 GB; leaves headroom for Postgres + Redis).
 
+## Pre-flight
+
+Confirm the prerequisites are in place on the box (`polymarket-prod`,
+`/opt/polymarket-bot/`):
+
+```bash
+# 1. The service account exists and owns the deploy tree.
+id polymarket || sudo useradd --system --home /opt/polymarket-bot --shell /usr/sbin/nologin polymarket
+sudo chown -R polymarket:polymarket /opt/polymarket-bot
+
+# 2. The venv exists and the deploy is current (rsync from local).
+ls /opt/polymarket-bot/.venv/bin/python
+ls /opt/polymarket-bot/.env
+
+# 3. Postgres + Redis are reachable.
+sudo -u polymarket /opt/polymarket-bot/.venv/bin/python -c \
+  "from src.database.connection import get_db; import asyncio; asyncio.run(get_db().__aenter__())"
+```
+
+If any of those fail, fix them BEFORE installing the units — a unit
+that crashes on first start because `.env` is missing is a confusing
+first-impression for an operator new to the box.
+
 ## Install (production box, as root)
 
 ```bash
-# 1. Create the service account once.
-useradd --system --home /opt/polymarket-bot --shell /usr/sbin/nologin polymarket
+# 1. Copy the units into systemd's search path.
+sudo cp infra/systemd/polymarket-*.service /etc/systemd/system/
 
-# 2. Copy the units into systemd's search path.
-cp infra/systemd/polymarket-*.service /etc/systemd/system/
+# 2. Reload systemd so it picks up the new units.
+sudo systemctl daemon-reload
 
-# 3. Reload, then enable each unit so it survives reboot.
-systemctl daemon-reload
-systemctl enable polymarket-engine.service
-systemctl enable polymarket-observer.service
-systemctl enable polymarket-onchain.service
-systemctl enable polymarket-crawler.service
-systemctl enable polymarket-falcon-refresher.service
-systemctl enable polymarket-api.service
+# 3. Enable + start each unit in one shot (--now is idempotent and
+#    survives reboot).
+sudo systemctl enable --now polymarket-engine.service
+sudo systemctl enable --now polymarket-observer.service
+sudo systemctl enable --now polymarket-onchain.service
+sudo systemctl enable --now polymarket-crawler.service
+sudo systemctl enable --now polymarket-falcon-refresher.service
+sudo systemctl enable --now polymarket-api.service
 
-# 4. Start them.
-systemctl start polymarket-engine.service
-systemctl start polymarket-observer.service
-systemctl start polymarket-onchain.service
-systemctl start polymarket-crawler.service
-systemctl start polymarket-falcon-refresher.service
-systemctl start polymarket-api.service
-
-# 5. Verify.
+# 4. Verify everything is active (running).
 systemctl status polymarket-*.service
+
+# 5. Tail a unit's journal to watch startup.
 journalctl -u polymarket-onchain.service -f
+```
+
+If a unit shows `failed` or `activating (auto-restart)`, the journal
+is the source of truth — `journalctl -u <unit> -n 200 --no-pager`
+typically tells you whether it's a missing dependency, a Python import
+error, or a `.env` issue.
+
+## Migration from the pre-Round-6 monolith
+
+Until Round 6, ingestion lived inside `polymarket-engine.service`. The
+new unit set splits ingestion across separate processes. Switch over
+in this order so there's never a window with zero ingestion:
+
+```bash
+# 1. Drop the legacy unit's ingestion responsibilities. The engine
+#    will keep running but stop spawning its in-process WS / crawler
+#    coroutines (controlled by INGESTION_IN_PROCESS=false in .env).
+sudo sed -i 's/^INGESTION_IN_PROCESS=.*/INGESTION_IN_PROCESS=false/' /opt/polymarket-bot/.env
+
+# 2. Restart engine so it picks up the new env.
+sudo systemctl restart polymarket-engine.service
+
+# 3. Bring the new daemons online (already enabled from the install
+#    step above).
+sudo systemctl start polymarket-onchain.service \
+                     polymarket-crawler.service \
+                     polymarket-falcon-refresher.service
+
+# 4. Watch chain_sync_state.last_processed_block + wallet_universe row
+#    count tick forward over the next few minutes. If they don't, fall
+#    back via the rollback section below.
 ```
 
 ## Operational notes
