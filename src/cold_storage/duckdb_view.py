@@ -23,8 +23,8 @@ from typing import Any
 import duckdb
 from loguru import logger
 
-from src.config import settings
 from src.cold_storage.exporter import TABLE_TIME_COLUMNS
+from src.config import settings
 
 
 class DuckDBResearchView:

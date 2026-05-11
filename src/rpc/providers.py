@@ -52,7 +52,7 @@ except Exception:  # pragma: no cover — defensive fallback
 RPC_ACQUIRE_TIMEOUT_S: float = 5.0
 
 
-class NoRPCProviderAvailable(RuntimeError):
+class NoRPCProviderAvailable(RuntimeError):  # noqa: N818 - public API, kept stable
     """Raised when ProviderPool.acquire() exhausts its wait budget with
     every provider either UNHEALTHY, breaker-open, or rate-limited."""
 

@@ -360,7 +360,10 @@ class EventDecoder:
         except Exception:
             log_index = 0
         try:
-            block_time_val = float(_to_int(block_time)) if isinstance(block_time, str) and block_time.startswith(("0x", "0X")) else float(block_time)
+            if isinstance(block_time, str) and block_time.startswith(("0x", "0X")):
+                block_time_val = float(_to_int(block_time))
+            else:
+                block_time_val = float(block_time)
         except Exception:
             block_time_val = 0.0
         return {

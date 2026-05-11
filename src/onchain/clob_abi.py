@@ -34,7 +34,6 @@ from __future__ import annotations
 
 from eth_utils import keccak
 
-
 # ---------------------------------------------------------------------------
 # Event-only ABI (subset of the full CTF Exchange ABI)
 # ---------------------------------------------------------------------------

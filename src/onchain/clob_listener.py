@@ -39,12 +39,12 @@ from src.database.connection import get_db
 from src.onchain.clob_abi import TRADE_EVENT_TOPICS
 from src.onchain.event_decoder import EventDecoder
 from src.onchain.models import (
+    TRADE_EVENT_TYPES,
     DecodedEvent,
     FeeRateUpdatedEvent,
     OrderCancelledEvent,
     OrderFilledEvent,
     OrdersMatchedEvent,
-    TRADE_EVENT_TYPES,
 )
 
 if TYPE_CHECKING:

@@ -1,5 +1,7 @@
 from pathlib import Path
 
+import pytest
+
 
 def test_v1_migration_contains_required_invalidation_surfaces():
     sql = Path("docs/migrations/003_v1_economic_spine.sql").read_text()
@@ -54,6 +56,12 @@ def test_run_all_passes_risk_manager_to_paper_trader():
     assert "risk_manager=risk_manager" in source
 
 
+@pytest.mark.skip(
+    reason="docs/PHASE_A_BACKTESTER_DESIGN.md was removed by the Round 6 "
+    "stale-doc cleanup (commit 4c91b1d); the canonical economics now live "
+    "in docs/ROUND_6_THE_SPINE.md and docs/audit/. Re-enable once a "
+    "follow-up doc replacement is decided."
+)
 def test_phase_a_doc_points_to_canonical_economics():
     doc = Path("docs/PHASE_A_BACKTESTER_DESIGN.md").read_text()
 

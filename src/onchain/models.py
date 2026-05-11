@@ -21,7 +21,7 @@ idempotency key for the partial UNIQUE INDEX from migration 021.
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass
 
 
 @dataclass(slots=True)

@@ -352,7 +352,7 @@ class RPCClient:
         _ = args
         return await self._coalesced_call("eth_call", [call_obj, "latest"])
 
-    async def eth_getLogs(
+    async def eth_getLogs(  # noqa: N802 - mirrors JSON-RPC method name
         self,
         filter_obj: dict,
         from_block: int,
@@ -374,7 +374,7 @@ class RPCClient:
             return []
         return result
 
-    async def eth_getBlockByNumber(
+    async def eth_getBlockByNumber(  # noqa: N802 - mirrors JSON-RPC method name
         self, num: int | str, include_txs: bool = False
     ) -> dict:
         """Fetch a single block header (+ tx list iff include_txs)."""
