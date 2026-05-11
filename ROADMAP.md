@@ -10,11 +10,81 @@
 
 ---
 
-## Round 6 — Mempool watcher + pre-signed order pool
+## Round 6 — The Spine (Data Sovereignty Layer)
+
+**The foundation round.** Every later round assumes the data is there
+— no holes, no rate limits, infinite history. This round makes that
+assumption true.
+
+The breakthrough insight: Polymarket trades are on-chain Polygon events.
+The Falcon API and data-api are value-added layers on top of the same
+chain data. We stop being a consumer of opinionated APIs and become a
+**node operator** with our own Polygon node + multi-RPC redundancy +
+process-split ingestion + tiered storage + universal wallet coverage.
+
+### Headline deliverables
+- **`infra/polygon-node/`** — self-hosted Erigon pruned node on a 2nd
+  Hetzner box (CX31 + 200 GB volume, €21/mo). Private-network link to
+  the bot box.
+- **`src/rpc/`** — multi-provider RPC abstraction (local Erigon as
+  primary, Alchemy + QuickNode as fallback). Circuit breaker, in-flight
+  call coalescing, adaptive token buckets per provider.
+- **`src/onchain/clob_listener.py`** — direct subscription to
+  Polymarket CLOB contract events. Every trade arrives in ~2s with
+  wallet attribution NATIVELY from the chain. 100% coverage by
+  construction.
+- **`src/crawler/`** — Universal Wallet Crawler covering ALL ~1.5M
+  Polymarket wallets ever, with adaptive depth tiers (full / periodic /
+  light tracking).
+- **`src/ingestion_daemon/`** — process-per-source split via systemd.
+  Engine GIL stalls can no longer cascade into ingestion. This is the
+  structural fix for "10-30 min pauses."
+- **`src/cold_storage/`** — nightly Parquet export of all hot tables;
+  DuckDB virtual views for research notebooks. Years of history
+  queryable in seconds.
+- **`src/monitoring/coverage_reconciler.py`** — cross-source comparison
+  every 5 min. Alerts fire if any source sees < 95% of the chain truth.
+
+### Full spec: see [`docs/ROUND_6_THE_SPINE.md`](docs/ROUND_6_THE_SPINE.md)
+
+### Dependencies
+- A second Hetzner box. €21/mo. Free private-network link.
+- Paid RPC providers (Alchemy / QuickNode free tiers initially) — used
+  during initial Erigon sync, then demoted to standby.
+- 2 TB of public Polygon snapshot ingestion (one-time, bootstraps
+  Erigon faster than network sync).
+
+### Effort
+~9 weeks single-dev (Erigon sync runs in parallel with code, so wall
+time ≈ engineering time).
+
+### Risk: 3/5 (composite)
+- Most components are well-understood; the integration is the work.
+- The biggest unknown is whether the wallet-universe backfill (1.5M
+  rows via paid-RPC eth_getLogs) blows the free-tier budget — pre-
+  flight against the providers' cost calculators before committing.
+
+### Acceptance criteria
+- `polybot_coverage_ratio{source="onchain"} = 1.0` for 7 consecutive days
+- `polybot_coverage_ratio{source="rest_poll"} > 0.95` (REST stays a healthy redundancy)
+- `polybot_chain_blocks_behind < 3` in steady state
+- `polybot_wallet_universe_size > 1_000_000` after backfill
+- A DuckDB notebook query against 90 days of cold trades returns in < 5 s
+- All ingester daemons survive `kill -9` without trade loss (Redis Stream consumer group recovers)
+
+---
+
+## Round 7 — Mempool watcher + pre-signed order pool
 
 **The headline.** The only legitimate path to "BEFORE the leader." Watch
 Polygon mempool for known leader-wallet transactions, decode them, fire
 pre-signed orders to the CLOB.
+
+> **Note**: this was the original Round 6. Round 6 was renamed to The
+> Spine because mempool watching is one consumer of the broader
+> ingestion architecture — it builds on `src/rpc/` and the local Erigon
+> node from Round 6. The substrate makes Round 7 simpler than the
+> original R6 plan.
 
 ### Deliverables
 - `src/mempool/` new module:
@@ -68,7 +138,7 @@ pre-signed orders to the CLOB.
 
 ---
 
-## Round 7 — Strategy classifier (the "why" layer)
+## Round 8 — Strategy classifier (the "why" layer)
 
 **Why this matters**: today the bot treats every leader the same. A
 swing trader behaves nothing like a market-maker, but our FOLLOW
@@ -132,9 +202,9 @@ leader a per-strategy posterior.
 
 ---
 
-## Round 8 — Multivariate Hawkes + follower-pool dynamics
+## Round 9 — Multivariate Hawkes + follower-pool dynamics
 
-**Round 5's BIC fix closed the false-positive bug**. Round 8 generalises
+**Round 5's BIC fix closed the false-positive bug**. Round 9 generalises
 the model from pairwise causality to **population-level** dynamics. This
 is what enables the volume-prediction edge in VISION § 1.
 
@@ -187,7 +257,7 @@ careful initialization and observation-model design.
 
 ---
 
-## Round 9 — Causal inference layer
+## Round 10 — Causal inference layer
 
 **Why**: Hawkes catches statistical association. Statistical association
 isn't causation. When a news event hits, both the leader and the
@@ -245,7 +315,7 @@ this is the most research-heavy round.
 
 ---
 
-## Round 10 — CLOB book-level-3 ingestion + microstructure features
+## Round 11 — CLOB book-level-3 ingestion + microstructure features
 
 **Why**: today we aggregate book data per minute (Round 2 orderbook
 pipeline). Real microstructure — iceberg orders, order-placement
@@ -290,7 +360,7 @@ leverage features.
 
 ---
 
-## Round 11 — Social signal + cross-market index
+## Round 12 — Social signal + cross-market index
 
 **Why**: many leaders telegraph entries on X/Twitter/Discord MINUTES
 before the trade. Pre-trade signal. Plus cross-market arb wallets
@@ -336,7 +406,7 @@ positions is alpha.
 
 ---
 
-## Round 12 — Continuous calibration loop + research notebook
+## Round 13 — Continuous calibration loop + research notebook
 
 **Why**: a bot that doesn't know when it's wrong silently dies. The
 audit's Phase 0 work added the prerequisites (decision logging, outcome
@@ -411,10 +481,14 @@ This is the discipline that compounds.
 
 If a round can't ship in its estimated effort window, the next round
 **does not start**. The roadmap is sequential under dependency, parallel
-where independent (Round 10 ‖ Round 8, Round 11 ‖ everything after
-Round 7). Bottleneck: hand-labelling for Round 7 is single-dev-blocking.
+where independent (Round 11 ‖ Round 9, Round 12 ‖ everything after
+Round 8). Bottleneck: hand-labelling 100 wallets for Round 8 is
+single-dev-blocking.
 
-Total: ~30 weeks single-dev to land Round 6 → Round 12.
+Total: ~39 weeks single-dev to land Round 6 → Round 13.
+
+Round 6 alone is 9 weeks but is the prerequisite for every other
+round. It's worth it.
 
 ---
 
