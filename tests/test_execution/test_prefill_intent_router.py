@@ -317,7 +317,7 @@ async def test_size_cap_uses_runtime_config_risk_per_trade_pct():
         await router._on_intent(intent)
 
     # Should have advanced to shadow (default), NOT size_cap.
-    assert conn.execute_calls[0][0][12] == RESULT_SHADOW
+    assert _last_fire_result(conn) == RESULT_SHADOW
 
 
 @pytest.mark.asyncio
@@ -337,7 +337,7 @@ async def test_cooldown_blocks_intent():
 
     pool.fire.assert_not_called()
     paper.open_trade.assert_not_called()
-    assert conn.execute_calls[0][0][12] == RESULT_COOLDOWN
+    assert _last_fire_result(conn) == RESULT_COOLDOWN
 
 
 @pytest.mark.asyncio
@@ -362,7 +362,7 @@ async def test_shadow_mode_routes_to_paper_trader():
     assert decision["trade_context"]["intent_id"] == intent.intent_id
     assert decision["trade_context"]["source"] == "mempool_prefill_shadow"
     assert decision["signal_audit"]["accepted"] is True
-    assert conn.execute_calls[0][0][12] == RESULT_SHADOW
+    assert _last_fire_result(conn) == RESULT_SHADOW
 
 
 @pytest.mark.asyncio
@@ -381,7 +381,7 @@ async def test_live_mode_pool_miss():
 
     pool.fire.assert_awaited_once_with(intent)
     paper.open_trade.assert_not_called()
-    assert conn.execute_calls[0][0][12] == RESULT_POOL_MISS
+    assert _last_fire_result(conn) == RESULT_POOL_MISS
 
 
 @pytest.mark.asyncio
@@ -405,7 +405,7 @@ async def test_live_mode_filled():
         await router._on_intent(intent)
 
     pool.fire.assert_awaited_once_with(intent)
-    assert conn.execute_calls[0][0][12] == RESULT_FILLED
+    assert _last_fire_result(conn) == RESULT_FILLED
 
 
 @pytest.mark.asyncio
@@ -436,7 +436,7 @@ async def test_live_mode_toctou_killswitch_recheck_blocks_fire():
         await router._on_intent(_make_intent())
 
     pool.fire.assert_not_called()
-    assert conn.execute_calls[0][0][12] == RESULT_KILLSWITCH_OFF
+    assert _last_fire_result(conn) == RESULT_KILLSWITCH_OFF
     # Both checks must have used bypass_cache=True.
     assert ks.is_real_execution_enabled.await_count == 2
     for call in ks.is_real_execution_enabled.await_args_list:
@@ -459,23 +459,26 @@ async def test_mempool_observation_row_fields():
 
     assert len(conn.execute_calls) == 1
     args = conn.execute_calls[0][0]
-    # Positional args: (sql, intent_id, wallet, market_id, token_id,
-    # side, size_usdc, intent_received_at, tx_hash, nonce, replaces,
-    # expected_block, fired_at, fire_result, latency_ms_to_fire)
-    assert isinstance(args[1], uuid.UUID)
-    assert str(args[1]) == intent_id_str
-    assert args[2] == intent.wallet
-    assert args[3] == intent.market_id
-    assert args[4] == intent.token_id
-    assert args[5] == intent.side
-    assert args[6] == intent.size_usdc
-    assert args[7] == intent.intent_received_at
-    assert args[8] == intent.tx_hash
-    assert args[9] == int(intent.nonce)
-    assert args[10] is None  # replaces_tx_hash
-    assert args[11] == int(intent.expected_block)
-    assert args[12] == RESULT_SHADOW
-    assert isinstance(args[13], int) and args[13] >= 0
+    assert isinstance(_insert_field(args, "intent_id"), uuid.UUID)
+    assert str(_insert_field(args, "intent_id")) == intent_id_str
+    assert _insert_field(args, "wallet_address") == intent.wallet
+    assert _insert_field(args, "market_id") == intent.market_id
+    assert _insert_field(args, "token_id") == intent.token_id
+    assert _insert_field(args, "side") == intent.side
+    assert _insert_field(args, "size_usdc") == intent.size_usdc
+    assert (
+        _insert_field(args, "intent_received_at")
+        == intent.intent_received_at
+    )
+    assert _insert_field(args, "tx_hash") == intent.tx_hash
+    assert _insert_field(args, "nonce") == int(intent.nonce)
+    assert _insert_field(args, "replaces_tx_hash") is None
+    assert (
+        _insert_field(args, "expected_block") == int(intent.expected_block)
+    )
+    assert _insert_field(args, "fire_result") == RESULT_SHADOW
+    latency = _insert_field(args, "latency_ms_to_fire")
+    assert isinstance(latency, int) and latency >= 0
 
 
 @pytest.mark.asyncio
@@ -524,7 +527,11 @@ async def test_decisions_counter_labels_each_branch():
         m.inc = MagicMock()
         return m
 
-    fake_counter.labels = MagicMock(side_effect=_labels)
+    # Mirror labels(result=...) kwarg form used by the implementation.
+    def _labels_kw(*args, **kwargs):
+        return _labels(kwargs.get("result") or (args[0] if args else ""))
+
+    fake_counter.labels = MagicMock(side_effect=_labels_kw)
 
     conn = _FakeConn()
 
@@ -569,7 +576,7 @@ async def test_on_intent_swallows_unexpected_exceptions():
 
     # Paper raised — but the router still records the shadow row.
     assert conn.execute_calls
-    assert conn.execute_calls[0][0][12] == RESULT_SHADOW
+    assert _last_fire_result(conn) == RESULT_SHADOW
 
 
 @pytest.mark.asyncio
@@ -595,14 +602,14 @@ async def test_runtime_config_flag_flips_live_mode():
             pool=pool, paper_trader=paper, runtime_config=rc_off
         )
         await router_off._on_intent(_make_intent())
-        assert conn.execute_calls[-1][0][12] == RESULT_SHADOW
+        assert _last_fire_result(conn) == RESULT_SHADOW
 
         # Flag ON → live (pool fires).
         router_on = _make_router(
             pool=pool, paper_trader=paper, runtime_config=rc_on
         )
         await router_on._on_intent(_make_intent())
-        assert conn.execute_calls[-1][0][12] == RESULT_FILLED
+        assert _last_fire_result(conn) == RESULT_FILLED
         pool.fire.assert_awaited()
 
 
@@ -623,7 +630,7 @@ async def test_runtime_config_get_failure_falls_back_to_settings():
     # Safe default = shadow, no pool fire.
     pool.fire.assert_not_called()
     paper.open_trade.assert_awaited_once()
-    assert conn.execute_calls[0][0][12] == RESULT_SHADOW
+    assert _last_fire_result(conn) == RESULT_SHADOW
 
 
 @pytest.mark.asyncio
@@ -656,7 +663,7 @@ async def test_stream_entry_rehydrates_payload():
         await router._on_stream_entry(payload, "mempool:leader_intent", "0-1")
 
     paper.open_trade.assert_awaited_once()
-    assert conn.execute_calls[0][0][12] == RESULT_SHADOW
+    assert _last_fire_result(conn) == RESULT_SHADOW
 
 
 @pytest.mark.asyncio
@@ -674,8 +681,12 @@ async def test_malformed_stream_payload_does_not_crash():
         # Missing required fields.
         await router._on_stream_entry({"intent_id": "not-a-uuid"}, "s", "0-1")
 
-    # Counter incremented with RESULT_ERROR.
-    labels_seen = [c.args[0] for c in fake_counter.labels.call_args_list]
+    # Counter incremented with RESULT_ERROR (called as labels(result=...)).
+    labels_seen = [
+        (c.kwargs.get("result") if c.kwargs else None)
+        or (c.args[0] if c.args else None)
+        for c in fake_counter.labels.call_args_list
+    ]
     assert RESULT_ERROR in labels_seen
 
 
@@ -700,4 +711,4 @@ async def test_in_cooldown_missing_on_risk_manager_is_tolerated():
 
     # Decision proceeds past the cooldown gate -> shadow.
     paper.open_trade.assert_awaited_once()
-    assert conn.execute_calls[0][0][12] == RESULT_SHADOW
+    assert _last_fire_result(conn) == RESULT_SHADOW

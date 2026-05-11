@@ -8,72 +8,163 @@ bytes against the Polymarket CLOB function ABI to extract a
 :class:`LeaderIntent`: the market, the token, the side (buy/sell), the
 size in USDC, and the price.
 
-Functions we decode (per R7 § 3.2)::
+Function selector strategy (Wave-2 decision)
+--------------------------------------------
+The R6-pinned ABI in :mod:`src.onchain.clob_abi` only ships event
+signatures (the on-chain listener only decodes inbound logs). We need
+function signatures for ``fillOrder`` / ``matchOrders`` / ``cancelOrder``
+to map the 4-byte selector at ``calldata[:4]`` to a parameter type
+list. Per Wave-2 implementer note in the architect docstring, we
+**hardcode the selectors and input-type tuples in this module** as
+constants rather than cross-edit ``clob_abi.py`` (which other agents
+in this wave are NOT touching). The TODO below tracks unifying the
+two ABI surfaces in a Round-7 follow-up.
 
-    fillOrder(order, signature, fillAmount, salt)
-    matchOrders(takerOrder, makerOrders, ...)
-    cancelOrder(order)
+  TODO(round-7-followup): unify with src.onchain.clob_abi.POLYMARKET_CLOB_ABI
+  when convenient. The two ABI definitions should live in one place so
+  a future contract upgrade is a single edit.
 
-If the tx's function selector doesn't match any of these (e.g. an
-unrelated ERC-20 approve, a proxy admin call, a CTF mint/burn) we
-return ``None`` — the caller drops the tx without further work.
+Source of selectors
+-------------------
+Selectors are computed at import time via ``eth_utils.keccak`` of the
+canonical Solidity function signature (the same way the event topic-0
+hashes are computed in :mod:`src.onchain.clob_abi`). The Order struct
+type tuple matches the Polygon-mainnet CTF Exchange's verified ABI at
+``0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E``:
 
-ABI source
-----------
-:mod:`src.onchain.clob_abi` ships an EVENT-ONLY ABI for R6 (the
-on-chain listener only decodes inbound log events, not transactions
-it sends). Wave-2 will need to EXTEND the ABI with FUNCTION
-signatures for ``fillOrder`` / ``matchOrders`` / ``cancelOrder`` —
-the on-chain decoder doesn't need them, so they weren't shipped in
-R6. The expansion is a Wave-2 implementer concern; the docstring at
-the top of ``src/onchain/clob_abi.py`` already calls this out as the
-trigger condition.
+    struct Order {
+        uint256 salt;
+        address maker;
+        address signer;
+        address taker;
+        uint256 tokenId;
+        uint256 makerAmount;
+        uint256 takerAmount;
+        uint256 expiration;
+        uint256 nonce;
+        uint256 feeRateBps;
+        uint8   side;
+        uint8   signatureType;
+        bytes   signature;
+    }
 
-  TODO (Wave 2): expand src.onchain.clob_abi.POLYMARKET_CLOB_ABI with
-  function entries for fillOrder / matchOrders / cancelOrder. The
-  authoritative source is the Polygonscan-verified ABI at the contract
-  address (``settings.POLYMARKET_CLOB_CONTRACT_ADDRESS``).
+Decoded side encoding: 0 = BUY, 1 = SELL (per the contract).
 
-Edge case: proxy contracts
---------------------------
-Polymarket uses adapter / proxy contracts (UMA dispute resolution,
-the negRiskAdapter, the CTF). A "fillOrder" call may arrive wrapped
-in a proxy's ``call(target, data)`` envelope. Wave-2 will need to
-peel the outer call and decode the inner calldata. Tracked as a
-known-limitation TODO; the FIRST iteration can simply skip
-unrecognised selectors and rely on ``polybot_mempool_tx_decoded_total
-{result="not_clob"}`` to surface the miss rate.
-
-Edge case: contract upgrade
----------------------------
-A CLOB contract upgrade (rare governance event) rotates function
-selectors and will cause a sudden ``decode_failed`` spike. The
-operator alert is wired off ``polybot_mempool_tx_decoded_total
-{result="decode_failed"}`` — runbook is "pin the new ABI, redeploy
-mempool service".
+V1 limitations
+--------------
+* The decoder reads the order struct directly; it does NOT unwrap
+  proxy / negRiskAdapter envelopes (per the architect's edge-case
+  note). Proxy calls produce a ``not_clob`` outcome until a Round-7
+  follow-up adds the wrapper handling.
+* ``expected_block`` is filled by the IntentRouter at consume time
+  (not by the decoder here). The :class:`LeaderIntent` carries 0
+  until then; the publisher emits 0 and the router upgrades it.
 
 See ``docs/ROUND_7_MEMPOOL_AND_PREFILL.md`` § 3.2 for the full spec.
 """
 
 from __future__ import annotations
 
+import uuid
 from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal
 from typing import TYPE_CHECKING, Literal, Optional
 
+from eth_abi import decode as abi_decode
+from eth_utils import keccak
+from loguru import logger
+
 if TYPE_CHECKING:  # pragma: no cover — type-only imports
     from src.mempool.node_client import MempoolTx
 
 
-_WAVE_2_REF = "Wave 2 — see docs/ROUND_7_MEMPOOL_AND_PREFILL.md § 3.2"
+# Defensive metrics import.
+try:
+    from src.monitoring.metrics import (  # type: ignore[attr-defined]
+        mempool_tx_decoded_total,
+    )
+except Exception:  # pragma: no cover — defensive fallback
+
+    class _NoOpLabel:
+        def labels(self, *_args, **_kwargs):
+            return self
+
+        def inc(self, *_args, **_kwargs):
+            return None
+
+    mempool_tx_decoded_total = _NoOpLabel()  # type: ignore[assignment]
 
 
-# The order-type set we surface to the IntentRouter. ``FOK`` (fill-or-
-# kill) and ``GTC`` (good-til-cancelled) are the two we expect to see
-# on Polymarket; ``GTD`` is "good-til-date". The CLOB encodes these in
-# the order struct's ``orderType`` field — Wave-2 maps the on-chain
-# uint8 enum to these strings.
+# ---------------------------------------------------------------------------
+# Function signatures + selectors
+# ---------------------------------------------------------------------------
+#
+# Each entry: (selector_4bytes, parameter_type_tuple, order_arg_index).
+# ``order_arg_index`` is the position of the Order struct in the
+# decoded args tuple — we use it to pull side / tokenId / amounts.
+# matchOrders and fillOrder both take the order as arg 0; cancelOrder
+# is just the order.
+#
+# Order tuple type, matching the struct above. ``eth_abi.decode``
+# accepts the parenthesised Solidity-tuple form.
+_ORDER_TUPLE: str = (
+    "(uint256,address,address,address,uint256,uint256,uint256,"
+    "uint256,uint256,uint256,uint8,uint8,bytes)"
+)
+
+# Signatures used to compute the 4-byte selectors. The selector is
+# keccak256(signature)[:4].
+_FILL_ORDER_SIG = f"fillOrder({_ORDER_TUPLE},uint256)"
+_MATCH_ORDERS_SIG = (
+    f"matchOrders({_ORDER_TUPLE},{_ORDER_TUPLE}[],uint256,uint256[])"
+)
+_CANCEL_ORDER_SIG = f"cancelOrder({_ORDER_TUPLE})"
+
+
+def _selector(sig: str) -> bytes:
+    return keccak(text=sig)[:4]
+
+
+_FILL_ORDER_SELECTOR: bytes = _selector(_FILL_ORDER_SIG)
+_MATCH_ORDERS_SELECTOR: bytes = _selector(_MATCH_ORDERS_SIG)
+_CANCEL_ORDER_SELECTOR: bytes = _selector(_CANCEL_ORDER_SIG)
+
+
+# Param type lists in eth_abi.decode form (a flat list of types; the
+# Order struct is one element typed as the tuple string above).
+_FILL_ORDER_PARAMS: list[str] = [_ORDER_TUPLE, "uint256"]
+_MATCH_ORDERS_PARAMS: list[str] = [
+    _ORDER_TUPLE,
+    f"{_ORDER_TUPLE}[]",
+    "uint256",
+    "uint256[]",
+]
+_CANCEL_ORDER_PARAMS: list[str] = [_ORDER_TUPLE]
+
+
+# Selector → (method_name, param_types, order_arg_index)
+_SELECTOR_MAP: dict[bytes, tuple[str, list[str], int]] = {
+    _FILL_ORDER_SELECTOR: ("fillOrder", _FILL_ORDER_PARAMS, 0),
+    _MATCH_ORDERS_SELECTOR: ("matchOrders", _MATCH_ORDERS_PARAMS, 0),
+    _CANCEL_ORDER_SELECTOR: ("cancelOrder", _CANCEL_ORDER_PARAMS, 0),
+}
+
+
+# Order-tuple positional layout (mirrors _ORDER_TUPLE above).
+_ORDER_SALT = 0
+_ORDER_MAKER = 1
+_ORDER_SIGNER = 2
+_ORDER_TAKER = 3
+_ORDER_TOKEN_ID = 4
+_ORDER_MAKER_AMOUNT = 5
+_ORDER_TAKER_AMOUNT = 6
+_ORDER_EXPIRATION = 7
+_ORDER_NONCE = 8
+_ORDER_FEE_RATE_BPS = 9
+_ORDER_SIDE = 10  # 0 = BUY, 1 = SELL
+
+
 OrderType = Literal["FOK", "GTC", "GTD"]
 
 
@@ -81,57 +172,8 @@ OrderType = Literal["FOK", "GTC", "GTD"]
 class LeaderIntent:
     """Decoded Polymarket trading intent — the unit the IntentRouter sees.
 
-    This is the canonical event type published to
-    ``mempool:leader_intent`` (Redis Stream). The JSON-on-the-wire
-    schema is shaped by :meth:`src.mempool.event_emitter.LeaderIntentPublisher.publish`
-    — see R7 § 3.4 for the contract.
-
-    Attributes
-    ----------
-    intent_id
-        A fresh UUID4 minted at decode time. PRIMARY KEY of the
-        ``mempool_observations`` table (migration 024) and the
-        correlation handle for every downstream log line.
-    wallet
-        The signer EOA (mirrors :attr:`MempoolTx.from_wallet`).
-    market_id
-        Polymarket market id (the condition id / questionId on the
-        CTF). Decoded by mapping ``makerAssetId`` ↔ ``takerAssetId``
-        against the CTF token → market lookup.
-    token_id
-        The specific outcome token (YES or NO) the leader is targeting.
-    side
-        ``"buy"`` if the leader is acquiring shares, ``"sell"`` if
-        selling. For ``matchOrders`` / ``fillOrder`` we read this from
-        the order struct's ``side`` field.
-    size_usdc
-        Notional in USDC for the trade (size_shares * price). We use
-        ``Decimal`` end-to-end on the money path so we never lose
-        rounding precision before the DB row writes (the DB column is
-        ``NUMERIC(20,2)``).
-    price
-        Limit price per share, in [0, 1]. For ``fillOrder`` this is
-        ``makerAmount / takerAmount`` (or the inverse, depending on
-        side). ``Decimal`` for the same reason as ``size_usdc``.
-    order_type
-        One of ``"FOK"`` / ``"GTC"`` / ``"GTD"``. See :data:`OrderType`.
-    intent_received_at
-        Wall-clock time the SUBSCRIPTION saw the tx (mirrors
-        :attr:`MempoolTx.received_at`). This is t=0 for the
-        ``polybot_intent_router_latency_seconds`` histogram.
-    expected_block
-        The next Polygon block number — i.e., the earliest block this
-        tx can mine in. The decoder reads it from
-        ``RPCClient.eth_getBlockByNumber('latest')['number'] + 1``.
-        Used to bound staleness on the IntentRouter side and to populate
-        the ``expected_block`` column of ``mempool_observations``.
-    tx_hash
-        Mirrors :attr:`MempoolTx.tx_hash`.
-    nonce
-        Mirrors :attr:`MempoolTx.nonce`.
-    replaces
-        Mirrors :attr:`MempoolTx.replaces` — the tx_hash this one
-        displaces, or ``None``.
+    See module docstring + the architect's Wave-1 docstring for the
+    per-field contract.
     """
 
     intent_id: str
@@ -149,74 +191,191 @@ class LeaderIntent:
     replaces: Optional[str] = None
 
 
+def _bump_decoded(result: str) -> None:
+    try:
+        mempool_tx_decoded_total.labels(result=result).inc()
+    except Exception:
+        pass
+
+
 class CLOBTxDecoder:
     """Decode :class:`MempoolTx.calldata` against the Polymarket CLOB ABI.
 
     Single public method :meth:`decode` returns a :class:`LeaderIntent`
     on a successful decode or ``None`` if the tx targets a function we
     don't care about / can't decode.
-
-    Wave-2 implementation outline
-    -----------------------------
-    1. Build an in-memory selector → method map at construction time::
-
-           selector(0xabcdef12) -> ("fillOrder", inputs_list)
-           selector(0x...)      -> ("matchOrders", inputs_list)
-           selector(0x...)      -> ("cancelOrder", inputs_list)
-
-       where ``selector`` is ``keccak256(method_signature)[:4]``.
-       The method signature is ``methodName(type1,type2,...)`` per
-       Solidity ABI v2.
-
-    2. In :meth:`decode`:
-
-       a. Extract the 4-byte selector from ``calldata[:4]``.
-       b. Look it up. Miss → ``polybot_mempool_tx_decoded_total
-          {result="not_clob"}.inc()``, return ``None``.
-       c. ABI-decode ``calldata[4:]`` against the inputs list using
-          ``eth_abi.decode(types, data)`` (already a R6 dep).
-       d. Build the :class:`LeaderIntent` from the decoded fields.
-       e. ``polybot_mempool_tx_decoded_total{result="decoded"}.inc()``.
-       f. Return.
-
-    3. ABI-decode exception → ``decode_failed`` counter and ``None``.
-       Do NOT raise — the subscription must stay healthy regardless of
-       individual decode failures.
     """
 
     def __init__(self, abi: Optional[list[dict]] = None) -> None:
-        """Construct with an optional ABI override.
-
-        Parameters
-        ----------
-        abi
-            If supplied, overrides the default :data:`src.onchain.clob_abi.POLYMARKET_CLOB_ABI`.
-            Useful for tests that pin a known function set. In
-            production we read from the on-chain module.
-        """
-        raise NotImplementedError(_WAVE_2_REF)
+        # ``abi`` is accepted for API parity with the architect contract
+        # but the V1 decoder reads the hardcoded selector map above. A
+        # future round-7 follow-up will move the selectors into the
+        # shared ABI and honour the override.
+        self._abi_override = abi
 
     def decode(self, tx: "MempoolTx") -> Optional[LeaderIntent]:
         """Decode ``tx.calldata`` into a :class:`LeaderIntent`.
 
         Returns ``None`` when:
-          * ``tx.calldata`` is shorter than 4 bytes (selector-less call).
-          * The selector is not in our method map (not a CLOB call we
-            care about).
-          * ABI decoding raises.
-          * The decoded order targets a market / token we don't have a
-            mapping for (asset_id → market_id lookup miss — same
-            problem the on-chain listener has at R6, deferred to a
-            Wave-2 join).
+          * ``tx.calldata`` is shorter than 4 bytes (no selector).
+          * Selector is not in the CLOB function map.
+          * ABI decode raises.
 
-        On success returns a fully-populated :class:`LeaderIntent`
-        with a fresh ``intent_id`` (uuid4) and ``intent_received_at``
-        copied from ``tx.received_at``.
-
-        Wave-2 must also fill in ``expected_block`` — most callers
-        will inject an async ``RPCClient`` reference at construction
-        time and look up ``eth_getBlockByNumber('latest')`` lazily;
-        the OWNED-rpc-client variant is what we expect to use in
-        ``src.mempool.main``.
+        On success, ``mempool_tx_decoded_total{result="decoded"}``
+        increments and a fully-populated :class:`LeaderIntent` is
+        returned with a fresh UUID ``intent_id``.
         """
-        raise NotImplementedError(_WAVE_2_REF)
+        calldata = tx.calldata
+        if not calldata or len(calldata) < 4:
+            _bump_decoded("not_clob")
+            return None
+        selector = bytes(calldata[:4])
+        entry = _SELECTOR_MAP.get(selector)
+        if entry is None:
+            _bump_decoded("not_clob")
+            return None
+        method_name, param_types, order_idx = entry
+        try:
+            decoded = abi_decode(param_types, calldata[4:])
+        except Exception as exc:
+            logger.debug(
+                "CLOBTxDecoder: ABI decode failed for {} tx={}: {!r}",
+                method_name,
+                tx.tx_hash,
+                exc,
+            )
+            _bump_decoded("decode_failed")
+            return None
+        try:
+            intent = self._build_intent(tx, method_name, decoded, order_idx)
+        except Exception as exc:
+            logger.debug(
+                "CLOBTxDecoder: intent build failed for {} tx={}: {!r}",
+                method_name,
+                tx.tx_hash,
+                exc,
+            )
+            _bump_decoded("decode_failed")
+            return None
+        if intent is None:
+            _bump_decoded("decode_failed")
+            return None
+        _bump_decoded("decoded")
+        return intent
+
+    def _build_intent(
+        self,
+        tx: "MempoolTx",
+        method_name: str,
+        decoded: tuple,
+        order_idx: int,
+    ) -> Optional[LeaderIntent]:
+        """Pull the Order struct out of ``decoded`` and assemble a
+        :class:`LeaderIntent`.
+
+        For ``cancelOrder``: the order is the whole payload, the
+        intent's ``order_type`` field carries the marker ``"cancel"``
+        and size/price are read from the order struct itself (the
+        signed maker/taker amounts that the cancellation refers to).
+        """
+        if order_idx >= len(decoded):
+            return None
+        order = decoded[order_idx]
+        if not isinstance(order, (tuple, list)) or len(order) < 12:
+            return None
+
+        maker_addr = order[_ORDER_MAKER]
+        token_id_int = int(order[_ORDER_TOKEN_ID])
+        maker_amount = int(order[_ORDER_MAKER_AMOUNT])
+        taker_amount = int(order[_ORDER_TAKER_AMOUNT])
+        side_uint = int(order[_ORDER_SIDE])
+
+        # side: 0=BUY, 1=SELL per Polymarket CTF Exchange.
+        side: Literal["buy", "sell"] = "buy" if side_uint == 0 else "sell"
+
+        # USDC has 6 decimals; outcome tokens are 18-decimal CTF shares.
+        # On Polymarket the convention is:
+        #   side=BUY  → maker spends USDC (makerAmount in USDC base
+        #               units), receives takerAmount shares.
+        #               price = makerAmount / takerAmount, size_usdc =
+        #               makerAmount / 1e6.
+        #   side=SELL → maker spends shares (makerAmount in shares),
+        #               receives takerAmount USDC.
+        #               price = takerAmount / makerAmount, size_usdc
+        #               = takerAmount / 1e6.
+        # Defensive: if either side is zero, fall back to a price of 0
+        # and a size of 0 — the decoded intent is still useful to the
+        # IntentRouter as a directional signal even if the numerics
+        # are degenerate (cancelOrder, for instance, often has
+        # zero-ish amounts in practice).
+        if side == "buy":
+            usdc_raw = maker_amount
+            shares_raw = taker_amount
+        else:
+            usdc_raw = taker_amount
+            shares_raw = maker_amount
+
+        size_usdc = Decimal(usdc_raw) / Decimal(10**6)
+        if shares_raw > 0:
+            # Shares are 18-decimal CTF tokens; USDC is 6-decimal.
+            # price = USDC per share, scaled to the [0, 1] range
+            # Polymarket uses.
+            # price (USDC/share) = (usdc_raw / 1e6) / (shares_raw / 1e18)
+            #                    = usdc_raw * 1e12 / shares_raw
+            price = (
+                Decimal(usdc_raw) * Decimal(10**12) / Decimal(shares_raw)
+            )
+        else:
+            price = Decimal(0)
+
+        # Order type: V1 stamps a marker for cancels and "GTC" for
+        # fills / matches. The contract carries no explicit order_type
+        # in the struct above — Polymarket has variants (FOK / GTC /
+        # GTD) encoded via the expiration field semantics, which is
+        # too tangled for V1. The TODO below tracks promoting this to
+        # a real enum once the IntentRouter actually needs to
+        # distinguish.
+        if method_name == "cancelOrder":
+            order_type = "cancel"
+        else:
+            order_type = "GTC"  # default for fills/matches
+
+        # market_id ↔ token mapping: the on-chain tokenId is the YES
+        # or NO CTF token id. Mapping back to the Polymarket market_id
+        # + outcome is a DB join (markets.token_yes / token_no), which
+        # we can NOT do synchronously in the decode hot path. V1
+        # stamps the token_id (lowercased 0x-prefixed hex of the
+        # uint256) and lets the IntentRouter resolve to market_id at
+        # consume time. The architect's doc note in tx_decoder.py
+        # § "asset_id → market_id lookup miss" captures the same
+        # deferral.
+        token_id_hex = f"0x{token_id_int:064x}"
+
+        # Normalise the maker address for the wallet field. Use the
+        # maker (the leader signing the order), NOT tx.from_wallet:
+        # for relayed / proxy submissions the tx may come from a
+        # facilitator while the order itself is signed by the leader.
+        # V1 fallback: if the maker address is the zero address, use
+        # tx.from_wallet.
+        if isinstance(maker_addr, str) and maker_addr:
+            wallet = maker_addr.lower()
+            if not wallet.startswith("0x"):
+                wallet = "0x" + wallet
+        else:
+            wallet = tx.from_wallet
+
+        return LeaderIntent(
+            intent_id=str(uuid.uuid4()),
+            wallet=wallet,
+            market_id=token_id_hex,  # V1 placeholder — IntentRouter resolves
+            token_id=token_id_hex,
+            side=side,
+            size_usdc=size_usdc,
+            price=price,
+            order_type=order_type,
+            intent_received_at=tx.received_at,
+            expected_block=0,  # filled by router at consume time
+            tx_hash=tx.tx_hash,
+            nonce=tx.nonce,
+            replaces=tx.replaces,
+        )

@@ -389,7 +389,33 @@ class RPCClient:
             return {}
         return result
 
-    async def eth_subscribe(self, filter_obj: dict) -> AsyncIterator[dict]:
+    async def eth_getTransactionByHash(  # noqa: N802 - mirrors JSON-RPC method name
+        self, tx_hash: str
+    ) -> dict | None:
+        """Fetch a pending or mined tx by hash.
+
+        Used by the mempool watcher to hydrate the full tx body from a
+        ``newPendingTransactions`` subscription hash. Returns the raw
+        JSON-RPC tx dict (``hash``, ``from``, ``to``, ``gasPrice``,
+        ``gas``, ``nonce``, ``input``, ...) or ``None`` if the node has
+        never seen the hash. Coalesced via the standard
+        ``_coalesced_call`` path so concurrent watchers don't hammer the
+        node with duplicate requests.
+        """
+        if not isinstance(tx_hash, str) or not tx_hash:
+            return None
+        result = await self._coalesced_call(
+            "eth_getTransactionByHash", [tx_hash]
+        )
+        if not isinstance(result, dict):
+            return None
+        return result
+
+    async def eth_subscribe(
+        self,
+        filter_obj: dict,
+        subscription_type: str = "logs",
+    ) -> AsyncIterator[dict]:
         """Long-lived subscription. NOT coalesced -- each subscriber
         gets its own WebSocket stream.
 
@@ -400,6 +426,14 @@ class RPCClient:
         websockets.connect-driven implementation is exercised by the
         on-chain listener tests in Wave-3; here the integration shape
         is what matters.
+
+        ``subscription_type`` defaults to ``"logs"`` for backward
+        compatibility with the on-chain listener; the mempool watcher
+        (R7) passes ``"newPendingTransactions"`` with a ``{"fromAddress":
+        [...]}`` filter (Erigon's filtered-subscription extension).
+        Filter is omitted from the SUBSCRIBE payload when empty so a
+        plain ``newPendingTransactions`` subscription still works
+        against providers that don't honor the filter.
         """
         # Import lazily so this module loads without `websockets`
         # installed in checkouts that don't need the subscribe path.
@@ -421,8 +455,14 @@ class RPCClient:
             try:
                 async with websockets.connect(ws_provider.ws_url) as ws:
                     self._ws_connections.add(ws)
+                    # Build subscribe params: ["<type>", <filter>?].
+                    # Skip filter if empty/None so providers that don't
+                    # support the filter extension still accept the call.
+                    sub_params: list[Any] = [subscription_type]
+                    if filter_obj:
+                        sub_params.append(filter_obj)
                     sub_id_envelope = self._rpc_envelope(
-                        "eth_subscribe", ["logs", filter_obj]
+                        "eth_subscribe", sub_params
                     )
                     await ws.send(json.dumps(sub_id_envelope))
                     # First reply is the subscription ID.

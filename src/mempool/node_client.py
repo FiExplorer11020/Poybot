@@ -22,28 +22,59 @@ Two collaborating primitives:
   nonce) before the original is mined — only the LAST tx in the
   per-(wallet, nonce) chain actually executes. If we fire against an
   obsolete tx we trade against stale intent. NonceTracker keeps a
-  per-wallet ``{nonce -> latest_tx_hash}`` map and returns the
-  replaced-hash on every observe so the publisher can emit a
-  ``replaces`` field downstream.
-
-Wave-2 will own the *implementations*. Wave-1 ships the type contracts
-and the docstring detail required to fill them in.
+  per-wallet ``{nonce -> [tx_hashes]}`` chain (so we can report
+  replacement-chain length on confirm) and returns the replaced-hash on
+  every observe so the publisher can emit a ``replaces`` field
+  downstream.
 
 See ``docs/ROUND_7_MEMPOOL_AND_PREFILL.md`` § 3.1 for the spec.
 """
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import TYPE_CHECKING, AsyncIterator, Optional
+
+from loguru import logger
 
 if TYPE_CHECKING:  # pragma: no cover — type-only imports
     from src.mempool.wallet_index import WatchedWalletIndex
     from src.rpc.client import RPCClient
 
 
-_WAVE_2_REF = "Wave 2 — see docs/ROUND_7_MEMPOOL_AND_PREFILL.md § 3.1"
+# Defensive metrics import — keep tests happy in checkouts without
+# prometheus_client by falling back to no-op shims.
+try:
+    from src.monitoring.metrics import (  # type: ignore[attr-defined]
+        mempool_replacement_chain_length,
+        mempool_tx_received_total,
+        mempool_wallet_matches_total,
+    )
+except Exception:  # pragma: no cover — defensive fallback
+
+    class _NoOpLabel:
+        def labels(self, *_args, **_kwargs):
+            return self
+
+        def inc(self, *_args, **_kwargs):
+            return None
+
+        def observe(self, *_args, **_kwargs):
+            return None
+
+    mempool_replacement_chain_length = _NoOpLabel()  # type: ignore[assignment]
+    mempool_tx_received_total = _NoOpLabel()  # type: ignore[assignment]
+    mempool_wallet_matches_total = _NoOpLabel()  # type: ignore[assignment]
+
+
+# How long an unconfirmed nonce-chain can sit in memory before we
+# evict it. Tx that's been waiting > 30 s has almost certainly been
+# dropped from validator mempools (Polygon block time is ~2 s). The
+# eviction is a memory-bound; the mark_confirmed path is the
+# authoritative signal.
+_CHAIN_MAX_AGE_S: float = 30.0
 
 
 @dataclass(slots=True)
@@ -55,41 +86,8 @@ class MempoolTx:
     have NOT yet decoded the calldata against the CLOB ABI. That's the
     job of :class:`src.mempool.tx_decoder.CLOBTxDecoder`.
 
-    Attributes
-    ----------
-    tx_hash
-        The 0x-prefixed lowercase transaction hash. Stable identifier
-        used for nonce-chain bookkeeping and downstream correlation.
-    from_wallet
-        EOA that signed the tx, 0x-prefixed lowercase. Matched against
-        the :class:`WatchedWalletIndex` membership test in the
-        subscription hot path.
-    to_contract
-        The target contract address (the Polymarket CTF Exchange when
-        we care; anything else is filtered out by the decoder).
-    gas_price
-        Effective gas price in wei. NOTE: for EIP-1559 tx this is the
-        max-fee-per-gas; we don't model maxPriorityFee separately
-        because for the nonce-chain check we only need monotonic
-        ordering.
-    gas_limit
-        Tx-declared gas limit. Useful for sanity checks (a wildly
-        oversized gas_limit hints at a non-CLOB call).
-    nonce
-        Transaction nonce from the wallet. Key for replacement-chain
-        detection — see :class:`NonceTracker`.
-    calldata
-        Raw input bytes (the function selector + ABI-encoded args).
-        The decoder slices this against the CLOB function ABI.
-    received_at
-        Wall-clock time the subscription handed us the tx. Used as
-        ``intent_received_at`` downstream and for end-to-end latency
-        metrics (``polybot_intent_router_latency_seconds``).
-    replaces
-        OPTIONAL: tx_hash of the tx this one replaces in the
-        (wallet, nonce) chain. Populated by NonceTracker AFTER the raw
-        :class:`MempoolTx` is constructed; the subscription itself
-        produces ``None`` here.
+    See module docstring for the field contract; the Wave-1 architect
+    docstring captures the per-field rationale.
     """
 
     tx_hash: str
@@ -101,6 +99,95 @@ class MempoolTx:
     calldata: bytes
     received_at: datetime
     replaces: Optional[str] = None
+
+
+def _hex_to_int(value: object) -> int:
+    """Coerce a JSON-RPC int field (``"0x..."`` hex or plain int).
+
+    Returns 0 for missing / un-parseable inputs; the caller decides
+    whether 0 is a meaningful signal (a 0-nonce tx is real; a 0
+    gas_price isn't).
+    """
+    if value is None:
+        return 0
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str):
+        s = value.strip()
+        if not s:
+            return 0
+        try:
+            if s.lower().startswith("0x"):
+                return int(s, 16)
+            return int(s)
+        except ValueError:
+            return 0
+    return 0
+
+
+def _hex_to_bytes(value: object) -> bytes:
+    """Coerce a JSON-RPC ``0x``-prefixed hex string to bytes."""
+    if value is None:
+        return b""
+    if isinstance(value, (bytes, bytearray)):
+        return bytes(value)
+    if isinstance(value, str):
+        s = value.strip()
+        if not s:
+            return b""
+        if s.lower().startswith("0x"):
+            s = s[2:]
+        try:
+            return bytes.fromhex(s)
+        except ValueError:
+            return b""
+    return b""
+
+
+def _normalize_address(value: object) -> str:
+    """Lowercase + 0x-prefix-normalise an address string."""
+    if not isinstance(value, str):
+        return ""
+    s = value.strip().lower()
+    if not s:
+        return ""
+    if not s.startswith("0x"):
+        s = "0x" + s
+    return s
+
+
+def _normalize_tx_hash(value: object) -> str:
+    """Same shape as ``_normalize_address`` but conceptually a 32-byte
+    hash. Kept separate for grep-ability."""
+    return _normalize_address(value)
+
+
+def _raw_tx_to_mempool_tx(raw: dict) -> Optional[MempoolTx]:
+    """Convert a raw JSON-RPC tx dict into :class:`MempoolTx`.
+
+    Returns ``None`` if mandatory fields (hash, from) are missing.
+    """
+    if not isinstance(raw, dict):
+        return None
+    tx_hash = _normalize_tx_hash(raw.get("hash"))
+    from_wallet = _normalize_address(raw.get("from"))
+    if not tx_hash or not from_wallet:
+        return None
+    # For EIP-1559 tx the field is ``maxFeePerGas``; legacy uses
+    # ``gasPrice``. Either is monotonic enough for our nonce-chain
+    # ordering check.
+    gas_price = _hex_to_int(raw.get("gasPrice") or raw.get("maxFeePerGas"))
+    return MempoolTx(
+        tx_hash=tx_hash,
+        from_wallet=from_wallet,
+        to_contract=_normalize_address(raw.get("to")),
+        gas_price=gas_price,
+        gas_limit=_hex_to_int(raw.get("gas")),
+        nonce=_hex_to_int(raw.get("nonce")),
+        calldata=_hex_to_bytes(raw.get("input")),
+        received_at=datetime.now(timezone.utc),
+        replaces=None,
+    )
 
 
 class MempoolSubscription:
@@ -120,24 +207,13 @@ class MempoolSubscription:
     available the subscription will degrade to "full firehose"
     (~1000 tx/sec public mempool) and the in-process
     :class:`src.mempool.wallet_index.WatchedWalletIndex` becomes the
-    only filter — bloom check is ~50ns so it's still tractable.
-
-    With the watched-address filter active we expect ~10-100 tx/sec at
-    steady state across the ~2000 watched wallets.
-
-    Reconnect contract
-    ------------------
-    The underlying :meth:`src.rpc.client.RPCClient.eth_subscribe` runs
-    its own bounded-backoff reconnect (1s → 30s cap). On every
-    reconnect we re-issue the subscription with the *current* watched
-    wallet list (the index may have grown). The reconnect itself is
-    transparent to the consumer of :meth:`stream`.
+    only filter.
 
     Lifecycle
     ---------
     The subscription is started lazily on the first ``async for``
-    iteration. :meth:`close` cancels the in-flight subscription and
-    is safe to call multiple times.
+    iteration. :meth:`close` flips an internal flag that the iterator
+    checks on every wake; safe to call multiple times.
     """
 
     def __init__(
@@ -145,120 +221,115 @@ class MempoolSubscription:
         rpc_client: "RPCClient",
         wallet_index: "WatchedWalletIndex",
     ) -> None:
-        """Bind to an RPCClient + the bloom-filter wallet membership index.
-
-        Parameters
-        ----------
-        rpc_client
-            Configured :class:`src.rpc.client.RPCClient`. The
-            subscription will pick the first provider with a ``ws_url``
-            (the local Erigon by priority); fall-through to paid
-            providers happens at the RPCClient layer.
-        wallet_index
-            :class:`src.mempool.wallet_index.WatchedWalletIndex`
-            instance — the subscription reads
-            ``wallet_index.snapshot_addresses()`` to build the
-            ``fromAddress`` filter each time it opens / reopens the
-            socket.
-        """
-        raise NotImplementedError(_WAVE_2_REF)
+        self._rpc = rpc_client
+        self._wallet_index = wallet_index
+        self._closed = False
 
     async def stream(self) -> AsyncIterator[MempoolTx]:
-        """Yield decoded :class:`MempoolTx` objects forever.
+        """Yield decoded :class:`MempoolTx` objects.
 
-        Wave-2 implementation outline:
+        The Erigon ``newPendingTransactions`` subscription yields tx
+        HASHES (not full tx bodies). We hydrate each with
+        ``eth_getTransactionByHash`` before yielding.
 
-        1. Compose the eth_subscribe payload using
-           ``wallet_index.snapshot_addresses()``.
-        2. Open the subscription via ``rpc_client.eth_subscribe(...)``.
-        3. For every raw JSON envelope yielded by the RPC client:
-
-           a. Decode the tx fields into :class:`MempoolTx`. The raw
-              fields Erigon sends are ``hash``, ``from``, ``to``,
-              ``gasPrice`` (hex), ``gas`` (hex), ``nonce`` (hex),
-              ``input`` (hex).
-           b. Skip if ``from_wallet not in wallet_index`` (defense in
-              depth — Erigon's filter is authoritative but we
-              double-check).
-           c. Increment ``polybot_mempool_tx_received_total{source}``.
-           d. Increment ``polybot_mempool_wallet_matches_total`` if
-              the address is in the index.
-           e. ``yield`` the :class:`MempoolTx`.
-
-        4. On the underlying WS reconnect (handled by RPCClient), the
-           ``async for`` simply pauses, no per-message action needed.
-
-        Note
-        ----
-        This method does NOT decode the calldata against the CLOB ABI
-        — that's a downstream concern handled by
-        :class:`src.mempool.tx_decoder.CLOBTxDecoder`. Keeping the two
-        stages separate lets us measure ``tx_received_total`` vs
-        ``tx_decoded_total{result}`` and diagnose decode-failure
-        spikes that hint at contract upgrades.
+        Per-tx exceptions (malformed payload, RPC blip while
+        hydrating, etc.) are caught and logged at DEBUG — one bad tx
+        must not stop the stream. The metric label is
+        ``polybot_mempool_tx_received_total{source}`` (``source`` is
+        the underlying provider; we record ``erigon`` here as the
+        canonical local case).
         """
-        raise NotImplementedError(_WAVE_2_REF)
-        # The yield-in-unreachable trick keeps mypy and the runtime
-        # both happy: Python recognises this as an async generator
-        # because of the unreachable ``yield`` below.
-        if False:  # pragma: no cover — type-only
-            yield  # type: ignore[misc]
+        # Build the subscription filter from the index snapshot. The
+        # filter is sent as a list of addresses; Erigon accepts the
+        # ``fromAddress`` form per its filtered-subscription docs.
+        addresses = self._wallet_index.snapshot_addresses()
+        filter_obj: dict = {}
+        if addresses:
+            filter_obj = {"fromAddress": list(addresses)}
+
+        async for raw in self._rpc.eth_subscribe(
+            filter_obj, subscription_type="newPendingTransactions"
+        ):
+            if self._closed:
+                return
+            try:
+                # Erigon yields tx HASHES for newPendingTransactions;
+                # some providers yield full tx objects directly.
+                # Handle both shapes defensively.
+                if isinstance(raw, str):
+                    tx_hash = _normalize_tx_hash(raw)
+                    if not tx_hash:
+                        continue
+                    full = await self._rpc.eth_getTransactionByHash(tx_hash)
+                    if full is None:
+                        # Tx has already been replaced / dropped from
+                        # the node's view. Skip silently — this is
+                        # normal under load.
+                        continue
+                    tx = _raw_tx_to_mempool_tx(full)
+                elif isinstance(raw, dict):
+                    tx = _raw_tx_to_mempool_tx(raw)
+                else:
+                    continue
+                if tx is None:
+                    continue
+                try:
+                    mempool_tx_received_total.labels(source="erigon").inc()
+                except Exception:
+                    pass
+                # Bloom defense-in-depth: skip tx whose from-wallet
+                # isn't in our watch set even if Erigon's filter
+                # missed it.
+                if tx.from_wallet not in self._wallet_index:
+                    continue
+                try:
+                    mempool_wallet_matches_total.inc()
+                except Exception:
+                    pass
+                yield tx
+            except Exception as exc:
+                # Catch ALL per-tx errors so one bad payload doesn't
+                # tear down the stream. The subscription health is
+                # paramount — we'd rather miss one intent than miss
+                # every intent for the next 30 s.
+                logger.debug(
+                    "MempoolSubscription: per-tx error swallowed: {!r}", exc
+                )
+                continue
 
     async def close(self) -> None:
-        """Cancel the in-flight subscription and release resources.
-
-        Idempotent. Does NOT close the underlying ``RPCClient`` (that's
-        owned by the daemon entrypoint and may be shared with other
-        subscribers in the future).
-        """
-        raise NotImplementedError(_WAVE_2_REF)
+        """Cancel the in-flight subscription. Idempotent."""
+        self._closed = True
 
 
 class NonceTracker:
     """Per-wallet nonce-chain tracker for tx replacements.
 
-    Polygon EOAs broadcast tx with strictly-increasing nonces; the
-    network accepts a second tx with the SAME nonce only if it offers
-    a higher gas price (typically +10%). The original is then evicted
-    from validators' mempools and will never mine. We see both in our
-    own mempool subscription, in arrival order, and need to mark the
-    earlier one as "obsolete" so the IntentRouter doesn't fire against
-    stale intent.
-
     State
     -----
-    ``_chains: dict[wallet, dict[nonce, tx_hash]]``
+    ``_chains: dict[(wallet, nonce), list[(tx_hash, observed_at_s)]]``
 
-    Per-wallet, per-nonce we hold the LATEST seen tx_hash. When a new
-    tx arrives we return the displaced hash (or ``None`` if this is
-    the first sighting at this nonce).
+    Per-wallet, per-nonce we keep the FULL list of tx hashes we've
+    seen in arrival order. The LAST entry is the "live" tx; older
+    ones are obsolete (replaced). We retain the full history so the
+    replacement-chain-length histogram can report the count on
+    :meth:`mark_confirmed`.
 
     Eviction
     --------
-    On :meth:`mark_confirmed(wallet, nonce)` we drop all entries
-    ``<= nonce`` for the wallet — those are settled and can never be
-    replaced. Without confirmation feedback the per-wallet dict would
-    grow unboundedly across a long session; the daemon's nonce-
-    confirmation feed (from the on-chain listener, R6's
-    ``chain:trades:stream``) provides the eviction signal.
-
-    Memory bound
-    ------------
-    Worst case: ~2000 wallets × ~50 in-flight nonces ≈ 100k entries.
-    At ~150 bytes per dict entry (wallet, nonce, tx_hash + Python
-    overhead) that's ~15 MB. Comfortable inside the daemon's 300 MB
-    budget.
-
-    Concurrency
-    -----------
-    All public methods are SYNCHRONOUS. The caller (subscription loop)
-    is single-async-task; if Wave-3 introduces a worker pool we'll
-    revisit with an asyncio.Lock.
+    On :meth:`mark_confirmed(wallet, nonce)` we drop the chain
+    entirely. As a memory-bound safety valve we also evict chains
+    whose youngest observation is older than ``_CHAIN_MAX_AGE_S``
+    (~30 s) on every observe — tx that have been waiting that long
+    have almost certainly been dropped from validator mempools.
     """
 
     def __init__(self) -> None:
-        """Empty tracker. State lives only in process memory."""
-        raise NotImplementedError(_WAVE_2_REF)
+        # Key: (wallet, nonce). Value: list of (tx_hash, observed_at).
+        # observed_at is a monotonic seconds float, used for the age
+        # eviction check only — not for ordering (arrival order in
+        # the list is the truth).
+        self._chains: dict[tuple[str, int], list[tuple[str, float]]] = {}
 
     def observe(self, tx: MempoolTx) -> Optional[str]:
         """Record ``tx`` in the chain for ``(tx.from_wallet, tx.nonce)``.
@@ -267,24 +338,51 @@ class NonceTracker:
         if this is a fresh entry (first sighting of the nonce, OR a
         re-sighting of the same tx_hash that's already the head of
         the chain).
-
-        Hook for ``polybot_mempool_replacement_chain_length`` histogram:
-        Wave-2 should keep a parallel counter of total observations
-        per (wallet, nonce) so the chain length can be reported when
-        the nonce eventually confirms (via :meth:`mark_confirmed`).
         """
-        raise NotImplementedError(_WAVE_2_REF)
+        # Opportunistic age-based prune. Cheap (one walk over keys);
+        # caps in-memory state at ``_CHAIN_MAX_AGE_S`` worth of
+        # entries when ``mark_confirmed`` isn't being called.
+        self._prune_stale()
+
+        key = (tx.from_wallet, tx.nonce)
+        now = time.monotonic()
+        chain = self._chains.get(key)
+        if chain is None:
+            self._chains[key] = [(tx.tx_hash, now)]
+            return None
+
+        # Same tx hash re-seen → no replacement signal.
+        head_hash = chain[-1][0] if chain else None
+        if head_hash == tx.tx_hash:
+            # Refresh the timestamp so we don't prematurely prune a
+            # tx still being broadcast.
+            chain[-1] = (head_hash, now)
+            return None
+
+        # A genuine replacement: the previous head is now obsolete.
+        chain.append((tx.tx_hash, now))
+        return head_hash
 
     def mark_confirmed(self, wallet: str, nonce: int) -> None:
-        """Drop all entries ``<= nonce`` for ``wallet``.
+        """Drop the chain for ``(wallet, nonce)``.
 
-        Called by the daemon when the on-chain listener reports a
-        wallet-attributed trade — that trade's tx has been mined, so
-        every same-or-lower nonce for that wallet is settled. The
-        chain-length histogram is observed here (the length of the
-        purged dict is the answer for the confirmed nonce).
+        Records the chain length to the histogram before purging so
+        operators can see the gas-war fingerprint.
         """
-        raise NotImplementedError(_WAVE_2_REF)
+        key = (_normalize_address(wallet), int(nonce))
+        chain = self._chains.pop(key, None)
+        # Also clear the un-normalized variant in case the caller
+        # passed a checksummed address. observe() normalizes via the
+        # MempoolTx.from_wallet field; mark_confirmed is called from
+        # the on-chain listener which may pass either case.
+        if chain is None:
+            chain = self._chains.pop((wallet, nonce), None)
+        if chain is None:
+            return
+        try:
+            mempool_replacement_chain_length.observe(len(chain))
+        except Exception:
+            pass
 
     def is_live_for(self, wallet: str, nonce: int, tx_hash: str) -> bool:
         """Return True iff ``tx_hash`` is the CURRENT head of the
@@ -292,9 +390,30 @@ class NonceTracker:
 
         Used by the IntentRouter as a final defence: if a replacement
         landed in our mempool AFTER the LeaderIntentPublisher emitted
-        but BEFORE the router consumed the stream entry, we still want
-        to refuse to fire. The router calls this with the intent's
-        recorded (wallet, nonce, tx_hash) just before issuing the
-        pre-signed order.
+        but BEFORE the router consumed the stream entry, we still
+        want to refuse to fire.
         """
-        raise NotImplementedError(_WAVE_2_REF)
+        key = (_normalize_address(wallet), int(nonce))
+        chain = self._chains.get(key)
+        if chain is None:
+            chain = self._chains.get((wallet, nonce))
+        if not chain:
+            return False
+        return chain[-1][0] == _normalize_tx_hash(tx_hash)
+
+    def _prune_stale(self) -> None:
+        """Drop chains whose youngest entry is older than
+        ``_CHAIN_MAX_AGE_S``."""
+        if not self._chains:
+            return
+        cutoff = time.monotonic() - _CHAIN_MAX_AGE_S
+        to_drop: list[tuple[str, int]] = []
+        for key, chain in self._chains.items():
+            if not chain:
+                to_drop.append(key)
+                continue
+            youngest = chain[-1][1]
+            if youngest < cutoff:
+                to_drop.append(key)
+        for key in to_drop:
+            self._chains.pop(key, None)
