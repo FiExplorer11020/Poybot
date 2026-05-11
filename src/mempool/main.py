@@ -21,7 +21,6 @@ from src.mempool.node_client import MempoolSubscription, NonceTracker
 from src.mempool.tx_decoder import CLOBTxDecoder
 from src.mempool.wallet_index import WatchedWalletIndex
 
-
 # Defensive metrics import — pattern matches the other R7 modules.
 try:
     from src.monitoring.metrics import (  # type: ignore[attr-defined]

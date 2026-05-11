@@ -33,7 +33,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import math
-from typing import TYPE_CHECKING, Iterable, Optional
+from typing import TYPE_CHECKING, Iterable
 
 from loguru import logger
 

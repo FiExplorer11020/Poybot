@@ -475,7 +475,11 @@ class IntentRouter:
                     f"intent_id={intent.intent_id}: {exc!r}"
                 )
         self._inc_decision(result)
-        self._observe_latency(start_monotonic, intent)
+        # Latency histogram is observed once per intent by the outer
+        # ``_on_intent`` finally-block — see ROUND_7_MEMPOOL_AND_PREFILL.md
+        # § 5 ``polybot_intent_router_latency_seconds``. Observing again
+        # here would double-count every happy-path intent and bias the
+        # p50/p99 quantile estimates used for the § 6 acceptance gate.
 
     async def _insert_observation(
         self,
