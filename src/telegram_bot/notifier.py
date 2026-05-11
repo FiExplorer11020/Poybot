@@ -23,6 +23,7 @@ us rate-limited just when we need the alerts most).
 from __future__ import annotations
 
 import asyncio
+import os
 import time
 from collections import deque
 from typing import Callable, Optional
@@ -42,6 +43,13 @@ CHANNEL_LIVE_OPENED = "positions:live_opened"
 CHANNEL_LIVE_CLOSED = "positions:live_closed"
 CHANNEL_KILLSWITCH = "control:killswitch_changed"
 CHANNEL_ENGINE_CRASH = "engine:crash"
+# Phase 3 Task D: ingestion gap alert channel. The IngestHealthMonitor
+# publishes one payload per (source, gap-event) with shape:
+#   {"source": "falcon_leaderboard", "duration_s": 2400.0, "severity": "warning"}
+# The notifier rate-limits to one alert per INGEST_ALERT_COOLDOWN_S
+# (default 300) per (source), so a Falcon outage that spans hours
+# doesn't paginate operators while still flagging recurrence.
+CHANNEL_INGEST_GAP = "ingest:gap"
 
 ALL_CHANNELS = (
     CHANNEL_PAPER_OPENED,
@@ -50,7 +58,15 @@ ALL_CHANNELS = (
     CHANNEL_LIVE_CLOSED,
     CHANNEL_KILLSWITCH,
     CHANNEL_ENGINE_CRASH,
+    CHANNEL_INGEST_GAP,
 )
+
+# Per-source cooldown for ingest-gap Telegram alerts (seconds). The
+# global outbound throttle still applies AFTER this gate — this exists
+# specifically to prevent spam during a long-running incident where
+# the gap-detection loop fires every tick. Override with
+# INGEST_ALERT_COOLDOWN_S env var (read at TelegramNotifier construction).
+DEFAULT_INGEST_ALERT_COOLDOWN_S = 300
 
 
 # Type alias for the send function injected by TelegramBot. It takes
@@ -81,6 +97,7 @@ class TelegramNotifier:
         redis_client,
         send_fn: SendFn,
         max_per_minute: Optional[int] = None,
+        ingest_alert_cooldown_s: Optional[int] = None,
     ) -> None:
         self._redis = redis_client
         self._send = send_fn
@@ -93,6 +110,22 @@ class TelegramNotifier:
         self._running = False
         self._stop_event = asyncio.Event()
         self._subscriber: Subscriber | None = None
+        # Phase 3 Task D: per-source cooldown for ingest_gap alerts.
+        # Falcon outages can persist for hours; we want exactly one
+        # alert when the gap opens, NOT one per watchdog tick.
+        env_cd = os.environ.get("INGEST_ALERT_COOLDOWN_S")
+        if ingest_alert_cooldown_s is not None:
+            cooldown = ingest_alert_cooldown_s
+        elif env_cd:
+            try:
+                cooldown = int(env_cd)
+            except ValueError:
+                cooldown = DEFAULT_INGEST_ALERT_COOLDOWN_S
+        else:
+            cooldown = DEFAULT_INGEST_ALERT_COOLDOWN_S
+        self._ingest_alert_cooldown_s = max(0, int(cooldown))
+        # Monotonic timestamps: last allowed ingest_gap alert per source.
+        self._ingest_last_alert_at: dict[str, float] = {}
 
     # ------------------------------------------------------------------ #
     # Lifecycle                                                           #
@@ -141,10 +174,33 @@ class TelegramNotifier:
     # ------------------------------------------------------------------ #
 
     async def _handle(self, channel: str, payload: dict) -> None:
+        # Phase 3 Task D: gate ingest_gap alerts on a per-source cooldown
+        # BEFORE formatting. The global outbound throttle (max/min) is a
+        # safety net; this is the primary defence against alert storms
+        # during a multi-hour Falcon outage.
+        if channel == CHANNEL_INGEST_GAP:
+            source = str(payload.get("source", "?")) if isinstance(payload, dict) else "?"
+            if not self._ingest_alert_allowed(source):
+                logger.debug(
+                    f"TelegramNotifier: ingest_gap for {source!r} suppressed "
+                    f"(within {self._ingest_alert_cooldown_s}s cooldown)"
+                )
+                return
         text = self._format(channel, payload)
         if text is None:
             return
         await self._broadcast(text)
+
+    def _ingest_alert_allowed(self, source: str) -> bool:
+        """Per-source cooldown gate for the ingest_gap channel."""
+        if self._ingest_alert_cooldown_s <= 0:
+            return True
+        now = time.monotonic()
+        last = self._ingest_last_alert_at.get(source, 0.0)
+        if last > 0 and (now - last) < self._ingest_alert_cooldown_s:
+            return False
+        self._ingest_last_alert_at[source] = now
+        return True
 
     @staticmethod
     def _format(channel: str, payload: dict) -> Optional[str]:
@@ -160,6 +216,8 @@ class TelegramNotifier:
             return formatters.format_killswitch_changed(payload)
         if channel == CHANNEL_ENGINE_CRASH:
             return formatters.format_engine_crash(payload)
+        if channel == CHANNEL_INGEST_GAP:
+            return formatters.format_ingest_gap(payload)
         logger.warning(f"TelegramNotifier: unknown channel {channel!r}")
         return None
 

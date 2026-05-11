@@ -16,6 +16,7 @@ from loguru import logger
 
 from src.config import settings
 from src.control.redis_pubsub import Subscriber
+from src.control.redis_streams import StreamConsumer
 from src.database.connection import get_db
 from src.economics.gates import BookSnapshotRef, evaluate_signal_gate
 from src.economics.models import ECONOMIC_MODEL_VERSION, FeeSnapshot, StrategyTrack
@@ -50,6 +51,11 @@ class Decision:
 
 
 REDIS_TRADES_CHANNEL = "trades:observed"
+# Phase 3 round 1: durable equivalent. The confidence engine consumes
+# from the Streams path as its primary source; pub/sub is retained as
+# a TODO(phase3-round2) safety net (dual-read, idempotent dispatch).
+TRADES_STREAM_NAME = "trades:stream"
+TRADES_STREAM_GROUP = "confidence"
 REDIS_DECISIONS_CHANNEL = "decisions"
 CACHE_PREFIX = "confidence:leader:"
 
@@ -79,17 +85,35 @@ class ConfidenceEngine:
         # Per-wallet Thompson state: {wallet: {"follow": [a, b], "fade": [a, b]}}
         self._thompson: dict[str, dict] = {}
         # F-04: dedicated pub/sub client with reconnect+resubscribe.
+        # TODO(phase3-round2): remove this pubsub subscription once the
+        # Streams path has soaked. Dispatch is guarded by
+        # `_seen_trade_keys` so the dual-read does NOT double-evaluate.
         self._subscriber = Subscriber(
             settings.REDIS_URL, name="engine.confidence"
         )
         self._subscriber.register(
             REDIS_TRADES_CHANNEL, self._on_trade_message
         )
+        # Phase 3 round 1: durable Streams consumer.
+        self._trades_consumer = StreamConsumer(
+            settings.REDIS_URL,
+            stream=TRADES_STREAM_NAME,
+            group=TRADES_STREAM_GROUP,
+            consumer_name=f"{TRADES_STREAM_GROUP}.1",
+        )
+        self._trades_consumer.register(self._on_trade_stream_entry)
+        # IDEMPOTENCY: every successful evaluation INSERTs a row into
+        # `decision_log` keyed by `(time, leader, market)`. A duplicate
+        # dispatch is at worst a duplicate decision_log row; we also
+        # gate at the front of the dispatcher to avoid a duplicate
+        # Thompson sample on the same trade.
+        self._seen_trade_keys: set[str] = set()
 
     async def start(self) -> None:
         self._running = True
         self._stop_event.clear()
         await self._subscriber.start()
+        await self._trades_consumer.start()
         try:
             await self._stop_event.wait()
         except asyncio.CancelledError:
@@ -98,11 +122,37 @@ class ConfidenceEngine:
     async def stop(self) -> None:
         self._running = False
         self._stop_event.set()
+        await self._trades_consumer.stop()
         await self._subscriber.stop()
 
     async def _on_trade_message(self, trade: dict, _channel: str) -> None:
         if not self._running:
             return
+        await self._dispatch_trade(trade, source="pubsub")
+
+    async def _on_trade_stream_entry(
+        self, trade: dict, _stream: str, entry_id: str
+    ) -> None:
+        if not self._running:
+            return
+        await self._dispatch_trade(trade, source="stream", entry_id=entry_id)
+
+    async def _dispatch_trade(
+        self,
+        trade: dict,
+        *,
+        source: str,
+        entry_id: str | None = None,
+    ) -> None:
+        key = _confidence_trade_dedup_key(trade)
+        if key and key in self._seen_trade_keys:
+            return
+        if key:
+            self._seen_trade_keys.add(key)
+            if len(self._seen_trade_keys) > 8_000:
+                self._seen_trade_keys = set(
+                    list(self._seen_trade_keys)[-4_000:]
+                )
         try:
             if not trade.get("is_leader"):
                 return
@@ -113,7 +163,9 @@ class ConfidenceEngine:
                 else:
                     await self._emit(decision)
         except Exception as e:
-            logger.error(f"ConfidenceEngine error: {e}")
+            logger.error(
+                f"ConfidenceEngine error src={source} entry_id={entry_id}: {e}"
+            )
             raise
 
     def _parse_trade_time(self, trade: dict) -> datetime:
@@ -1072,3 +1124,17 @@ class ConfidenceEngine:
                 decision,
             )
         return payload
+
+
+def _confidence_trade_dedup_key(event: dict) -> str:
+    """Canonical fingerprint for confidence engine's idempotency cache."""
+    wallet = event.get("wallet_address") or ""
+    market = event.get("market_id") or ""
+    t = event.get("time") or ""
+    side = event.get("side") or ""
+    price = event.get("price") or ""
+    size = event.get("size_usdc") or ""
+    if not wallet or not market:
+        return ""
+    return f"{wallet}|{market}|{t}|{side}|{price}|{size}"
+

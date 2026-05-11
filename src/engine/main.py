@@ -26,13 +26,80 @@ from src.engine.scheduler import Scheduler
 from src.engine.watchdog import Watchdog
 from src.graph.graph_engine import GraphEngine
 from src.logging_setup import configure_logging
+from src.monitoring.ingest_health import (
+    SOURCE_FALCON_LEADERBOARD,
+    SOURCE_FALCON_MARKETS,
+    SOURCE_FALCON_TRADES,
+    SOURCE_FALCON_WALLET360,
+    SOURCE_REDIS_PUBSUB,
+    SOURCE_REST_DATA_API,
+    SOURCE_WS_MARKET_FEED,
+    get_health_monitor,
+)
 from src.profiler.behavior_profiler import BehaviorProfiler
 from src.profiler.error_model import ErrorModel
 from src.telegram_bot import TelegramBot
+from src.telegram_bot.notifier import CHANNEL_INGEST_GAP
 
 # S3.9: any unhandled exception in main() publishes here so the
 # Telegram notifier alerts the operator before the process dies.
 ENGINE_CRASH_CHANNEL = "engine:crash"
+
+
+def _make_falcon_alert_recovery(redis_client, source: str):
+    """Build an alert-only recovery callback for a Falcon (or WS) source.
+
+    Phase 3 Task D constraint: auto-recovery for Falcon-source gaps must
+    NOT auto-retry HTTP calls. Hammering Falcon when it's already
+    rate-limiting us is the opposite of what we want. The recovery here
+    is "page the operator + log". The TelegramNotifier rate-limits at
+    1 alert per INGEST_ALERT_COOLDOWN_S (default 300 s) per source.
+    """
+
+    async def _callback(_source: str, duration_s: float) -> None:
+        from src.monitoring.ingest_health import DEFAULT_THRESHOLDS_S
+
+        threshold = DEFAULT_THRESHOLDS_S.get(_source)
+        severity = "critical" if duration_s > 2 * (threshold or 0) else "warning"
+        payload = {
+            "source": _source,
+            "duration_s": float(duration_s),
+            "severity": severity,
+            "threshold_s": threshold,
+        }
+        try:
+            await redis_client.publish(CHANNEL_INGEST_GAP, json.dumps(payload))
+        except Exception as exc:
+            logger.warning(
+                f"ingest_health: publish to {CHANNEL_INGEST_GAP} failed for "
+                f"{_source!r}: {exc}"
+            )
+
+    return _callback
+
+
+def _make_rest_api_recovery(redis_client):
+    """REST data-api recovery: alert + log only.
+
+    The audit warns against eager retries — a gap usually means data-api
+    is down or our outbound IP is rate-limited. Nothing we do in-process
+    fixes that. We page the operator and let the regular 5 s poll loop
+    keep trying with its existing retry/backoff logic.
+    """
+    return _make_falcon_alert_recovery(redis_client, SOURCE_REST_DATA_API)
+
+
+def _make_redis_pubsub_recovery(redis_client):
+    """Redis pub/sub recovery: alert the operator.
+
+    Per-Subscriber rebuilds happen inside ``Subscriber.restart()``, but
+    the engine container owns many subscribers — orchestrating their
+    restart from here would require cross-component state we don't have.
+    Instead we surface the gap to the operator; the watchdog's
+    ``polybot_redis_subscriber_reconnects_total`` counter will tell us
+    if Redis itself is flapping.
+    """
+    return _make_falcon_alert_recovery(redis_client, SOURCE_REDIS_PUBSUB)
 
 
 async def _publish_crash(redis_client, component: str, exc: BaseException) -> None:
@@ -116,6 +183,42 @@ async def main() -> None:
         live_trader=None,
     )
 
+    # ---- Phase 3 Task D: Ingest Health Monitor ------------------------- #
+    # Tracks freshness of every ingestion source (WS, REST data-api,
+    # Falcon agents, Redis pub/sub). Recovery callbacks page the operator
+    # on Falcon gaps and force-reconnect the WS / pub/sub on transient
+    # network gaps. Auto-recovery for Falcon endpoints is intentionally
+    # alert-only — re-hammering the API when it's already rate-limiting
+    # us is the opposite of what we want.
+    health_monitor = get_health_monitor()
+    health_monitor.register_recovery(
+        SOURCE_REDIS_PUBSUB,
+        _make_redis_pubsub_recovery(redis_client),
+    )
+    for falcon_source in (
+        SOURCE_FALCON_LEADERBOARD,
+        SOURCE_FALCON_WALLET360,
+        SOURCE_FALCON_MARKETS,
+        SOURCE_FALCON_TRADES,
+    ):
+        health_monitor.register_recovery(
+            falcon_source, _make_falcon_alert_recovery(redis_client, falcon_source)
+        )
+    health_monitor.register_recovery(
+        SOURCE_REST_DATA_API,
+        _make_rest_api_recovery(redis_client),
+    )
+    # WS recovery is wired LATER (after the observer process is reachable
+    # via Redis pub/sub). For the engine container, we keep WS recovery
+    # as an operator alert — the observer container does the actual
+    # force_reconnect from its own ingest-health bootstrap.
+    health_monitor.register_recovery(
+        SOURCE_WS_MARKET_FEED,
+        _make_falcon_alert_recovery(redis_client, SOURCE_WS_MARKET_FEED),
+    )
+    await health_monitor.start()
+    # -------------------------------------------------------------------- #
+
     stop_event = asyncio.Event()
 
     def handle_signal(*_):
@@ -178,6 +281,10 @@ async def main() -> None:
         await _publish_crash(redis_client, "engine", e)
         raise
     finally:
+        try:
+            await health_monitor.stop()
+        except Exception:
+            pass
         await scheduler.stop()
         await watchdog.stop_all()
         # Components are owned by the watchdog now, but we still call

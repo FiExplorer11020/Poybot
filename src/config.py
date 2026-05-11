@@ -34,12 +34,43 @@ class Settings(BaseSettings):
     # Falcon API (CLAUDE.md § 5 + § 9)                                    #
     # ------------------------------------------------------------------ #
     FALCON_API_KEY: str = ""
+    # Phase 3 Task B: comma-separated list of API keys for the FalconKeyPool.
+    # If empty, the pool falls back to a single-key list built from
+    # FALCON_API_KEY — backward-compatible. Every key has its own per-key
+    # token bucket so total sustained throughput is N × FALCON_RPM_REFILL_PER_SEC
+    # without violating Falcon's documented 60 RPM per-key cap.
+    FALCON_API_KEYS: str = ""
     FALCON_API_URL: str = (
         "https://narrative.agent.heisenberg.so/api/v2/semantic/retrieve/parameterized"
     )
     FALCON_REFRESH_INTERVAL_S: int = 1800  # 30min — was 3600, faster convergence
     FALCON_CACHE_TTL_S: int = 172800  # 48h — survive Falcon downtime
     FALCON_MAX_REQUESTS_PER_MINUTE: int = 60
+    # Phase 3 Task B: adaptive per-key token bucket. The legacy
+    # FALCON_MAX_REQUESTS_PER_MINUTE is kept for backward compatibility with
+    # existing call sites but the new client uses the (capacity, refill)
+    # pair below per key. Defaults match the documented 60 RPM contract:
+    # bucket starts full (burst of 60 calls), then 1 token/sec sustains
+    # 60/min indefinitely.
+    FALCON_RPM_BUCKET_CAPACITY: int = 60
+    FALCON_RPM_REFILL_PER_SEC: float = 1.0
+    # Backoff window in seconds after a 429: refill rate is halved for this
+    # many seconds, then restored. Linear "be a good citizen" adaptive layer;
+    # NOT a retry-on-429 mechanism (that would defeat the purpose).
+    FALCON_BACKOFF_S: int = 60
+    # Request-coalescing TTL: an in-flight call's resolved future is kept
+    # for this many seconds so duplicate (agent_id, params) calls return
+    # the cached result. Independent of the 48h Redis cache — this is a
+    # short-window in-process dedup, only useful when two coroutines race
+    # on the same params.
+    FALCON_COALESCE_TTL_S: float = 30.0
+    # Conditional-GET soft expiry. Once a cached payload is older than this
+    # but still inside FALCON_CACHE_TTL_S, the next call performs a
+    # revalidating request with If-None-Match / If-Modified-Since. A 304
+    # restores TTL without burning rate-limit budget meaningfully (some
+    # APIs don't charge 304s; on Falcon we still pay 1 token but skip the
+    # JSON payload).
+    FALCON_CONDITIONAL_REVALIDATE_S: int = 3600
     # Phase 1 Task F (audit HP-2 fix #1): in-flight Falcon HTTP concurrency.
     # The previous Semaphore(1) serialised every Falcon call across the whole
     # process; the actual ceiling is the 60 RPM token bucket below
@@ -104,6 +135,67 @@ class Settings(BaseSettings):
     DATA_API_RECENT_LEADER_MARKETS: int = 500
     WEBSOCKET_PING_INTERVAL_S: int = 30
     WEBSOCKET_PONG_TIMEOUT_S: int = 10
+
+    # ------------------------------------------------------------------ #
+    # Phase 3 Round 1 — Data Continuity Backbone (Agent A)                #
+    # ------------------------------------------------------------------ #
+    # The "10-30 min pauses between continuous data gathering" pathology
+    # had three root causes: (a) REST polling used time-window queries
+    # with edge-case gaps, (b) leader-registry refresh was driven by a
+    # FALCON_REFRESH_INTERVAL_S=1800 wall-clock timer with nothing in
+    # between, (c) WS reconnect backoff could stall without any
+    # event-stream freshness check. Phase 3 R1 replaces all three.
+
+    # Cursor-driven REST polling. The cursor is a monotonic
+    # `(timestamp_s, last_tx_hash)` tuple persisted in Redis as
+    # `observer:cursor:trades:<source>`. On boot, if the cursor is
+    # missing, we fall back to "now minus CURSOR_BOOTSTRAP_LOOKBACK_S".
+    # TTL is long (the cursor is the ingestion ground-truth — losing it
+    # forces a re-poll window that's bounded by this lookback).
+    OBSERVER_CURSOR_TTL_S: int = 86400 * 14  # 14 days — survives a long outage
+    OBSERVER_CURSOR_BOOTSTRAP_LOOKBACK_S: int = 300  # 5 min — explicit log when used
+
+    # WS freshness watchdog. The watchdog wakes every WS_FRESHNESS_TICK_S
+    # and inspects each channel's `observer:ws:last_msg:<channel>` Redis
+    # key. If any channel has been silent for >`WS_CHANNEL_STALE_S`, log
+    # WARNING + increment `polybot_ws_channel_stale_total{channel}` and
+    # trigger a reconnect for that channel. 60 s is the right number for
+    # an active Polymarket subscription — under normal load we see
+    # price_change at sub-second cadence; 60 s of nothing is anomalous.
+    WS_FRESHNESS_TICK_S: int = 10
+    WS_CHANNEL_STALE_S: int = 60
+
+    # WS reconnect backfill cap. On reconnect we backfill
+    # `min(now - last_seen_trade_ts, WS_BACKFILL_MAX_HOURS)`. The old
+    # hardcoded "fetch 1h history" was either too greedy (long downtimes
+    # spent Falcon agent-556 quota reprocessing irrelevant trades) or
+    # too thin (sub-hour reconnect storms missed the latest signal).
+    # The clamp is the safety net.
+    WS_BACKFILL_MAX_HOURS: float = 24.0
+
+    # Event-driven Falcon refresh. The base FALCON_REFRESH_INTERVAL_S
+    # (1800 s = 30 min) stays as the FLOOR — worst-case staleness upper
+    # bound. On top of that, we trigger an incremental
+    # `refresh_wallet(wallet, reason=...)` when:
+    #   * The trade observer sees a high-volume trade by an unknown wallet
+    #     (>= EVENT_REFRESH_MIN_USDC), OR
+    #   * The trade observer sees EVENT_REFRESH_UNKNOWN_TRADES consecutive
+    #     trades from a wallet not in the active leader set.
+    # EVENT_REFRESH_COOLDOWN_S prevents the same wallet from being
+    # refreshed more often than that (cheap in-memory map keyed by wallet).
+    EVENT_REFRESH_MIN_USDC: float = 5_000.0
+    EVENT_REFRESH_UNKNOWN_TRADES: int = 5
+    EVENT_REFRESH_COOLDOWN_S: int = 300
+
+    # Falcon daily budget guardrail for event-driven refreshes. The
+    # counter lives at Redis `falcon:budget:YYYYMMDD` with TTL 25h. We
+    # decrement before each refresh; if the budget is exhausted we skip
+    # the refresh and increment
+    # `event_driven_refreshes_total{result="budget_exhausted"}`. 500/day
+    # ≈ 1 refresh every ~3 min on average, well inside the 60 RPM Falcon
+    # ceiling (which is the hard limit; this is a *soft* ceiling so a
+    # surge of unknown wallets doesn't blow the whole day's quota).
+    FALCON_DAILY_BUDGET: int = 500
 
     # ------------------------------------------------------------------ #
     # Position Tracker — persistent state cap (Phase 2 Task C)            #
@@ -367,6 +459,54 @@ class Settings(BaseSettings):
             raise ValueError(
                 f"REGISTRY_BACKFILL_CONCURRENCY must be in [1, 64], got {v}. "
                 "Higher than 64 doesn't help — the Falcon RPM limiter is the bound."
+            )
+        return v
+
+    @field_validator("FALCON_RPM_BUCKET_CAPACITY")
+    @classmethod
+    def _validate_falcon_bucket_capacity(cls, v: int) -> int:
+        # Phase 3 Task B: documented Falcon contract is 60 RPM per key. We
+        # don't crash if the operator raises this — they may have a private
+        # contract — but we warn (the FalconClient logs at construction).
+        # Hard lower bound: 1 (otherwise the client deadlocks immediately).
+        # Hard upper bound: 10_000 (sanity ceiling, catches typos).
+        if v < 1 or v > 10_000:
+            raise ValueError(
+                f"FALCON_RPM_BUCKET_CAPACITY must be in [1, 10000], got {v}."
+            )
+        return v
+
+    @field_validator("FALCON_RPM_REFILL_PER_SEC")
+    @classmethod
+    def _validate_falcon_refill(cls, v: float) -> float:
+        if v <= 0.0 or v > 100.0:
+            raise ValueError(
+                f"FALCON_RPM_REFILL_PER_SEC must be in (0, 100], got {v}."
+            )
+        return v
+
+    @field_validator("FALCON_BACKOFF_S")
+    @classmethod
+    def _validate_falcon_backoff(cls, v: int) -> int:
+        if v < 1 or v > 3600:
+            raise ValueError(f"FALCON_BACKOFF_S must be in [1, 3600], got {v}.")
+        return v
+
+    @field_validator("FALCON_COALESCE_TTL_S")
+    @classmethod
+    def _validate_falcon_coalesce_ttl(cls, v: float) -> float:
+        if v < 0.0 or v > 600.0:
+            raise ValueError(
+                f"FALCON_COALESCE_TTL_S must be in [0, 600], got {v}."
+            )
+        return v
+
+    @field_validator("FALCON_CONDITIONAL_REVALIDATE_S")
+    @classmethod
+    def _validate_falcon_revalidate(cls, v: int) -> int:
+        if v < 0 or v > 172800:
+            raise ValueError(
+                f"FALCON_CONDITIONAL_REVALIDATE_S must be in [0, 172800], got {v}."
             )
         return v
 

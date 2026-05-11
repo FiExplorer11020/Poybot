@@ -3,10 +3,29 @@ LeaderRegistry: maintains the leaders table and refreshes it on a schedule.
 
 Pulls top-N wallets from Falcon agent 584, enriches each with agent 581 (Wallet 360),
 classifies by strategy/influence/horizon/copiability, and persists to PostgreSQL.
+
+Phase 3 Round 1 (Agent A) adds an event-driven refresh path on top of the
+existing wall-clock loop. The ``run()`` cycle stays — 30 min FLOOR, never
+relaxed. Between cycles, ``refresh_wallet(wallet, reason=...)`` performs a
+targeted Falcon call (wallet360 + classification) for a single wallet,
+gated by:
+
+* An in-memory cooldown (``settings.EVENT_REFRESH_COOLDOWN_S``) so the
+  same wallet isn't re-enriched more than every ~5 min.
+* An in-memory ``asyncio.Event`` per wallet so duplicate concurrent
+  calls coalesce into a single Falcon round-trip.
+* A daily Falcon budget counter in Redis
+  (``falcon:budget:YYYYMMDD`` TTL 25 h, default 500/day) so a flood of
+  unknown wallets can't blow the whole day's quota.
+
+External callers (Telegram /refresh, Agent D watchdog) invoke
+``refresh_wallet`` directly with their own ``reason`` label; the event
+bridge in ``src/registry/event_bridge.py`` does the same on the WS path.
 """
 
 import asyncio
 import json
+import time
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -14,9 +33,38 @@ import aiohttp
 from loguru import logger
 
 from src.config import settings
+from src.database.connection import get_db  # Phase 3 Round 1: hoist for test-patchability
 from src.observer.trade_observer import _market_type_label
 from src.registry.falcon_client import FalconAPIError, FalconClient
 from src.registry.models import Leader, LeaderClassification
+
+# Phase 3 Round 1 (Agent A): metrics for event-driven refreshes. No-op
+# fallback for early CI before the metrics module lands (same pattern as
+# Phase 1 Task O / F).
+try:
+    from src.monitoring.metrics import (  # type: ignore[attr-defined]
+        event_driven_refreshes_total,
+        falcon_daily_budget_remaining,
+    )
+except Exception:  # pragma: no cover
+    class _NoOpLabel:
+        def labels(self, *_a, **_kw):
+            return self
+
+        def inc(self, *_a, **_kw):
+            return None
+
+        def set(self, *_a, **_kw):
+            return None
+
+    event_driven_refreshes_total = _NoOpLabel()  # type: ignore[assignment]
+    falcon_daily_budget_remaining = _NoOpLabel()  # type: ignore[assignment]
+
+
+def _falcon_budget_key(now: datetime | None = None) -> str:
+    """Daily budget key in Redis. Day boundary is UTC midnight."""
+    when = now or datetime.now(tz=timezone.utc)
+    return f"falcon:budget:{when.strftime('%Y%m%d')}"
 
 
 class LeaderRegistry:
@@ -24,6 +72,15 @@ class LeaderRegistry:
         self.falcon = falcon_client
         self.redis = redis_client
         self._stop = asyncio.Event()
+        # Phase 3 Round 1: targeted-refresh coalescing + cooldown state.
+        # Per-wallet asyncio.Event acts as a "refresh in flight" lock;
+        # duplicate concurrent callers await the same event and observe
+        # the result, so we never fan out 5× Falcon calls for the same
+        # wallet from 5× trade messages arriving in burst.
+        self._inflight: dict[str, asyncio.Event] = {}
+        self._inflight_result: dict[str, bool] = {}
+        # Wallet -> last successful refresh monotonic timestamp.
+        self._last_refresh_at: dict[str, float] = {}
 
     async def refresh_leaderboard(self, conn: Any) -> int:
         preserve_existing_score = False
@@ -190,6 +247,244 @@ class LeaderRegistry:
             count += 1
         logger.info(f"Enriched {count} leaders ({skipped} stamped no_data)")
         return count
+
+    # ------------------------------------------------------------------ #
+    # Phase 3 Round 1 — Event-driven refresh                              #
+    # ------------------------------------------------------------------ #
+
+    async def refresh_wallet(self, wallet: str, reason: str = "unknown") -> bool:
+        """Targeted Falcon refresh of a single wallet.
+
+        Designed for incremental, low-latency updates triggered by:
+        * The event bridge on the WS path (``reason="ws_unknown_wallet"``)
+        * The watchdog when freshness lags (``reason="watchdog"``)
+        * External callers — Telegram /refresh, ops console
+          (``reason="user_command"``)
+
+        Returns True if the refresh succeeded (wallet row updated),
+        False if the refresh was skipped (cooldown, budget exhausted,
+        Falcon error). Idempotent: duplicate concurrent calls for the
+        same wallet coalesce into a single Falcon round-trip via an
+        in-memory ``asyncio.Event``.
+
+        This method NEVER raises on Falcon failure — those are logged
+        and surfaced via the ``event_driven_refreshes_total{result=...}``
+        counter. The caller treats the return value as advisory.
+        """
+        wallet = (wallet or "").strip()
+        if not wallet:
+            return False
+
+        # 1. Cooldown gate — cheap, in-memory. Avoids hammering Falcon
+        # for the same wallet on every trade burst.
+        cooldown_s = max(0, int(settings.EVENT_REFRESH_COOLDOWN_S))
+        now_mono = time.monotonic()
+        last_at = self._last_refresh_at.get(wallet, 0.0)
+        if cooldown_s > 0 and (now_mono - last_at) < cooldown_s:
+            event_driven_refreshes_total.labels(
+                reason=reason, result="skipped_recent"
+            ).inc()
+            return False
+
+        # 2. Coalesce concurrent callers. The first caller creates an
+        # asyncio.Event; subsequent callers await it and observe the
+        # cached result. Pattern documented in the class docstring.
+        existing = self._inflight.get(wallet)
+        if existing is not None:
+            event_driven_refreshes_total.labels(
+                reason=reason, result="coalesced"
+            ).inc()
+            await existing.wait()
+            return self._inflight_result.get(wallet, False)
+
+        event = asyncio.Event()
+        self._inflight[wallet] = event
+        self._inflight_result.pop(wallet, None)
+
+        result = False
+        try:
+            # 3. Daily Falcon budget gate. Decrement BEFORE the API call
+            # so a flood of unknown wallets can't blow the day's quota
+            # before the first call returns.
+            allowed = await self._reserve_falcon_budget()
+            if not allowed:
+                event_driven_refreshes_total.labels(
+                    reason=reason, result="budget_exhausted"
+                ).inc()
+                return False
+
+            # 4. Targeted Falcon round-trip + DB upsert. We hand the DB
+            # work to ``_apply_wallet_refresh`` so the same body can be
+            # called from a future Agent D "batch refresh" path without
+            # duplicating the classification logic.
+            try:
+                metrics = await self.falcon.get_wallet360(wallet)
+            except FalconAPIError as exc:
+                logger.debug(
+                    f"refresh_wallet({wallet}, reason={reason}): "
+                    f"Falcon get_wallet360 failed: {exc}"
+                )
+                event_driven_refreshes_total.labels(
+                    reason=reason, result="error"
+                ).inc()
+                return False
+
+            try:
+                await self._apply_wallet_refresh(wallet, metrics)
+            except Exception as exc:
+                logger.warning(
+                    f"refresh_wallet({wallet}, reason={reason}): "
+                    f"DB upsert failed: {exc}"
+                )
+                event_driven_refreshes_total.labels(
+                    reason=reason, result="error"
+                ).inc()
+                return False
+
+            self._last_refresh_at[wallet] = time.monotonic()
+            event_driven_refreshes_total.labels(
+                reason=reason, result="refreshed"
+            ).inc()
+            result = True
+            return True
+        finally:
+            self._inflight_result[wallet] = result
+            event.set()
+            # Pop the event so the next caller after cooldown gets a
+            # fresh Event (not the now-fired one).
+            self._inflight.pop(wallet, None)
+
+    async def refresh_now(self, reason: str = "user_command") -> int:
+        """Force a full leaderboard + enrichment + sync_markets cycle now.
+
+        Used by Telegram /refresh and any operator-initiated refresh
+        path. Does NOT bypass Falcon rate limits — the underlying
+        client's 60 RPM bucket still applies. Returns the number of
+        leaders enriched in this cycle (0 on failure).
+        """
+        # get_db imported at module top (Phase 3 test-patchability)
+
+        n = 0
+        try:
+            async with get_db() as conn:
+                await self.refresh_leaderboard(conn)
+                n = await self.enrich_leaders(conn)
+                await self.sync_markets(conn)
+                event_driven_refreshes_total.labels(
+                    reason=reason, result="refreshed"
+                ).inc()
+        except Exception as exc:
+            logger.exception(f"refresh_now({reason}) failed: {exc}")
+            event_driven_refreshes_total.labels(
+                reason=reason, result="error"
+            ).inc()
+        return n
+
+    async def _apply_wallet_refresh(self, wallet: str, metrics: Any) -> None:
+        """Apply a Falcon wallet360 result to the `leaders` row.
+
+        Mirrors the per-wallet logic in ``enrich_leaders`` but for a
+        single wallet (no LIMIT 300 batch). The leaders row is created
+        if it doesn't already exist — event-driven refreshes can fire
+        for wallets that aren't yet in the leaderboard.
+        """
+        # get_db imported at module top (Phase 3 test-patchability)
+
+        async with get_db() as conn:
+            if metrics is None:
+                # falcon_no_data — same flag set as in `enrich_leaders`,
+                # but we don't promote the wallet into the active pool.
+                await conn.execute(
+                    """
+                    INSERT INTO leaders
+                        (wallet_address, falcon_score, last_refresh,
+                         excluded, on_watchlist, exclude_reason)
+                    VALUES ($1, NULL, NOW(), TRUE, FALSE, 'falcon_no_data')
+                    ON CONFLICT (wallet_address) DO UPDATE SET
+                        last_refresh = NOW(),
+                        excluded = TRUE,
+                        on_watchlist = FALSE,
+                        exclude_reason = COALESCE(
+                            leaders.exclude_reason, 'falcon_no_data'
+                        )
+                    """,
+                    wallet,
+                )
+                return
+            w360 = metrics.to_dict()
+            classification = self.classify_leader(w360)
+            await conn.execute(
+                """
+                INSERT INTO leaders
+                    (wallet_address, falcon_score, wallet360_json,
+                     classification_json, excluded, exclude_reason,
+                     last_refresh, on_watchlist)
+                VALUES ($1, NULL, $2, $3, $4, $5, NOW(), TRUE)
+                ON CONFLICT (wallet_address) DO UPDATE SET
+                    wallet360_json = EXCLUDED.wallet360_json,
+                    classification_json = EXCLUDED.classification_json,
+                    excluded = EXCLUDED.excluded,
+                    exclude_reason = EXCLUDED.exclude_reason,
+                    last_refresh = NOW()
+                """,
+                wallet,
+                json.dumps(w360),
+                json.dumps(classification.model_dump()),
+                not classification.copiable,
+                "structural_bot" if classification.strategy == "structural" else None,
+            )
+
+    async def _reserve_falcon_budget(self) -> bool:
+        """Decrement the daily Falcon budget. Returns True if a slot was
+        reserved, False if exhausted.
+
+        Backed by Redis ``falcon:budget:YYYYMMDD`` with TTL 25h. If
+        ``self.redis`` is None (tests / cold boot), the budget is
+        unbounded — the only ceiling is the Falcon RPM limiter inside
+        the client.
+        """
+        budget_max = max(0, int(settings.FALCON_DAILY_BUDGET))
+        if budget_max <= 0:
+            # 0 means "disabled" — every event-driven refresh is allowed
+            # and the gauge stays at 0.
+            falcon_daily_budget_remaining.set(0)
+            return True
+        if self.redis is None:
+            # No Redis attached — refresh path is unbudgeted (tests).
+            falcon_daily_budget_remaining.set(float(budget_max))
+            return True
+
+        key = _falcon_budget_key()
+        try:
+            # INCR returns the new value. On first hit of the day the
+            # key is missing, INCR creates it at 1 — we then attach a
+            # 25h TTL so a forgotten EXPIRE doesn't leak the counter
+            # across midnight.
+            used = await self.redis.incr(key)
+            # Set TTL only once per day (when used==1). EXPIRE is
+            # idempotent but cheap.
+            if used == 1:
+                try:
+                    await self.redis.expire(key, 25 * 3600)
+                except Exception:
+                    pass
+            remaining = max(0, budget_max - int(used))
+            falcon_daily_budget_remaining.set(float(remaining))
+            if int(used) > budget_max:
+                # We crossed the line on this call — back out the
+                # increment so subsequent calls see the same `used`.
+                try:
+                    await self.redis.decr(key)
+                except Exception:
+                    pass
+                return False
+            return True
+        except Exception as exc:
+            # Redis failure — fail-open so the user-facing path isn't
+            # blocked by a transient outage. The hard rate cap inside
+            # FalconClient (60 RPM) still applies.
+            logger.debug(f"_reserve_falcon_budget: Redis incr failed: {exc}")
+            return True
 
     def classify_leader(self, wallet360: dict) -> LeaderClassification:
         total_trades = float(wallet360.get("total_trades", 0) or 0)

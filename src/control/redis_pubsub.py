@@ -65,6 +65,25 @@ from typing import Any, Awaitable, Callable
 import redis.asyncio as redis_async
 from loguru import logger
 
+# Phase 3 Task D: every pubsub message proves the in-process control
+# plane is alive — the IngestHealthMonitor's `redis_pubsub` source key
+# is heartbeated from `_consume_once` on every received message. Import
+# defensively so the legacy module still loads if monitoring is absent.
+try:
+    from src.monitoring.ingest_health import (  # type: ignore[attr-defined]
+        SOURCE_REDIS_PUBSUB,
+        get_health_monitor,
+    )
+
+    def _heartbeat_pubsub() -> None:
+        try:
+            get_health_monitor().heartbeat(SOURCE_REDIS_PUBSUB)
+        except Exception:
+            pass
+except Exception:  # pragma: no cover
+    def _heartbeat_pubsub() -> None:
+        return None
+
 # Handler signature: receives the decoded payload (dict for JSON) and the
 # channel name. Async only — sync handlers are explicitly out of scope
 # because every existing call site is already async.
@@ -186,6 +205,23 @@ class Subscriber:
         logger.info(
             f"Subscriber({self._name}): started with channels={sorted(self._handlers)}"
         )
+
+    async def restart(self) -> None:
+        """Tear down + restart the subscriber. Used by Phase 3 Task D
+        ingest-health recovery when ``redis_pubsub`` heartbeats stop.
+
+        Idempotent on a stopped subscriber: if not running, behaves like
+        ``start()``. The owned Redis client is rebuilt so a half-open
+        socket doesn't survive the restart.
+        """
+        if self._running:
+            await self.stop()
+        # Re-arm the stop event so start() can run cleanly.
+        try:
+            self._stop_event = asyncio.Event()
+        except Exception:
+            pass
+        await self.start()
 
     async def stop(self) -> None:
         """Cancel the run loop and close the owned Redis client."""
@@ -344,6 +380,12 @@ class Subscriber:
                 self._total_messages += 1
                 self._last_message_ts[channel] = time.time()
                 self._bump_message_counter(channel)
+                # Phase 3 Task D: ingest-health heartbeat. ANY pubsub
+                # message from ANY subscriber counts — the Subscriber
+                # class is shared infrastructure so a single live
+                # subscriber refreshes the global `redis_pubsub`
+                # source. O(1), best-effort.
+                _heartbeat_pubsub()
                 await self._dispatch(channel, raw)
         finally:
             # Best-effort unsubscribe + close. If the connection is

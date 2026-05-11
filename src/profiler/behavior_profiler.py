@@ -13,12 +13,42 @@ from loguru import logger
 
 from src.config import settings
 from src.control.redis_pubsub import Subscriber
+from src.control.redis_streams import StreamConsumer
 from src.database.connection import get_db
 from src.economics.models import ECONOMIC_MODEL_VERSION
 from src.economics.versioning import valid_paper_trade_filter
 
 REDIS_POSITIONS_CHANNEL = "positions:closed"
+# Phase 2 / legacy fan-out — kept as a TODO(phase3-round2) safety net
+# while the new Streams path soaks; remove once we've gone several
+# weeks without seeing a stream-vs-pubsub divergence in production.
 REDIS_TRADES_CHANNEL = "trades:observed"
+# Phase 3 round 1: the durable, consumer-group-backed equivalent.
+TRADES_STREAM_NAME = "trades:stream"
+TRADES_STREAM_GROUP = "profiler.behavior"
+
+# Idempotency cache size. ~5k entries covers ~5 minutes of peak
+# trade volume (1k/min). Tuned for "double-write window" only —
+# not "process lifetime".
+_SEEN_TRADE_KEYS_MAXSIZE = 5_000
+
+
+def _trade_dedup_key(event: dict) -> str:
+    """Canonical fingerprint of a trade event for idempotent dispatch.
+
+    Mirrors the fields trade_observer uses for its DB-level UNIQUE
+    INDEX so the keys collide for `(pub/sub, stream)` twin-publishes
+    and for any XCLAIM replay.
+    """
+    wallet = event.get("wallet_address") or ""
+    market = event.get("market_id") or ""
+    t = event.get("time") or ""
+    side = event.get("side") or ""
+    price = event.get("price") or ""
+    size = event.get("size_usdc") or ""
+    if not wallet or not market:
+        return ""
+    return f"{wallet}|{market}|{t}|{side}|{price}|{size}"
 RECENT_LOSS_LIMIT = 25
 PROCESS_SCALE_WINDOW_S = 1800
 PROCESS_BURST_WINDOW_S = 180
@@ -83,28 +113,57 @@ class BehaviorProfiler:
         self._error_model = error_model
         self._running = False
         self._stop_event = asyncio.Event()
-        # F-04: a single Subscriber owns BOTH positions:closed and
-        # trades:observed handlers. Previously the profiler spawned two
-        # bare async-for loops sharing the command client; both pinned
-        # pool connections forever and lost their subscription state on
-        # any disconnect.
+        # F-04 + Phase 3 round 1: trades flow via a Streams consumer
+        # group (durable, at-least-once); positions:closed remains on
+        # pub/sub for now because Phase 3 round 1 only re-plumbs the
+        # trades:observed path. The pubsub Subscriber here keeps both
+        # the positions handler AND a TODO(phase3-round2) dual-read of
+        # trades:observed as a redundancy net during the soak.
         self._subscriber: Subscriber | None = None
+        self._trades_consumer: StreamConsumer | None = None
+        # Idempotency guard: dual-write (pub/sub + stream) and any
+        # Streams replay (XCLAIM after a crash mid-handler) both
+        # produce identical `event` dicts. The set holds canonical
+        # `(wallet, market, time, side, price, size)` keys so the
+        # second arrival is dropped before any Dirichlet/Beta update
+        # runs. Size is bounded by `_SEEN_TRADE_KEYS_MAXSIZE`.
+        self._seen_trade_keys: set[str] = set()
 
     async def start(self) -> None:
         self._running = True
         self._stop_event.clear()
         if self._redis is None:
             return
-        # Build the subscriber lazily so tests that swap `_redis` and
-        # never call start() don't pull in a dedicated client.
+        # Subscriber still owns positions:closed (pub/sub, not migrated).
+        # It ALSO keeps trades:observed as a TODO(phase3-round2) safety
+        # net — when the soak proves the Streams path is stable we'll
+        # drop the dual-subscribe.
         self._subscriber = Subscriber(
             settings.REDIS_URL, name="profiler.behavior"
         )
         self._subscriber.register(
             REDIS_POSITIONS_CHANNEL, self._on_position_message
         )
+        # TODO(phase3-round2): remove this pubsub subscription once the
+        # Streams path has soaked. Trade handlers are guarded by
+        # `_seen_trade_keys` (process-local) so the duplicate read does
+        # NOT double-update the Dirichlet/Beta posteriors.
         self._subscriber.register(REDIS_TRADES_CHANNEL, self._on_trade_message)
+
+        # Phase 3 round 1: durable trades consumer group. IDEMPOTENT
+        # contract: re-processing the same `(market_id, wallet, time,
+        # side, price, size_usdc)` tuple is suppressed by
+        # `_seen_trade_keys` below, so a Streams replay (XCLAIM after a
+        # crash mid-handler) doesn't double-count.
+        self._trades_consumer = StreamConsumer(
+            settings.REDIS_URL,
+            stream=TRADES_STREAM_NAME,
+            group=TRADES_STREAM_GROUP,
+            consumer_name=f"{TRADES_STREAM_GROUP}.1",
+        )
+        self._trades_consumer.register(self._on_trade_stream_entry)
         await self._subscriber.start()
+        await self._trades_consumer.start()
         try:
             await self._stop_event.wait()
         except asyncio.CancelledError:
@@ -113,6 +172,9 @@ class BehaviorProfiler:
     async def stop(self) -> None:
         self._running = False
         self._stop_event.set()
+        if self._trades_consumer is not None:
+            await self._trades_consumer.stop()
+            self._trades_consumer = None
         if self._subscriber is not None:
             await self._subscriber.stop()
             self._subscriber = None
@@ -127,12 +189,63 @@ class BehaviorProfiler:
             raise
 
     async def _on_trade_message(self, event: dict, _channel: str) -> None:
+        """Pub/sub fallback handler. Delegates to the same idempotent path."""
         if not self._running:
             return
+        await self._dispatch_trade_event(event, source="pubsub", entry_id=None)
+
+    async def _on_trade_stream_entry(
+        self, event: dict, _stream: str, entry_id: str
+    ) -> None:
+        """Streams handler — receives `(payload, stream, entry_id)`.
+
+        IDEMPOTENT: the `_seen_trade_keys` LRU below ignores a repeat
+        publish of the same `(wallet, market, time, side, price, size)`
+        tuple. Trade-observer's dual-write (pub/sub + streams) and a
+        Streams XCLAIM replay both go through here, so the handler is
+        exercised on every code path.
+        """
+        if not self._running:
+            return
+        await self._dispatch_trade_event(event, source="stream", entry_id=entry_id)
+
+    async def _dispatch_trade_event(
+        self, event: dict, *, source: str, entry_id: str | None
+    ) -> None:
+        # Idempotency guard. The keys are short — wallet:market:time-ms
+        # is enough because trade_observer enforces a `(wallet, market,
+        # bucket, side, price, size)` dedup at ingest. We just need to
+        # suppress the (pub/sub, stream) twin-publish AND any XCLAIM
+        # replay; both produce IDENTICAL `event` dicts so a hash of
+        # the canonical fields collides.
+        key = _trade_dedup_key(event)
+        if key and key in self._seen_trade_keys:
+            return
+        if key:
+            self._seen_trade_keys.add(key)
+            # Bound the memory footprint — drop the oldest half once
+            # we hit a soft cap. The pub/sub + streams dual-write +
+            # ~1k entries/min peak gives plenty of room.
+            if len(self._seen_trade_keys) > _SEEN_TRADE_KEYS_MAXSIZE:
+                # popleft-ish behaviour on a set: drop ~half by
+                # rebuilding from the most recent inserts. Fine for
+                # the cardinality we're talking about.
+                self._seen_trade_keys = set(
+                    list(self._seen_trade_keys)[
+                        -(_SEEN_TRADE_KEYS_MAXSIZE // 2):
+                    ]
+                )
         try:
             await self.on_leader_trade(event)
         except Exception as e:
-            logger.error(f"BehaviorProfiler trade error: {e}")
+            # IMPORTANT: we re-raise from the stream handler so the
+            # StreamConsumer's retry path (XCLAIM after claim_idle_ms)
+            # gets a shot. The pub/sub Subscriber catches exceptions
+            # anyway, so this branch is safe for both sources.
+            logger.error(
+                f"BehaviorProfiler trade error src={source} "
+                f"entry_id={entry_id}: {e}"
+            )
             raise
 
     async def on_position_closed(self, event: dict) -> None:

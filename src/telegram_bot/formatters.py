@@ -123,6 +123,31 @@ def format_engine_crash(payload: dict) -> str:
     )
 
 
+def format_ingest_gap(payload: dict) -> str:
+    """Format a Phase 3 Task D ingest_gap alert.
+
+    Payload shape (produced by IngestHealthMonitor recovery callback):
+      {"source": "falcon_leaderboard",
+       "duration_s": 2400.0,
+       "severity": "warning" | "critical",
+       "threshold_s": 2100}
+    """
+    source = payload.get("source", "?")
+    duration_s = float(payload.get("duration_s", 0) or 0)
+    severity = payload.get("severity", "warning")
+    threshold_s = payload.get("threshold_s")
+    icon = "⚠️" if severity != "critical" else "🚨"
+    minutes = duration_s / 60.0
+    thr_str = (
+        f" (threshold {int(threshold_s)}s)" if threshold_s else ""
+    )
+    return (
+        f"{icon} INGEST GAP — {source}\n"
+        f"silent for {minutes:.1f} min{thr_str}\n"
+        f"severity: {severity}"
+    )
+
+
 # --------------------------------------------------------------------------- #
 # Command formatters                                                           #
 # --------------------------------------------------------------------------- #

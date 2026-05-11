@@ -95,6 +95,36 @@ falcon_concurrency = Gauge(
     "Current concurrent in-flight Falcon calls",
 )
 
+# === Phase 3 Task B — Smart Falcon Client ===
+# All additive; existing scrapers see no breaking changes. The legacy
+# `falcon_calls_total{agent,result}` and `falcon_call_latency_seconds{agent}`
+# above remain instrumented exactly as before; the Phase 3 client extends
+# their wiring with the new key-pool and coalescing metrics below.
+falcon_keys_in_pool = Gauge(
+    "polybot_falcon_keys_in_pool",
+    "Number of Falcon API keys configured in the pool",
+)
+falcon_tokens_available = Gauge(
+    "polybot_falcon_tokens_available",
+    "Tokens currently available in the per-key bucket",
+    ["key_index"],
+)
+falcon_rate_limit_hits_total = Counter(
+    "polybot_falcon_rate_limit_hits_total",
+    "HTTP 429 responses from Falcon (triggers adaptive backoff)",
+    ["key_index"],
+)
+falcon_coalesced_calls_total = Counter(
+    "polybot_falcon_coalesced_calls_total",
+    "Calls deduplicated by in-flight coalescing (waiter joined an existing request)",
+    ["agent"],
+)
+falcon_conditional_get_savings_total = Counter(
+    "polybot_falcon_conditional_get_savings_total",
+    "304 Not-Modified responses (revalidated, cached payload reused)",
+    ["agent"],
+)
+
 # === Redis pub/sub (any path that publishes can use this) ===
 redis_publishes_total = Counter(
     "polybot_redis_publishes_total",
@@ -151,6 +181,119 @@ redis_subscriber_handler_errors_total = Counter(
     "polybot_redis_subscriber_handler_errors_total",
     "Handler-raised exceptions inside a subscriber",
     ["subscriber", "channel"],
+)
+
+# === Phase 3 Round 1 — Redis Streams (Agent C) ===
+# Owned by ``src/control/redis_streams.py``. Closes audit Section 6's
+# "no durability, no trace context, no idempotency token, no
+# consumer-group semantics" finding for the trades:observed → engine
+# pipeline. The Streams primitives replace pub/sub's "messages
+# published during the disconnect window are LOST" gap with a server-
+# side cursor (consumer group + XACK + XCLAIM). The metrics here are
+# the dashboard's window onto producer health, consumer throughput,
+# pending depth (= backpressure), and deadletter outflow.
+stream_published_total = Counter(
+    "polybot_stream_published_total",
+    "Entries published to a Redis Stream",
+    ["stream"],
+)
+stream_consumed_total = Counter(
+    "polybot_stream_consumed_total",
+    "Entries successfully consumed (XACKed)",
+    ["stream", "group"],
+)
+stream_pending_entries = Gauge(
+    "polybot_stream_pending_entries",
+    "XPENDING count per group",
+    ["stream", "group"],
+)
+stream_dead_letters_total = Counter(
+    "polybot_stream_dead_letters_total",
+    "Entries that exhausted retries and went to the deadletter stream",
+    ["stream", "group"],
+)
+stream_handler_latency_seconds = Histogram(
+    "polybot_stream_handler_latency_seconds",
+    "Stream consumer handler processing time",
+    ["stream", "group"],
+    buckets=(0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0),
+)
+stream_reconnects_total = Counter(
+    "polybot_stream_reconnects_total",
+    "Producer/consumer reconnect events",
+    ["component", "stream"],  # component: producer|consumer
+)
+
+# === Phase 3 Round 1 — Data Continuity Backbone (Agent A) ===
+# These metrics measure the new continuity primitives: cursor-driven REST
+# polling, event-driven Falcon refresh, the WS freshness watchdog, and
+# the Falcon daily budget guard. The user-facing problem they exist to
+# prove fixed: "10-30 min pauses between continuous data gathering".
+# Histogram buckets are tuned to the 5 s REST cadence + the 30 min
+# FALCON_REFRESH_INTERVAL_S floor so the tail of each path is visible
+# without burning cardinality.
+polling_cursor_lag_seconds = Histogram(
+    "polybot_polling_cursor_lag_seconds",
+    "Seconds between persisted cursor and now at poll start (per source)",
+    ["source"],  # api_wallet|api_market|api_global
+    buckets=(1.0, 5.0, 15.0, 30.0, 60.0, 120.0, 300.0, 900.0, 1800.0, 3600.0),
+)
+ws_channel_stale_total = Counter(
+    "polybot_ws_channel_stale_total",
+    "WS channels detected as stale by the freshness watchdog",
+    ["channel"],  # market|book|price_change|trade
+)
+ws_backfill_hours_used = Histogram(
+    "polybot_ws_backfill_hours_used",
+    "Hours of history requested on WS reconnect backfill",
+    buckets=(0.1, 0.5, 1.0, 2.0, 6.0, 12.0, 24.0),
+)
+event_driven_refreshes_total = Counter(
+    "polybot_event_driven_refreshes_total",
+    "Event-driven leader refresh invocations",
+    # reason: ws_unknown_wallet|user_command|watchdog|trade_observer
+    # result: refreshed|skipped_recent|budget_exhausted|coalesced|error
+    ["reason", "result"],
+)
+falcon_daily_budget_remaining = Gauge(
+    "polybot_falcon_daily_budget_remaining",
+    "Calls remaining in today's Falcon event-driven refresh budget",
+)
+
+# === Phase 3 Round 1 — Ingest Health Watchdog (Agent D) ===
+# Owned by ``src/monitoring/ingest_health.py``. The IngestHealthMonitor
+# tracks freshness of every ingestion source (WS, REST data-api, Falcon
+# agents, Redis pub/sub) via per-source heartbeats. A background tick loop
+# computes "seconds since last event" on every scrape; when the gap
+# exceeds the source-specific threshold a recovery callback fires (with
+# cooldown) and the gauges/counters below light up. Prometheus alert
+# rules in ``docs/monitoring/alerts.yml`` reference these names verbatim.
+#
+# Severity convention: warning = >threshold, critical = >2 × threshold.
+ingest_seconds_since_last_event = Gauge(
+    "polybot_ingest_seconds_since_last_event",
+    "Seconds since last activity per ingestion source",
+    ["source"],
+)
+ingest_gaps_total = Counter(
+    "polybot_ingest_gaps_total",
+    "Detected ingestion gaps (threshold crossings)",
+    ["source", "severity"],  # severity: warning|critical
+)
+ingest_recovery_attempts_total = Counter(
+    "polybot_ingest_recovery_attempts_total",
+    "Auto-recovery callback invocations",
+    ["source", "result"],  # result: triggered|skipped_cooldown|failed
+)
+ingest_recovery_success_total = Counter(
+    "polybot_ingest_recovery_success_total",
+    "Recoveries confirmed (heartbeat returned after gap)",
+    ["source"],
+)
+ingest_threshold_breaches_active = Gauge(
+    "polybot_ingest_threshold_breaches_active",
+    "Currently-active gap states (1=active, 0=closed)",
+    ["source"],
 )
 
 

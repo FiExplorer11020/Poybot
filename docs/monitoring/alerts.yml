@@ -1,0 +1,149 @@
+# Prometheus alert rules for the Polymarket Leader Intelligence Bot.
+#
+# Phase 3 Round 1, Agent D — paired with `src/monitoring/ingest_health.py`
+# and the metrics block in `src/monitoring/metrics.py`. The user-stated
+# problem these rules exist to detect: "data-acquisition pauses of
+# 10-30 min are appearing and going unnoticed."
+#
+# Severity convention:
+#   warning  → Telegram alert via `ingest:gap` (per-source 5-min cooldown)
+#   critical → page the on-call; >2x threshold or hot-path metric breach
+#
+# Load this file into Prometheus via `rule_files` in prometheus.yml:
+#
+#   rule_files:
+#     - /etc/prometheus/rules/polybot/*.yml
+#
+# Test locally with promtool:
+#   promtool check rules docs/monitoring/alerts.yml
+
+groups:
+  # ---------------------------------------------------------------------- #
+  # Ingestion health (Agent D's core deliverable)                          #
+  # ---------------------------------------------------------------------- #
+  - name: polybot_ingestion
+    interval: 30s
+    rules:
+      # The "user's reported pain" alert: any source silent >5 min.
+      - alert: IngestSourceStale
+        expr: polybot_ingest_seconds_since_last_event > 300
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Ingest source {{ $labels.source }} silent for >5min"
+          description: >
+            {{ $labels.source }} hasn't heartbeated for
+            {{ $value | humanizeDuration }}. The watchdog has already fired
+            its recovery callback (see
+            polybot_ingest_recovery_attempts_total). If this fires for a
+            Falcon source, the auto-recovery is alert-only — no automatic
+            retry, per Phase 3 Task D constraint.
+
+      # The "user's reported pain hardened" alert: >30 min is the regime
+      # the user explicitly called out.
+      - alert: IngestSourceDown
+        expr: polybot_ingest_seconds_since_last_event > 1800
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Ingest source {{ $labels.source }} silent for >30min (user's reported pain)"
+          description: >
+            {{ $labels.source }} has been silent for over half an hour.
+            For ws_market_feed / rest_data_api this is a hard outage; for
+            falcon_* it likely means the upstream Falcon agent is down.
+            Check polybot_falcon_calls_total{result="error|timeout"} and
+            polybot_ws_disconnects_total. Recovery callback fires once
+            per INGEST_RECOVERY_COOLDOWN_S — no auto-retry storm.
+
+      # Coordinated with Agent A: HP-1 freshness SLO is "p95 < 5s".
+      - alert: TradeIngestionLatencyHigh
+        expr: histogram_quantile(0.95, rate(polybot_trade_ingestion_latency_seconds_bucket[5m])) > 10
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Trade ingestion p95 latency >10s"
+          description: >
+            HP-1 targeted p95 < 5s. >10s means the producer-consumer queue
+            is hot — check polybot_observer_queue_depth and the DB write
+            latency histogram.
+
+      # Coordinated with Agent A: queue drops indicate undersized capacity.
+      - alert: ObserverQueueBackpressure
+        expr: polybot_observer_queue_drops_total > 0
+        for: 30s
+        labels:
+          severity: warning
+        annotations:
+          summary: "Observer dropping trades due to backpressure — under-provisioned"
+          description: >
+            The trade-write queue is overflowing. Drops = silent data loss.
+            Bump OBSERVER_QUEUE_MAXSIZE or the DB-flush concurrency.
+
+  # ---------------------------------------------------------------------- #
+  # Falcon API (coordinated with Agent B)                                  #
+  # ---------------------------------------------------------------------- #
+  - name: polybot_falcon
+    interval: 30s
+    rules:
+      - alert: FalconRateLimitHits
+        expr: rate(polybot_falcon_rate_limit_hits_total[5m]) > 0
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Falcon returning 429s — token bucket may need recalibration"
+          description: >
+            We're hitting Falcon's 60 RPM cap. The adaptive token bucket
+            will halve refill for FALCON_BACKOFF_S after each 429; if this
+            alert persists, either bump key count via FALCON_API_KEYS or
+            reduce caller fan-out.
+
+      # Recovery success tracker — useful to confirm an outage cleared.
+      - alert: IngestRecoveryNotProgressing
+        expr: |
+          increase(polybot_ingest_recovery_attempts_total{result="triggered"}[15m])
+          > 3 *
+          increase(polybot_ingest_recovery_success_total[15m])
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Recoveries firing but heartbeats not returning ({{ $labels.source }})"
+          description: >
+            We're retrying recovery but the source isn't coming back.
+            Strong signal the upstream is genuinely down (vs flaky).
+
+  # ---------------------------------------------------------------------- #
+  # Redis pub/sub + Streams (coordinated with Agent C)                     #
+  # ---------------------------------------------------------------------- #
+  - name: polybot_redis
+    interval: 30s
+    rules:
+      - alert: SubscriberReconnectStorm
+        expr: rate(polybot_redis_subscriber_reconnects_total[5m]) > 0.1
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Redis pub/sub subscribers reconnecting >0.1/s"
+          description: >
+            Subscribers are flapping. Pub/sub has a "messages in the
+            reconnect gap are lost" caveat — sustained flapping = silent
+            data loss. Check Redis health + network.
+
+      # Coordinated with Agent C: the Streams pipeline writes failures to
+      # a deadletter stream. Any sustained outflow is critical.
+      - alert: DeadLetterStreamGrowing
+        expr: rate(polybot_stream_dead_letters_total[10m]) > 0
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Stream dead-letter rate >0/s for 10min"
+          description: >
+            Messages are being routed to the deadletter stream — the
+            consumer-group is dropping work it can't process. Inspect the
+            stream and drain manually.

@@ -41,6 +41,7 @@ try:
         db_write_latency_seconds,
         observer_queue_depth,
         observer_queue_drops_total,
+        polling_cursor_lag_seconds,
         redis_publishes_total,
         trade_ingestion_latency_seconds,
         trades_ingested_total,
@@ -68,6 +69,34 @@ except ImportError:  # pragma: no cover — fallback for early CI before Task M
     observer_queue_drops_total = _NoopMetric()
     redis_publishes_total = _NoopMetric()
     ws_disconnects_total = _NoopMetric()
+    polling_cursor_lag_seconds = _NoopMetric()
+
+# Phase 3 Task D: ingest-health heartbeats. Defensive import so older
+# checkouts still load this module.
+try:
+    from src.monitoring.ingest_health import (  # type: ignore[attr-defined]
+        SOURCE_FALCON_TRADES,
+        SOURCE_REST_DATA_API,
+        get_health_monitor,
+    )
+
+    def _heartbeat_rest() -> None:
+        try:
+            get_health_monitor().heartbeat(SOURCE_REST_DATA_API)
+        except Exception:
+            pass
+
+    def _heartbeat_falcon_trades() -> None:
+        try:
+            get_health_monitor().heartbeat(SOURCE_FALCON_TRADES)
+        except Exception:
+            pass
+except Exception:  # pragma: no cover
+    def _heartbeat_rest() -> None:
+        return None
+
+    def _heartbeat_falcon_trades() -> None:
+        return None
 
 REDIS_TRADES_CHANNEL = "trades:observed"
 DEDUP_KEY_PREFIX = "seen_trades"
@@ -75,6 +104,41 @@ DEDUP_TTL_S = 7 * 86400  # 7 days
 MARKET_META_TTL_S = 3600
 SOURCE_API_WALLET = "api_wallet"
 SOURCE_API_MARKET = "api_market"
+
+# Phase 3 Round 1 (Agent A) — continuous-cursor REST polling. The cursor
+# is a monotonic ``(timestamp_s, tx_hash)`` tuple, persisted in Redis at
+# ``observer:cursor:trades:<source>``. Time-window queries
+# (``?from=…&to=…``) are gone — they had edge gaps where a trade
+# landing at boundary +/- 1 ms was silently skipped. The cursor pattern
+# is "fetch a fixed-size window of the latest trades, dedupe against
+# the cursor in client code". The data-api response ships sorted-by-
+# time DESC so the *first* row of each response is the new cursor head.
+CURSOR_KEY_PREFIX = "observer:cursor:trades"
+# Per-channel "last message at" tracker used by the WS freshness
+# watchdog. Owned by trade_observer.py (we control _handle_ws_message)
+# and consumed by websocket_client.py (watchdog reads these keys).
+WS_LAST_MSG_KEY_PREFIX = "observer:ws:last_msg"
+# Map raw WS event types into bounded channel labels for the freshness
+# watchdog. Prometheus rejects unbounded cardinality.
+_WS_CHANNEL_LABEL_BY_EVENT: dict[str, str] = {
+    "book": "book",
+    "price_change": "price_change",
+    "trade": "trade",
+}
+
+
+def _cursor_key(source: str, scope: str = "") -> str:
+    """Build the Redis key for a cursor. ``scope`` is used for the
+    per-wallet path (one cursor per wallet) so the cursor doesn't move
+    backward when a different wallet's pagination returns an older max.
+    """
+    if scope:
+        return f"{CURSOR_KEY_PREFIX}:{source}:{scope.lower()}"
+    return f"{CURSOR_KEY_PREFIX}:{source}"
+
+
+def _ws_last_msg_key(channel: str) -> str:
+    return f"{WS_LAST_MSG_KEY_PREFIX}:{channel}"
 
 # HP-1 (Phase 1 Task O): how long a producer will wait to enqueue before giving
 # up and counting a queue-full drop. 1 s is generous enough that a brief writer
@@ -430,6 +494,169 @@ class TradeObserver:
     def inserted_count(self) -> int:
         return self._inserted
 
+    # ------------------------------------------------------------------ #
+    # Phase 3 Round 1 (Agent A) — continuous-cursor helpers               #
+    # ------------------------------------------------------------------ #
+
+    async def _load_cursor(self, source: str, scope: str = "") -> tuple[float, str]:
+        """Return the persisted ``(timestamp_s, tx_hash)`` cursor for a
+        source. On miss falls back to "now minus
+        OBSERVER_CURSOR_BOOTSTRAP_LOOKBACK_S" with an explicit log;
+        subsequent polls will advance the cursor from there.
+
+        Cursor format on the wire: JSON ``{"ts": <float>, "tx": <hex>}``.
+        Older string-only cursors (``"<ts>"``) are accepted for forward
+        compatibility — a fresh deploy never sees them, but a partial
+        rollback shouldn't crash the observer.
+        """
+        if self._redis is None:
+            return self._cursor_bootstrap()
+        key = _cursor_key(source, scope)
+        try:
+            raw = await self._redis.get(key)
+        except Exception as exc:
+            logger.debug(
+                f"_load_cursor({source}, {scope}): Redis GET failed: {exc}; "
+                "falling back to bootstrap lookback"
+            )
+            return self._cursor_bootstrap(missing_log_source=source)
+        if not raw:
+            return self._cursor_bootstrap(missing_log_source=source)
+        try:
+            if isinstance(raw, (bytes, bytearray)):
+                raw = raw.decode("utf-8", errors="ignore")
+            data = json.loads(raw)
+            return float(data.get("ts") or 0.0), str(data.get("tx") or "")
+        except Exception:
+            try:
+                if isinstance(raw, str) and ":" in raw:
+                    ts_str, tx_str = raw.split(":", 1)
+                    return float(ts_str), tx_str
+                return float(raw), ""
+            except Exception:
+                return self._cursor_bootstrap(missing_log_source=source)
+
+    def _cursor_bootstrap(
+        self, *, missing_log_source: str | None = None
+    ) -> tuple[float, str]:
+        """Build the boot-time fallback cursor: now minus the configured
+        bootstrap lookback window. Logs once per source so a missing
+        cursor is auditable in ops.
+        """
+        lookback = max(0, int(settings.OBSERVER_CURSOR_BOOTSTRAP_LOOKBACK_S))
+        ts = time.time() - lookback
+        if missing_log_source:
+            logger.info(
+                f"observer cursor missing for source={missing_log_source}; "
+                f"bootstrapping at now - {lookback}s "
+                f"(ts={ts:.0f}, tx='')"
+            )
+        return ts, ""
+
+    async def _save_cursor(
+        self,
+        source: str,
+        ts_s: float,
+        tx_hash: str,
+        *,
+        scope: str = "",
+    ) -> None:
+        """Atomically persist the cursor head AFTER the batch has
+        committed to PG.
+
+        Atomicity guarantee: trade_observer commits the batch via
+        ``_write_batch`` (single PG transaction) BEFORE calling
+        ``_save_cursor`` from the poll loop. If the process crashes
+        between the commit and this SET, the next boot replays from
+        the previous cursor — the DB UNIQUE INDEX absorbs the
+        duplicates, zero data loss. If the process crashes during the
+        commit (PG tx rollback), the cursor was never advanced; the
+        next poll re-reads from the same starting point.
+        """
+        if self._redis is None:
+            return
+        key = _cursor_key(source, scope)
+        ttl = max(60, int(settings.OBSERVER_CURSOR_TTL_S))
+        payload = json.dumps({"ts": float(ts_s), "tx": str(tx_hash or "")})
+        try:
+            await self._redis.set(key, payload, ex=ttl)
+        except Exception as exc:
+            # Cursor persistence is best-effort. Worst case on Redis
+            # failure: the next poll bootstraps from "now - lookback"
+            # and the UNIQUE INDEX dedupes anything we re-fetch.
+            logger.debug(f"_save_cursor({source}): Redis SET failed: {exc}")
+
+    @staticmethod
+    def _trade_cursor_tuple(trade: dict) -> tuple[float, str]:
+        """Extract the cursor coordinates from a data-api trade row.
+
+        Falls back to an empty ``tx_hash`` if the response shape doesn't
+        ship one; the cursor degrades to "timestamp only", and the DB
+        UNIQUE INDEX still prevents double-ingestion.
+        """
+        ts_raw = trade.get("timestamp", 0)
+        try:
+            ts_int = int(ts_raw)
+        except (TypeError, ValueError):
+            return 0.0, ""
+        ts_s = ts_int / 1000.0 if ts_int > 1_000_000_000_000 else float(ts_int)
+        tx_hash = str(
+            trade.get("transactionHash")
+            or trade.get("transaction_hash")
+            or trade.get("tx_hash")
+            or ""
+        ).lower()
+        return ts_s, tx_hash
+
+    @staticmethod
+    def _cursor_filter_new(
+        trades: list[dict],
+        cursor_ts: float,
+        cursor_tx: str,
+    ) -> list[dict]:
+        """Return only the trades strictly newer than the cursor.
+
+        Tiebreak rule on equal timestamps: a different ``tx_hash``
+        counts as new (two trades from the same wallet in the same
+        millisecond are legal — they have different tx hashes), the
+        same hash is the cursor head itself and is dropped.
+
+        Hash comparison is case-insensitive — ``_trade_cursor_tuple``
+        lowercases tx hashes on extract so an uppercase cursor passed
+        in (e.g. from a test) is normalised here too.
+        """
+        cursor_tx_norm = (cursor_tx or "").lower()
+        out: list[dict] = []
+        for tr in trades:
+            ts_s, tx_hash = TradeObserver._trade_cursor_tuple(tr)
+            if ts_s > cursor_ts:
+                out.append(tr)
+                continue
+            if (
+                ts_s == cursor_ts
+                and tx_hash
+                and tx_hash != cursor_tx_norm
+            ):
+                out.append(tr)
+        return out
+
+    @staticmethod
+    def _cursor_head(trades: list[dict]) -> tuple[float, str]:
+        """Find the maximum ``(ts, tx_hash)`` across a batch.
+
+        We don't assume server-side ordering — the data-api returns
+        most-recent-first today, but a single misordered row would
+        otherwise rewind our cursor and re-process trades.
+        """
+        max_ts = 0.0
+        max_tx = ""
+        for tr in trades:
+            ts_s, tx_hash = TradeObserver._trade_cursor_tuple(tr)
+            if ts_s > max_ts or (ts_s == max_ts and tx_hash > max_tx):
+                max_ts = ts_s
+                max_tx = tx_hash
+        return max_ts, max_tx
+
     def update_leaders(self, wallets: set[str], markets: set[str]) -> None:
         """Dynamically update leader wallets and markets."""
         self._leader_wallets = wallets
@@ -455,6 +682,11 @@ class TradeObserver:
         self._ws_client = PolymarketWSClient(
             on_message=self._handle_ws_message,
             markets=self._leader_markets,
+            # Phase 3 Round 1 (Agent A): the WS client uses its own
+            # Redis client for the per-channel freshness watchdog. We
+            # share ours — the watchdog only reads, never writes, so
+            # the contention is negligible.
+            redis_client=self._redis,
         )
         # HP-1 fix #3: dedicated DB writer task drains the queue in batches.
         # Started BEFORE the producers so the very first enqueued record has
@@ -991,6 +1223,23 @@ class TradeObserver:
                 minute_bucket = int(now_ts // 60)
                 await self._redis.incrby(f"ws:msgs:minute:{minute_bucket}", 1)
                 await self._redis.expire(f"ws:msgs:minute:{minute_bucket}", 180)
+                # Phase 3 Round 1 (Agent A) — per-channel last-message
+                # tracking for the WS freshness watchdog. The watchdog in
+                # PolymarketWSClient reads these keys to decide whether a
+                # specific channel has gone silent (vs the whole socket
+                # which we already detect via ping/pong). 5 min TTL = if
+                # we crash, the watchdog reads "stale" and triggers a
+                # reconnect on next tick.
+                channel = _WS_CHANNEL_LABEL_BY_EVENT.get(event_type, "other")
+                await self._redis.set(
+                    _ws_last_msg_key(channel), str(now_ts), ex=300
+                )
+                # Aggregate "any message" key — useful for the global
+                # watchdog (Agent D) which doesn't care about per-channel
+                # details, just "are we hearing anything at all".
+                await self._redis.set(
+                    _ws_last_msg_key("any"), str(now_ts), ex=300
+                )
             except Exception:
                 pass
 
@@ -1282,6 +1531,12 @@ class TradeObserver:
             except Exception as exc:
                 logger.debug(f"Falcon compatibility backfill failed for {wallet}: {exc}")
                 continue
+            # Phase 3 Task D: a successful Falcon agent 556 fetch
+            # heartbeats the `falcon_trades` source. The agent-id-based
+            # heartbeat in FalconClient also fires, but call it here
+            # too so a test that mocks `falcon.query` (skipping the
+            # client's own wrapper) still proves liveness.
+            _heartbeat_falcon_trades()
             for trade in trades or []:
                 await self._process_falcon_trade(trade, wallet)
 
@@ -1321,24 +1576,25 @@ class TradeObserver:
     async def _backfill_wallet_trades(self, session: aiohttp.ClientSession) -> int:
         """Per-wallet REST backfill, parallelised under a bounded semaphore.
 
-        Phase 1 Task F (audit HP-1 fix #2). The previous implementation
-        looped wallets serially with an 8 s timeout each; with ~200 leaders
-        the worst case was 200 × 8 s = 26 min. We now fan out to
-        `REGISTRY_BACKFILL_CONCURRENCY` (default 20) workers via
-        `asyncio.gather(..., return_exceptions=True)`:
+        Phase 1 Task F (audit HP-1 fix #2) fanned this out to
+        ``REGISTRY_BACKFILL_CONCURRENCY`` workers; Phase 3 Round 1
+        (Agent A) further replaces the implicit "fetch latest 100 and
+        Redis-dedupe" pattern with an explicit per-wallet **cursor**.
+        Each wallet's cursor lives at
+        ``observer:cursor:trades:api_wallet:<wallet>``. Two consequences:
 
-        * Each per-wallet HTTP call still respects the 8 s timeout (now via
-          `asyncio.wait_for` so the cancellation kills the slow worker, not
-          the whole batch).
-        * One wallet's failure no longer kills the others — exceptions are
-          captured by `return_exceptions=True` and logged in aggregate.
-        * The 60 RPM Falcon-side limiter (`FALCON_MAX_REQUESTS_PER_MINUTE`)
-          is the *real* cap on sustained throughput. We're not hitting
-          Falcon here (`data-api.polymarket.com` is a separate endpoint
-          with a different ceiling), but the same logic applies: with 20
-          workers, sustained tput converges to whatever the upstream
-          allows; the win is in stall recovery — one stuck wallet no
-          longer blocks the other 19. That's the audit's "~16×" claim.
+        * If a wallet has been quiet, we still fetch its latest 100
+          trades but immediately filter to "newer than the cursor head",
+          so we don't re-enqueue old trades just to have the DB UNIQUE
+          INDEX deduplicate them again.
+        * If a wallet has been bursting, the same response shape catches
+          the burst tail-end via natural cursor advancement.
+
+        The cursor is updated AFTER the batch hands off to the queue
+        (the writer's PG commit is the atomic boundary; we save the
+        cursor head only after we've enqueued every new trade in the
+        response). On crash mid-batch the next poll re-fetches and the
+        UNIQUE INDEX absorbs the duplicates — zero data loss.
         """
         wallets = [w for w in self._leader_wallets if w]
         if not wallets:
@@ -1352,18 +1608,26 @@ class TradeObserver:
         async def _backfill_one(wallet: str) -> int:
             if not self._running:
                 return 0
+            # Per-wallet cursor — even when the global market sweep is
+            # running concurrently, a wallet's history is partitioned
+            # by `proxyWallet=...` so the cursor is monotonic per wallet.
+            cursor_ts, cursor_tx = await self._load_cursor(
+                SOURCE_API_WALLET, scope=wallet
+            )
+            polling_cursor_lag_seconds.labels(source=SOURCE_API_WALLET).observe(
+                max(0.0, time.time() - cursor_ts)
+            )
             url = f"https://data-api.polymarket.com/trades?user={wallet}&limit=100"
             async with sem:
                 if not self._running:
                     return 0
                 try:
-                    # asyncio.wait_for kills this single coroutine on
-                    # timeout — the rest of the gather keeps going.
                     async with session.get(
                         url, timeout=aiohttp.ClientTimeout(total=8)
                     ) as resp:
                         if resp.status != 200:
                             return 0
+                        _heartbeat_rest()
                         trades = await resp.json()
                 except asyncio.TimeoutError:
                     logger.debug(f"data-api wallet backfill timeout for {wallet}")
@@ -1371,17 +1635,33 @@ class TradeObserver:
                 except Exception as e:
                     logger.debug(f"data-api wallet backfill failed for {wallet}: {e}")
                     return 0
-            # Process trades OUTSIDE the semaphore — _process_data_api_trade
-            # touches the DB and Redis; holding the per-wallet HTTP slot
-            # while we serialise the writes would defeat the parallelism.
+            # Cursor filter — drop trades we've already seen. Saves
+            # work in both _process_trade (Redis SET NX) and the writer
+            # (DB tx + UNIQUE INDEX collision overhead).
+            if isinstance(trades, list):
+                new_trades = self._cursor_filter_new(
+                    trades, cursor_ts, cursor_tx
+                )
+            else:
+                new_trades = []
             response_ts_s = time.time()
-            count = 0
-            for trade in trades:
+            for trade in new_trades:
                 await self._process_data_api_trade(
                     trade, source=SOURCE_API_WALLET, event_ts_s=response_ts_s
                 )
-                count += 1
-            return count
+            # Advance the cursor AFTER enqueueing every record. The
+            # writer commits its PG transaction asynchronously; on
+            # crash between enqueue and commit, the cursor IS advanced
+            # but the next poll's UNIQUE INDEX dedupes the replay.
+            if new_trades:
+                head_ts, head_tx = self._cursor_head(new_trades)
+                if head_ts > cursor_ts or (
+                    head_ts == cursor_ts and head_tx and head_tx != cursor_tx
+                ):
+                    await self._save_cursor(
+                        SOURCE_API_WALLET, head_ts, head_tx, scope=wallet
+                    )
+            return len(new_trades)
 
         results = await asyncio.gather(
             *(_backfill_one(w) for w in wallets), return_exceptions=True
@@ -1403,23 +1683,33 @@ class TradeObserver:
     async def _backfill_market_activity(self, session: aiohttp.ClientSession) -> int:
         """Global market sweep against `data-api.polymarket.com/trades`.
 
-        HP-1 fix #1 supplement (ETag / If-Modified-Since): at the new 5 s
-        cadence we burn a request every five seconds. If the server ships
-        a strong ETag (or even Last-Modified), we cache it and echo it
-        back as `If-None-Match` (and `If-Modified-Since`) on the next
-        call. A 304 response means "no new trades since you last asked"
-        and we skip parsing the body entirely. We also count the skip in
-        `trades_ingested_total{source="rest", result="not_modified"}`
-        for observability — that counter against `…{result="inserted"}`
-        is the easiest way to see the bandwidth saved.
+        Two complementary mechanisms gate the work this method does on
+        each poll:
+
+        1. **ETag / If-Modified-Since** (Phase 1 HP-1 fix #1 supplement).
+           Saves bandwidth on no-op polls.
+        2. **Continuous cursor** (Phase 3 Round 1 / Agent A). Replaces
+           the implicit "rely on Redis dedup" pattern with an explicit
+           ``(ts, tx_hash)`` cursor at
+           ``observer:cursor:trades:api_market``. Even when the server
+           skips the 304 path and returns a 200 full body, we filter to
+           trades strictly newer than the cursor head before doing any
+           DB work. This eliminates the time-window edge cases where a
+           trade landing exactly at the previous poll's boundary was
+           silently dropped.
 
         If the server never returns ETag/Last-Modified, we log once at
-        DEBUG and stop trying — the conditional headers cost ~80 bytes
-        per request to send unconditionally, which is fine but noisy.
+        DEBUG and stop trying. The cursor is the real correctness
+        primitive here; ETag is the bandwidth optimisation.
         """
         target_markets = await self._get_recent_leader_market_ids()
         if not target_markets:
             return 0
+
+        cursor_ts, cursor_tx = await self._load_cursor(SOURCE_API_MARKET)
+        polling_cursor_lag_seconds.labels(source=SOURCE_API_MARKET).observe(
+            max(0.0, time.time() - cursor_ts)
+        )
 
         processed = 0
         url = (
@@ -1447,6 +1737,11 @@ class TradeObserver:
                     trades_ingested_total.labels(
                         source="rest", result="not_modified"
                     ).inc()
+                    # Phase 3 Task D: a 304 also proves liveness — the
+                    # endpoint is responsive even if there's no new
+                    # payload. Without this heartbeat, a quiet market
+                    # period would flap the gap watchdog.
+                    _heartbeat_rest()
                     logger.debug(
                         f"data-api market activity 304 Not Modified "
                         f"(etag={self._last_etag!r} last_mod={self._last_modified!r})"
@@ -1454,6 +1749,8 @@ class TradeObserver:
                     return 0
                 if resp.status != 200:
                     return 0
+                # Phase 3 Task D: ingest-health heartbeat on 200.
+                _heartbeat_rest()
                 # Capture validators BEFORE consuming the body so a
                 # mid-response error doesn't poison the cache with a bad
                 # ETag.
@@ -1480,7 +1777,16 @@ class TradeObserver:
         # producer lets the writer measure end-to-end latency from "REST
         # response received" to "DB committed".
         response_ts_s = time.time()
-        for trade in trades:
+        # Cursor filter first — the cheap path. Eliminates any trade
+        # we've already enqueued in a previous poll. The DB UNIQUE
+        # INDEX still backs us up if a crash interleaved cursor save
+        # with batch commit, but in steady state this filter drops the
+        # work the dedup path used to do.
+        if isinstance(trades, list):
+            new_trades = self._cursor_filter_new(trades, cursor_ts, cursor_tx)
+        else:
+            new_trades = []
+        for trade in new_trades:
             market_id = str(trade.get("conditionId") or "")
             if not market_id or market_id not in target_markets:
                 continue
@@ -1488,6 +1794,17 @@ class TradeObserver:
                 trade, source=SOURCE_API_MARKET, event_ts_s=response_ts_s
             )
             processed += 1
+        # Advance the cursor across the WHOLE response, not just the
+        # subset that matched target_markets — that guarantees the next
+        # poll's filter doesn't keep re-finding the same off-watchlist
+        # trades. If the response had nothing newer than the cursor,
+        # _cursor_head returns (0.0, "") which we ignore.
+        if new_trades:
+            head_ts, head_tx = self._cursor_head(new_trades)
+            if head_ts > cursor_ts or (
+                head_ts == cursor_ts and head_tx and head_tx != cursor_tx
+            ):
+                await self._save_cursor(SOURCE_API_MARKET, head_ts, head_tx)
         return processed
 
     async def _get_recent_leader_market_ids(self) -> set[str]:
