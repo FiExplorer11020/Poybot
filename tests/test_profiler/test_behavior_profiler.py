@@ -63,7 +63,9 @@ def test_update_dirichlet_creates_category():
     profile = {}
     _update_dirichlet(profile, "crypto")
     assert "crypto" in profile["preferred_categories"]
-    assert profile["preferred_categories"]["crypto"]["alpha"][0] == 1.0
+    # Round 4 update: size-weighted semantics — prior 1.0 + observation
+    # weight (1.0 when size_usdc is None per _size_weight fallback).
+    assert profile["preferred_categories"]["crypto"]["alpha"][0] == 2.0
 
 
 # ---------------------------------------------------------------------------
@@ -75,7 +77,8 @@ def test_update_dirichlet_increments_existing():
     profile = {}
     _update_dirichlet(profile, "crypto")
     _update_dirichlet(profile, "crypto")
-    assert profile["preferred_categories"]["crypto"]["alpha"][0] == 2.0
+    # Round 4 update: size-weighted — prior 1.0 + 2× obs weight 1.0 = 3.0.
+    assert profile["preferred_categories"]["crypto"]["alpha"][0] == 3.0
 
 
 # ---------------------------------------------------------------------------
@@ -273,10 +276,16 @@ async def test_on_position_closed_saves_profile():
         }
         await profiler.on_position_closed(event)
 
-    # The save conn should have had execute called with INSERT ... ON CONFLICT
-    save_conn.execute.assert_called_once()
-    sql_arg = save_conn.execute.call_args[0][0]
-    assert "ON CONFLICT" in sql_arg
+    # Round 4 update: Phase 0 added a leader FK upsert before the profile
+    # write, so save_conn.execute is called TWICE. Find the leader_profiles
+    # call by SQL fragment.
+    assert save_conn.execute.call_count >= 1
+    profile_calls = [
+        c for c in save_conn.execute.call_args_list
+        if "leader_profiles" in c.args[0]
+    ]
+    assert profile_calls, "expected one execute() call targeting leader_profiles"
+    assert "ON CONFLICT" in profile_calls[0].args[0]
 
 
 # ---------------------------------------------------------------------------
@@ -313,11 +322,15 @@ async def test_on_position_closed_increments_resolved():
         }
         await profiler.on_position_closed(event)
 
-    # Verify save was called with positions_resolved = 6 (5 + 1)
-    save_conn.execute.assert_called_once()
-    call_args = save_conn.execute.call_args[0]
+    # Round 4 update: Phase 0 added a leader FK upsert; filter for the
+    # leader_profiles call to read positions_resolved (index 4).
+    profile_calls = [
+        c for c in save_conn.execute.call_args_list
+        if "leader_profiles" in c.args[0]
+    ]
+    assert profile_calls, "expected one execute() call targeting leader_profiles"
+    call_args = profile_calls[0].args
     # Positional args: sql, wallet, profile_json, trades_observed, positions_resolved, maturity
-    # Index 4 is positions_resolved
     assert call_args[4] == 6
 
 

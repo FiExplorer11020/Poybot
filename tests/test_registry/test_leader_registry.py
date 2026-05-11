@@ -168,6 +168,13 @@ class TestEnrichLeaders:
 
     @pytest.mark.asyncio
     async def test_skips_wallet_on_none_response(self):
+        """Round 4 update: Phase 0 (audit Section 16, 'enrich_leaders now
+        stamps excluded=TRUE, on_watchlist=FALSE for falcon_no_data
+        wallets') changed the contract. When wallet360 returns None we
+        STILL call execute() — but only to write the falcon_no_data
+        stamp, not the metrics upsert. The test now asserts the stamp
+        was written instead of asserting no write happened at all.
+        """
         registry, falcon = _make_registry()
         conn = _make_conn()
         conn.fetch = AsyncMock(return_value=[{"wallet_address": "0xa"}])
@@ -175,7 +182,11 @@ class TestEnrichLeaders:
 
         count = await registry.enrich_leaders(conn)
         assert count == 0
-        conn.execute.assert_not_awaited()
+        # Execute IS called — but for the falcon_no_data stamp.
+        conn.execute.assert_awaited_once()
+        stamp_sql = conn.execute.call_args[0][0]
+        assert "falcon_no_data" in stamp_sql.lower()
+        assert "0xa" in conn.execute.call_args[0]
 
     @pytest.mark.asyncio
     async def test_returns_zero_when_no_stale_leaders(self):

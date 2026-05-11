@@ -1,8 +1,17 @@
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
+
+# Round 4 fix: subprocess runs scripts/backtest.py which does
+# `from src.backtest...` — that fails without PYTHONPATH because the
+# subprocess Python has no project root in sys.path (the project isn't
+# installed via `pip install -e .` because the lightgbm wheel build
+# fails on this Python version). Inject PYTHONPATH explicitly.
+_PROJECT_ROOT = str(Path(__file__).resolve().parents[2])
+_SUBPROC_ENV = {**os.environ, "PYTHONPATH": _PROJECT_ROOT}
 
 
 def test_backtest_cli_writes_mock_report(tmp_path):
@@ -20,6 +29,7 @@ def test_backtest_cli_writes_mock_report(tmp_path):
         check=True,
         capture_output=True,
         text=True,
+        env=_SUBPROC_ENV,
     )
 
     report = json.loads(output.read_text())
@@ -35,6 +45,7 @@ def test_backtest_cli_exposes_historical_options():
         check=True,
         capture_output=True,
         text=True,
+        env=_SUBPROC_ENV,
     )
 
     assert "--start" in result.stdout

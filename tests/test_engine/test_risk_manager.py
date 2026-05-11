@@ -39,12 +39,25 @@ def _make_db_cm_returning(cnt_value: int = 0, total_value: float = 0.0):
 class TestCheckCanTrade:
     @pytest.mark.asyncio
     async def test_check_can_trade_passes_clean_state(self):
-        """All DB calls return 0 — clean slate should allow trading."""
+        """All DB calls return 0 — clean slate should allow trading.
+
+        Round 4 update: Phase 0 wired check_can_trade to consult the
+        killswitch first. The killswitch's get_state() needs an
+        initialized DB pool which the test doesn't set up, so we patch
+        get_killswitch() to return a stub that always says enabled.
+        """
         rm = RiskManager()
         signal = _make_signal()
 
-        with patch(
-            "src.engine.risk_manager.get_db", _make_db_cm_returning(cnt_value=0, total_value=0.0)
+        ks_stub = AsyncMock()
+        ks_stub.is_execution_enabled = AsyncMock(return_value=True)
+
+        with (
+            patch(
+                "src.engine.risk_manager.get_db",
+                _make_db_cm_returning(cnt_value=0, total_value=0.0),
+            ),
+            patch("src.engine.risk_manager.get_killswitch", return_value=ks_stub),
         ):
             result = await rm.check_can_trade(signal, current_capital=settings.PAPER_CAPITAL_USDC)
 
