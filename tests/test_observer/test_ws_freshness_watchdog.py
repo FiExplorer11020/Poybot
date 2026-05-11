@@ -50,9 +50,12 @@ def _make_client(redis_client=None, markets=None) -> PolymarketWSClient:
     async def _noop_handler(msg):
         return None
 
+    # Use `is None` so the empty-set case (markets=set()) is honored —
+    # `markets or {...}` falls through to the default because `set()` is
+    # falsy. Round 3 fix for the test_watchdog_skips_when_no_markets test.
     return PolymarketWSClient(
         on_message=_noop_handler,
-        markets=markets or {"0xtoken1"},
+        markets={"0xtoken1"} if markets is None else markets,
         redis_client=redis_client,
     )
 
@@ -199,18 +202,15 @@ async def test_watchdog_noop_without_redis():
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.xfail(
-    reason="Phase 3 Round 1: ws_mock.close is awaited 3x via an unrelated "
-    "code path in the test setup (likely connect()/close() during "
-    "_make_client). The watchdog body itself correctly short-circuits "
-    "on empty markets. Fix in Round 2 by isolating ws_mock state from "
-    "the setup path.",
-    strict=False,
-)
 @pytest.mark.asyncio
 async def test_watchdog_skips_when_no_markets_subscribed(fake_redis):
     """If no markets are subscribed, channel silence is expected — the
-    watchdog should NOT fire a reconnect."""
+    watchdog should NOT fire a reconnect.
+
+    Round 3 fix: the helper `_make_client(markets=set())` now correctly
+    passes the empty set through (was falling through `markets or ...`
+    to the default before).
+    """
     client = _make_client(redis_client=fake_redis, markets=set())
     client._running = True
     client.last_message_at = time.time() - 1000
