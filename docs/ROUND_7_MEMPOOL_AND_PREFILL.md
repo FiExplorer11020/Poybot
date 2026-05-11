@@ -299,11 +299,11 @@ code path. Switch is one runtime config knob away.
 
 | Migration | Round | Purpose |
 |---|---|---|
-| 032 | 7.1 | `mempool_observations` table — intent_id, latency tracking, fill correlation |
-| 033 | 7.2 | `live_orders` extension — `intent_id` FK to `mempool_observations` |
+| 024 | 7.1 | `mempool_observations` table — intent_id, latency tracking, fill correlation |
+| 025 | 7.2 | `live_orders` extension — `intent_id` FK to `mempool_observations` |
 
 ```sql
--- Migration 032 (sketch)
+-- Migration 024 (sketch)
 CREATE TABLE mempool_observations (
     intent_id UUID PRIMARY KEY,
     wallet_address VARCHAR(100) NOT NULL,
@@ -363,7 +363,7 @@ polybot_mempool_shadow_vs_live_pnl_diff_usdc     # during shadow mode
 | 3.4 — `event_emitter.py` (stream wiring) | 0.25 |
 | 3.5 — `prefill/pool.py` | 0.75 |
 | 3.6 — `prefill/intent_router.py` (incl. risk integration) | 0.75 |
-| Migration 032/033 + tests | 0.5 |
+| Migration 024/025 + tests | 0.5 |
 | 3.7 — Shadow-mode infrastructure | 0.25 |
 | Documentation + audit doc | 0.25 |
 | **Total** | **~4 weeks** + 30-day shadow soak (parallel, doesn't block dev) |

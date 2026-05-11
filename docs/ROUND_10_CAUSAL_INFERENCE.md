@@ -242,7 +242,7 @@ is near zero, that's the news-confounding case — we don't trade it.
 ## 4. Migration sequence
 
 ```sql
--- Migration 038
+-- Migration 030
 CREATE TABLE causal_estimates (
     leader_wallet VARCHAR(100) NOT NULL,
     pool_class VARCHAR(20) NOT NULL,
@@ -262,7 +262,7 @@ CREATE TABLE causal_estimates (
     PRIMARY KEY (leader_wallet, pool_class, estimated_at)
 );
 
--- Migration 039
+-- Migration 031
 CREATE TABLE instrumental_events (
     event_id BIGSERIAL PRIMARY KEY,
     event_type VARCHAR(40) NOT NULL,  -- news|oracle_update|api_outage|funding|gas_quirk

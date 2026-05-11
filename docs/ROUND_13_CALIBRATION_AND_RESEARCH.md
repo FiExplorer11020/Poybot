@@ -69,7 +69,7 @@ research/
 Notebooks are git-tracked (history of analyses); the duckdb file is
 not (it's a working DB).
 
-The calibration daemon writes to a new schema (migration 046); the
+The calibration daemon writes to a new schema (migration 038); the
 notebooks read from the cold tier (R6) and the new schema, plus the
 existing feature store.
 
@@ -84,7 +84,7 @@ Every decision the bot makes already gets logged to `decision_log`
 PREDICTED at the time:
 
 ```sql
--- Migration 046
+-- Migration 038
 CREATE TABLE decision_predictions (
     decision_id BIGINT NOT NULL REFERENCES decision_log(id),
     predicted_at TIMESTAMPTZ NOT NULL,
@@ -140,7 +140,7 @@ class ModelLossAggregator:
       This is weaker than the labelled validation set, but it's
       continuous + automated.
 
-    Per-model loss history → `calibration_loss_history` (mig. 047)
+    Per-model loss history → `calibration_loss_history` (mig. 039)
     """
 ```
 
@@ -222,10 +222,10 @@ The auto-disabler can be operator-overridden in both directions.
 ## 4. Migration sequence
 
 ```sql
--- Migration 046
+-- Migration 038
 -- See § 3.1 for `decision_predictions`
 
--- Migration 047
+-- Migration 039
 CREATE TABLE calibration_loss_history (
     model VARCHAR(40) NOT NULL,
     strategy_class VARCHAR(20),  -- NULL = aggregate
@@ -239,7 +239,7 @@ CREATE TABLE calibration_loss_history (
 );
 CREATE INDEX idx_clh_measured ON calibration_loss_history (measured_at DESC);
 
--- Migration 048
+-- Migration 040
 CREATE TABLE model_disable_state (
     model VARCHAR(40) PRIMARY KEY,
     is_disabled BOOLEAN NOT NULL DEFAULT FALSE,
@@ -319,14 +319,14 @@ polybot_research_notebook_executions_total          # operator-driven
 ## 7. Rollout plan
 
 ### Phase 13.A — Prediction logging (week 1)
-1. Migration 046 (decision_predictions)
+1. Migration 038 (decision_predictions)
 2. Hook into confidence_engine.decide() — atomic write
 3. Hook into position_tracker close events to fill outcomes
 4. **Gate**: 7 days of clean prediction logging, ≥ 95 % of decisions
    have populated outcomes after 30 min
 
 ### Phase 13.B — Loss aggregation (week 2)
-1. Migration 047 (calibration_loss_history)
+1. Migration 039 (calibration_loss_history)
 2. Nightly batch job in batch_runner.py
 3. Backfill 90 days of historical losses from existing decision_log
    + position outcomes
@@ -339,7 +339,7 @@ polybot_research_notebook_executions_total          # operator-driven
    historical replay
 
 ### Phase 13.D — Auto-disable + override (week 3)
-1. Migration 048 (model_disable_state)
+1. Migration 040 (model_disable_state)
 2. confidence_engine reads disable flags before model contributions
 3. Telegram /disable /enable /disabled commands
 4. **Gate**: operator-tested commands work end-to-end

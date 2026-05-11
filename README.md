@@ -128,8 +128,8 @@ docker exec -i polymarket_db psql -U polymarket -d polymarket \
 - [docs/docker-setup.md](docs/docker-setup.md) : Dockerfile / compose / healthchecks
 - [docs/backups.md](docs/backups.md) : Postgres -> Cloudflare R2 (currently idle)
 - [docs/live-trading-setup.md](docs/live-trading-setup.md) : procédure de bascule live
-- [docs/PHASE_A_BACKTESTER_DESIGN.md](docs/PHASE_A_BACKTESTER_DESIGN.md) : design du backtester
-- [docs/SESSION_2026-05-10_RUNBOOK.md](docs/SESSION_2026-05-10_RUNBOOK.md) : dernière session de patches (DQ + risk cockpit + wallet scanner + inspector + size-weighted profile)
+- [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) : target end-state architecture, module by module
+- [docs/audit/CHANGELOG.md](docs/audit/CHANGELOG.md) : full retrospective of every change since the audit started
 - `src/*/CLAUDE.md` : architecture notes par module
 
 ## Runtime map

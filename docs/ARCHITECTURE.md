@@ -1,6 +1,6 @@
 # ARCHITECTURE — Target End-State
 
-> The shape of the system after Round 6–12 lands.
+> The shape of the system after Round 6–13 lands.
 > Read [VISION.md](../VISION.md) for the why and [ROADMAP.md](../ROADMAP.md)
 > for the sequencing. This file describes WHAT we are building, module
 > by module, at the end.
@@ -25,7 +25,7 @@
    ┌────────────────────────────────────────────────────────────────────┐
    │                       INGESTION LAYER                              │
    │ src/registry/ │ src/observer/{trade,book,clob}_observer            │
-   │ src/mempool/ (NEW R6) │ src/social/ (NEW R11) │ src/cross_market/ │
+   │ src/mempool/ (NEW R7) │ src/social/ (NEW R12) │ src/cross_market/ │
    └─────┬─────────┬─────────┬─────────┬─────────┬───────────────────┘
          │ trades  │ books   │ intents │ social  │ cross-venue
          ▼         ▼         ▼         ▼         ▼
@@ -45,11 +45,11 @@
    ┌────────────────────────────────────────────────────────────────────┐
    │                     MODELING LAYER                                 │
    │ src/profiler/         (behavior, error_model, feature_store)       │
-   │ src/strategy_classifier/  (NEW R7 — supervised per-wallet)         │
-   │ src/graph/hawkes_*  (R5 BIC bivariate, R8 multivariate)            │
-   │ src/follower_volume/  (NEW R8 — Kalman state-space)                │
-   │ src/causal/  (NEW R9 — IV, do-calculus, counterfactual)            │
-   │ src/calibration/  (NEW R12 — drift, auto-disable)                  │
+   │ src/strategy_classifier/  (NEW R8 — supervised per-wallet)         │
+   │ src/graph/hawkes_*  (R5 BIC bivariate, R9 multivariate)            │
+   │ src/follower_volume/  (NEW R9 — Kalman state-space)                │
+   │ src/causal/  (NEW R10 — IV, do-calculus, counterfactual)           │
+   │ src/calibration/  (NEW R13 — drift, auto-disable)                  │
    └────────────────────────────────┬───────────────────────────────────┘
                                     │
                                     ▼
@@ -66,18 +66,18 @@
    │                     EXECUTION LAYER                                │
    │ src/engine/paper_trader.py        (virtual portfolio)              │
    │ src/engine/live_trader.py         (CLOB via py-clob-client)        │
-   │ src/execution/prefill/  (NEW R6 — pre-signed pool + intent router) │
+   │ src/execution/prefill/  (NEW R7 — pre-signed pool + intent router) │
    └────────────────────────────────┬───────────────────────────────────┘
                                     │
                                     ▼
    ┌────────────────────────────────────────────────────────────────────┐
    │       OBSERVABILITY + DASHBOARD + ALERTS                           │
    │ /metrics (Prometheus, 60+ series at end-state)                     │
-   │ docs/monitoring/alerts.yml (Round 6+ adds mempool alerts)          │
+   │ docs/monitoring/alerts.yml (Round 7+ adds mempool alerts)          │
    │ src/api/  (FastAPI dashboard + WS bridge)                          │
    │ src/monitoring/ingest_health.py  (Round 3 — gap detector)          │
    │ src/telegram_bot/  (operator alerts + /commands)                   │
-   │ research/  (NEW R12 — Jupyter notebooks)                           │
+   │ research/  (NEW R13 — Jupyter notebooks)                           │
    └────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -134,10 +134,10 @@ no time-window holes.
   `book_quality_snapshots` into `orderbook_features_minute`
 
 **Target state**:
-- NEW `clob_book_observer.py` (Round 10) — captures every book event
+- NEW `clob_book_observer.py` (Round 11) — captures every book event
   (placement, modification, cancellation) at full WS granularity, into
   the partitioned `clob_book_events` table
-- NEW `microstructure.py` (Round 10) — derives iceberg detection, spoof
+- NEW `microstructure.py` (Round 11) — derives iceberg detection, spoof
   patterns, order-flow-imbalance
 - All observers emit to Redis Streams (trades:stream from Round 3 R1 +
   new books:stream and microstructure:stream)
@@ -150,7 +150,7 @@ no time-window holes.
 
 ---
 
-#### `src/mempool/` — NEW (Round 6)
+#### `src/mempool/` — NEW (Round 7)
 
 **Role**: Detect leader trade intent **before** chain confirmation.
 
@@ -171,7 +171,7 @@ no time-window holes.
 
 ---
 
-#### `src/social/` — NEW (Round 11)
+#### `src/social/` — NEW (Round 12)
 
 **Role**: Capture pre-trade signal from X / Telegram / Discord.
 
@@ -187,7 +187,7 @@ no time-window holes.
 
 ---
 
-#### `src/cross_market/` — NEW (Round 11)
+#### `src/cross_market/` — NEW (Round 12)
 
 **Role**: Detect leaders who trade simultaneously on Kalshi, Manifold,
 PredictIt — and use their other-venue positions as features.
@@ -223,18 +223,31 @@ PredictIt — and use their other-venue positions as features.
 | `book_quality_snapshots` | Raw book updates | — | 30 d |
 | `orderbook_features_minute` | Per-minute rollup (R2 task Z) | — | 90 d |
 
-**Target additions (Round 6–12)**:
+**Target additions (Round 6–13)** — synchronized with the per-round specs:
 
 | Table | Migration | Round | Purpose |
 |---|---|---|---|
-| `mempool_observations` | 020 | R6 | Tx detected in mempool — observation→confirmation latency tracking |
-| `leader_strategy_history` | 021 | R7 | Append-only per-wallet strategy probability history |
-| `follower_pool_state` | 022 | R8 | Kalman filter state per (leader, pool_class) |
-| `causal_estimates` | 023 | R9 | IV-adjusted causal ATE vs Hawkes statistical |
-| `clob_book_events` | 024 | R10 | Every book event (placement/mod/cancel), partitioned by hour |
-| `social_signals` | 025 | R11 | Tweet/TG/Discord captured signals |
-| `cross_market_positions` | 026 | R11 | Same-wallet positions across venues |
-| `calibration_replays` | 027 | R12 | Per-decision counterfactual replay results |
+| `wallet_universe` | 020 | R6 | All ~1.5 M Polymarket wallets ever, with adaptive depth tier |
+| `trades_observed` (ext.) | 021 | R6 | + `block_number`, `tx_hash`, `log_index` + UNIQUE for chain-source dedup |
+| `chain_sync_state` | 022 | R6 | Last processed Polygon block (resume on restart) |
+| `rpc_health_history` | 023 | R6 | Per-provider availability + latency |
+| `mempool_observations` | 024 | R7 | Tx detected in mempool — observation→confirmation latency |
+| `live_orders` (ext.) | 025 | R7 | + `intent_id` FK to `mempool_observations` |
+| `strategy_labels` + `leader_strategy_history` | 026 | R8 | Hand-labels + classifier outputs (append-only) |
+| `leaders.classification_json` (formalised schema) | 027 | R8 | Strategy probs / primary / confidence / model_version |
+| `multivariate_hawkes_fits` | 028 | R9 | N-dim Hawkes results per leader |
+| `follower_pool_state` | 029 | R9 | Kalman state per (leader, pool_class) |
+| `causal_estimates` | 030 | R10 | IV-adjusted ATE vs Hawkes statistical |
+| `instrumental_events` | 031 | R10 | News / oracle / API-outage events used as instruments |
+| `clob_book_events` | 032 | R11 | Every order-life event, partitioned by hour |
+| `microstructure_features` | 033 | R11 | Per-minute rollups (iceberg / spoof / OFI) |
+| `wallet_microstructure_signature` | 034 | R11 | Per-wallet 30-day signatures |
+| `social_signals` | 035 | R12 | Tweet / TG / Discord captured signals |
+| `cross_market_operators` | 036 | R12 | Cross-venue identity resolutions |
+| `cross_market_positions` | 037 | R12 | Same-wallet positions across venues |
+| `decision_predictions` | 038 | R13 | Per-decision model predictions, captured atomically |
+| `calibration_loss_history` | 039 | R13 | Daily per-model loss snapshots |
+| `model_disable_state` | 040 | R13 | Auto-disable flags per model |
 
 **Discipline**: every new table that backs a model FEATURE is append-only
 (history table). Every "current value" table that the model READS is

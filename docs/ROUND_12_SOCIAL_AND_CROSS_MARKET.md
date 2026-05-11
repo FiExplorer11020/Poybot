@@ -216,7 +216,7 @@ class CrossMarketPositionAggregator:
     """For each watched wallet, fetch positions across all resolved
     venues. Emit a unified position snapshot per resolved identity.
 
-    Output to `cross_market_positions` table (migration 043):
+    Output to `cross_market_positions` table (migration 035):
       {
         operator_id (our internal ID for resolved identities),
         polymarket_wallet, kalshi_account, manifold_handle, ...,
@@ -247,7 +247,7 @@ ships, we add it to the taxonomy.
 ## 5. Migration sequence
 
 ```sql
--- Migration 043
+-- Migration 035
 CREATE TABLE social_signals (
     signal_id BIGSERIAL PRIMARY KEY,
     source VARCHAR(20) NOT NULL,         -- x|telegram|discord
@@ -265,7 +265,7 @@ CREATE INDEX idx_ss_author_time ON social_signals (author_handle, posted_at DESC
 CREATE INDEX idx_ss_wallet_time ON social_signals
     (resolved_wallet, posted_at DESC) WHERE resolved_wallet IS NOT NULL;
 
--- Migration 044
+-- Migration 036
 CREATE TABLE cross_market_operators (
     operator_id BIGSERIAL PRIMARY KEY,
     polymarket_wallet VARCHAR(100),
@@ -281,7 +281,7 @@ CREATE TABLE cross_market_operators (
 CREATE INDEX idx_cmo_pm ON cross_market_operators (polymarket_wallet);
 CREATE INDEX idx_cmo_kalshi ON cross_market_operators (kalshi_account);
 
--- Migration 045
+-- Migration 037
 CREATE TABLE cross_market_positions (
     snapshot_id BIGSERIAL PRIMARY KEY,
     operator_id BIGINT NOT NULL REFERENCES cross_market_operators(operator_id),

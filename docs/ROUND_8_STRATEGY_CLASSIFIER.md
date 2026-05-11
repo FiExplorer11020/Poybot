@@ -148,7 +148,7 @@ src/strategy_classifier/labeling/
 The label store is **append-only** with provenance:
 
 ```sql
--- Migration 034 (part 1)
+-- Migration 026 (part 1)
 CREATE TABLE strategy_labels (
     label_id BIGSERIAL PRIMARY KEY,
     wallet_address VARCHAR(100) NOT NULL,
@@ -207,7 +207,7 @@ class StrategyClassifier:
       }
 
     Stored in leaders.classification_json (Phase 3 R2 schema extension)
-    and append-only to leader_strategy_history (migration 034 part 2).
+    and append-only to leader_strategy_history (migration 026 part 2).
     """
 ```
 
@@ -293,8 +293,8 @@ the strategy; the operator decides the policy per strategy.
 
 | Migration | Purpose |
 |---|---|
-| 034 | `strategy_labels` (hand-labels) + `leader_strategy_history` (model outputs, append-only) |
-| 035 | `leaders.classification_json` schema extension (already partially used; formalize the schema) |
+| 026 | `strategy_labels` (hand-labels) + `leader_strategy_history` (model outputs, append-only) |
+| 027 | `leaders.classification_json` schema extension (already partially used; formalize the schema) |
 
 ---
 

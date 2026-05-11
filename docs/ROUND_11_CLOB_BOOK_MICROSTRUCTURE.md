@@ -114,7 +114,7 @@ class CLOBBookObserver:
     placement events (only on fills). For full attribution, join with
     on-chain CLOB events from Round 6 on (tx_hash, log_index).
 
-    Output: writes events to `clob_book_events` (migration 040,
+    Output: writes events to `clob_book_events` (migration 032,
     partitioned by hour) AND publishes to Redis Stream
     `book:events:stream` for downstream microstructure derivations.
 
@@ -215,7 +215,7 @@ improvement is the measurable acceptance criterion (§ 6).
 ## 4. Migration sequence
 
 ```sql
--- Migration 040
+-- Migration 032
 -- Partitioned by hour (not day) because of 13 GB/day volume.
 CREATE TABLE clob_book_events (
     event_id BIGSERIAL,
@@ -242,7 +242,7 @@ CREATE INDEX idx_cbe_order_hash ON clob_book_events
 
 -- (Then create initial partitions for the next 24h.)
 
--- Migration 041
+-- Migration 033
 CREATE TABLE microstructure_features (
     market_id VARCHAR(100) NOT NULL,
     token_id VARCHAR(100) NOT NULL,
@@ -259,7 +259,7 @@ CREATE TABLE microstructure_features (
 );
 CREATE INDEX idx_mf_bucket ON microstructure_features (bucket_ts DESC);
 
--- Migration 042
+-- Migration 034
 CREATE TABLE wallet_microstructure_signature (
     wallet_address VARCHAR(100) NOT NULL,
     rollup_at TIMESTAMPTZ NOT NULL,

@@ -3,7 +3,7 @@
 > **Formal title**: Data Sovereignty Layer
 > **Colloquial name**: The Spine
 > **Why this round comes first**: every model, every prediction, every
-> trade in Rounds 7–12 depends on this layer being solid. The earlier
+> trade in Rounds 7–13 depends on this layer being solid. The earlier
 > ROADMAP put mempool ingestion at Round 6; that was the right
 > *component* but the wrong *frame*. Mempool watching is one consumer
 > of the broader architecture this round builds.
@@ -269,7 +269,7 @@ class AdaptiveDepth:
     """
 ```
 
-**Migration 028** — `wallet_universe`:
+**Migration 020** — `wallet_universe`:
 ```sql
 CREATE TABLE wallet_universe (
     wallet_address VARCHAR(100) PRIMARY KEY,
@@ -409,10 +409,10 @@ class CoverageReconciler:
 
 | Migration | Round | Purpose |
 |---|---|---|
-| 028 | 6.1 | `wallet_universe` table + initial indexes |
-| 029 | 6.2 | `trades_observed`: add `block_number`, `tx_hash`, `log_index` columns + UNIQUE on (tx_hash, log_index) for chain-source dedup |
-| 030 | 6.3 | `chain_sync_state` (last processed block, for resume on restart) |
-| 031 | 6.4 | `rpc_health_history` (per-provider availability + latency) |
+| 020 | 6.1 | `wallet_universe` table + initial indexes |
+| 021 | 6.2 | `trades_observed`: add `block_number`, `tx_hash`, `log_index` columns + UNIQUE on (tx_hash, log_index) for chain-source dedup |
+| 022 | 6.3 | `chain_sync_state` (last processed block, for resume on restart) |
+| 023 | 6.4 | `rpc_health_history` (per-provider availability + latency) |
 
 ---
 
@@ -526,8 +526,8 @@ Strictly sequential, since each component depends on the previous:
 
 ### Phase 6.B — On-chain ingestion (weeks 3-5)
 1. Build `src/onchain/clob_listener.py` against the paid RPC pool
-2. Migration 029 (`trades_observed` block/tx columns + UNIQUE)
-3. Migration 030 (`chain_sync_state`)
+2. Migration 021 (`trades_observed` block/tx columns + UNIQUE)
+3. Migration 022 (`chain_sync_state`)
 4. Run in shadow mode for 1 week: writes new rows but downstream
    consumers still use REST data. Reconciler verifies coverage.
 5. Switch primary source to on-chain; REST becomes redundancy
@@ -547,7 +547,7 @@ Strictly sequential, since each component depends on the previous:
    populate `wallet_universe`. Uses the paid-RPC pool (this is the
    only time we hit them heavily again).
 2. Build adaptive-depth manager
-3. Migration 028 (`wallet_universe` schema)
+3. Migration 020 (`wallet_universe` schema)
 4. **Gate**: `wallet_universe_size > 1_000_000`, tier promotions/
    demotions running nightly
 

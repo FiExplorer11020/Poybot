@@ -272,7 +272,7 @@ that leader.
 ## 4. Migration sequence
 
 ```sql
--- Migration 036
+-- Migration 028
 CREATE TABLE multivariate_hawkes_fits (
     leader_wallet VARCHAR(100) NOT NULL,
     fit_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
@@ -287,7 +287,7 @@ CREATE TABLE multivariate_hawkes_fits (
     PRIMARY KEY (leader_wallet, fit_at)
 );
 
--- Migration 037
+-- Migration 029
 CREATE TABLE follower_pool_state (
     leader_wallet VARCHAR(100) NOT NULL,
     pool_class VARCHAR(20) NOT NULL,
