@@ -62,6 +62,31 @@ HAWKES_HALFLIFE_S = 300.0
 _PARAM_FLOOR = 1e-9
 _INVALID_NLL = 1e10
 
+# Round 5 — Significance threshold for accepting α > 0 (model selection).
+#
+# On independent or weakly-coupled data the MLE was systematically returning
+# α/μ ≈ 5+ (test_independence_yields_low_alpha_mu in test_hawkes_bivariate.py)
+# because the optimiser picks up phantom coincidences and there's no
+# regularisation pushing α toward 0.
+#
+# We use BIC (Bayesian Information Criterion) rather than a fixed-α LRT
+# threshold. BIC penalises the bivariate model by `log(N)` for the extra
+# parameter, where N is the number of follower events. Concretely:
+#
+#       2 · (NLL_at_α=0 − NLL_at_MLE) > log(N) · HAWKES_BIC_K_PENALTY
+#
+# This is equivalent to "the bivariate model wins only if it reduces NLL by
+# more than ½·log(N) per added parameter." For typical follower counts
+# (N ≈ 1k-5k), the threshold sits at ~7-8 — much stricter than the χ²(1,
+# 5%) value of 3.84 and stricter still than typical false-positive rates of
+# raw LRT. Smaller samples are penalised LESS strictly (small log(N)), so
+# we still detect strong coupling in sparse-data edges.
+#
+# The fallback floor `HAWKES_LRT_FLOOR` guards against degenerate
+# log(N)·k giving an absurdly-low threshold for tiny N (e.g. log(20)·1=3.0).
+HAWKES_BIC_K_PENALTY = 1  # bivariate adds 1 free parameter (α) over null
+HAWKES_LRT_FLOOR = 3.84    # absolute floor = χ²(1, 5%) — never accept below this
+
 
 # ---------------------------------------------------------------------------
 # Log-likelihood: BIVARIATE exponential kernel
@@ -355,6 +380,39 @@ class HawkesFitter:
         nll = bivariate_hawkes_nll(
             np.array([mu, alpha, beta]), leader_norm, follower_norm, window_end
         )
+
+        # Round 5 — BIC model selection against H0: α = 0.
+        # Compute NLL of the μ-only Poisson model AT THE BIVARIATE μ
+        # (so the comparison is against a properly-fit null, not
+        # the empirical rate). β is irrelevant when α=0.
+        null_nll = bivariate_hawkes_nll(
+            np.array([mu, 0.0, beta]), leader_norm, follower_norm, window_end
+        )
+        nF = max(len(follower_norm), 1)
+        # log(N) is the BIC unit; ×1 because bivariate adds exactly 1 free
+        # parameter (α) over the H0 model (μ alone, β unidentified).
+        bic_threshold = max(
+            HAWKES_BIC_K_PENALTY * float(np.log(nF)),
+            HAWKES_LRT_FLOOR,
+        )
+        if (
+            np.isfinite(null_nll)
+            and np.isfinite(nll)
+            and null_nll < _INVALID_NLL / 2
+            and nll < _INVALID_NLL / 2
+        ):
+            lrt_statistic = 2.0 * (null_nll - nll)
+        else:
+            lrt_statistic = 0.0
+
+        if lrt_statistic < bic_threshold:
+            # Not enough evidence to reject α=0 — return the μ-only fit.
+            # This is the regularisation that prevents independent-Poisson
+            # data from being labelled as a confirmed follower.
+            alpha = 0.0
+            nll = null_nll
+            convergence = f"{convergence}_bic_rejected"
+
         log_lik = -nll if np.isfinite(nll) and nll < _INVALID_NLL / 2 else float("nan")
         alpha_mu = float(alpha / mu) if mu > _PARAM_FLOOR else 0.0
 
@@ -367,6 +425,7 @@ class HawkesFitter:
             "beta": float(beta),
             "alpha_mu_ratio": alpha_mu,
             "log_likelihood": float(log_lik) if np.isfinite(log_lik) else 0.0,
+            "lrt_statistic": float(lrt_statistic),
             "n_leader_events": int(len(leader_norm)),
             "n_follower_events": int(len(follower_norm)),
             "convergence": convergence,
@@ -392,7 +451,11 @@ class HawkesFitter:
         # ---- Prior seeds -------------------------------------------------
         empirical_mu = max(len(follower_times) / window_end, _PARAM_FLOOR * 10.0)
         seed_beta = 1.0 / HAWKES_HALFLIFE_S
+        # Round 5: the H0 = no-coupling seed is included so the optimiser
+        # has a fair shot at the null. If it lands here with strictly lower
+        # NLL than any α > 0 seed, the LRT path will accept α = 0 cleanly.
         seeds = [
+            np.array([empirical_mu, 0.0, seed_beta]),  # H0 seed (α=0)
             np.array([empirical_mu, 0.1 * empirical_mu, seed_beta]),
             np.array([empirical_mu * 0.5, 0.5 * empirical_mu, seed_beta]),
             np.array([empirical_mu * 2.0, 1.0 * empirical_mu, seed_beta * 2.0]),
