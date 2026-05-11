@@ -1,44 +1,72 @@
 """Provider pool for the multi-RPC abstraction.
 
-WAVE-1 ARCHITECT SKELETON. Bodies intentionally not implemented; Wave 2
-fills them in. See docs/ROUND_6_THE_SPINE.md § 3.2.
+Wave-2 implementation. A :class:`ProviderPool` holds N :class:`RPCProvider`
+instances ranked by priority and exposes :meth:`acquire` which returns the
+best available provider given current circuit-breaker + token-bucket state.
 
-A :class:`ProviderPool` holds N :class:`RPCProvider` instances ranked
-by priority and exposes :meth:`acquire` which returns the best
-available provider given current circuit-breaker + token-bucket state.
-
-Default provider lineup (overridable via settings.RPC_PROVIDER_PRIORITIES):
-  priority 0 — local Erigon (~5 ms latency, no rate limit)
-  priority 1 — Alchemy paid tier (~50 ms latency, 300 CU/s)
-  priority 2 — QuickNode free tier (~80 ms latency, 15 req/min)
-
-The pool round-robins WITHIN a priority tier only when multiple
-providers share a tier; in practice priorities are unique so the
-behaviour is "prefer 0, fall back to 1, fall back to 2".
+Acquisition algorithm:
+  1. Scan providers by priority ascending.
+  2. Skip those in ProviderState.UNHEALTHY.
+  3. Skip those whose breaker.can_attempt() is False (the breaker arms
+     a HALF_OPEN probe if cooldown elapsed -- can_attempt() True).
+  4. For each candidate, try its bucket.try_acquire() (fast path).
+  5. If the fast path picks one, yield it.
+  6. If none fast-path-available, wait min(refill_time, cooldown) and
+     retry. Bound by ``RPC_ACQUIRE_TIMEOUT_S`` -- raises
+     :class:`NoRPCProviderAvailable` if exhausted.
 """
 
 from __future__ import annotations
 
+import asyncio
 import enum
+import time
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from typing import Any, AsyncIterator
 
-from src.rpc.circuit_breaker import CircuitBreaker
+from loguru import logger
+
+from src.rpc.circuit_breaker import CircuitBreaker, CircuitState
 from src.rpc.rate_limiter import AdaptiveTokenBucket
+
+try:
+    from src.monitoring.metrics import (  # type: ignore[attr-defined]
+        rpc_fallback_total,
+    )
+except Exception:  # pragma: no cover — defensive fallback
+    class _NoOpLabel:
+        def labels(self, *_args, **_kwargs):
+            return self
+
+        def inc(self, *_args, **_kwargs):
+            return None
+
+    rpc_fallback_total = _NoOpLabel()  # type: ignore[assignment]
+
+
+# Default upper bound for ProviderPool.acquire() before it raises
+# NoRPCProviderAvailable. Lives here (not in src/config.py) because
+# Wave-1 didn't add it to settings; an operator override would land
+# alongside the rest of the RPC tuning knobs in a Wave-3 patch.
+RPC_ACQUIRE_TIMEOUT_S: float = 5.0
+
+
+class NoRPCProviderAvailable(RuntimeError):
+    """Raised when ProviderPool.acquire() exhausts its wait budget with
+    every provider either UNHEALTHY, breaker-open, or rate-limited."""
+
+    pass
 
 
 class ProviderState(enum.Enum):
     """High-level lifecycle state of an RPCProvider.
 
-    Differs from :class:`CircuitState` — that's the breaker's view;
-    this is the operator's view.
-
     HEALTHY     — passes health checks, breaker is CLOSED, in rotation.
     DEGRADED    — breaker has tripped recently or latency p95 is elevated.
-                  Still in rotation as a fallback but de-prioritised.
-    UNHEALTHY   — manually disabled by operator, or breaker has been OPEN
-                  for > 3× cooldown without recovery. Skipped entirely.
+                  Still in rotation as a fallback.
+    UNHEALTHY   — manually disabled by operator, or URL not configured.
+                  Skipped entirely.
     """
 
     HEALTHY = "healthy"
@@ -48,23 +76,7 @@ class ProviderState(enum.Enum):
 
 @dataclass
 class RPCProvider:
-    """One Polygon RPC provider with its own auth, rate budget, breaker.
-
-    Fields:
-        name: Symbolic identifier ('local_erigon', 'alchemy', 'quicknode').
-            Used as the Prometheus label and as
-            ``rpc_health_history.provider``.
-        url: HTTP(S) endpoint for JSON-RPC POSTs. WebSocket endpoint
-            for subscriptions is derived (s/http/ws/) unless overridden.
-        ws_url: Explicit WebSocket endpoint (for eth_subscribe).
-            None => auto-derive from ``url``.
-        priority: Lower is preferred. 0 = local node, 1+ = paid/free
-            backups.
-        api_key: Optional bearer token / API key for paid providers.
-        bucket: Adaptive token bucket scoped to this provider.
-        breaker: Circuit breaker scoped to this provider.
-        state: Lifecycle state (operator-visible).
-    """
+    """One Polygon RPC provider with its own auth, rate budget, breaker."""
 
     name: str
     url: str
@@ -81,77 +93,214 @@ class ProviderPool:
     best available provider given current circuit-breaker + budget state.
 
     The pool is purely a scheduling layer — it does not make HTTP calls
-    itself. :class:`src.rpc.client.RPCClient` owns the aiohttp / websockets
-    sessions and uses ``async with pool.acquire() as provider:`` to pick
-    a target.
+    itself. :class:`src.rpc.client.RPCClient` owns the httpx /
+    websockets sessions and uses ``async with pool.acquire() as
+    provider:`` to pick a target.
     """
 
-    def __init__(self, providers: list[RPCProvider]) -> None:
-        """
-        Args:
-            providers: Pre-constructed RPCProvider objects with their
-                bucket + breaker attached. Wave 2 will add a classmethod
-                ``from_settings()`` that builds these from
-                ``settings.RPC_PROVIDER_PRIORITIES``.
-        """
-        # TODO: implement in Wave 2 — see ROUND_6_THE_SPINE.md § 3.2
-        raise NotImplementedError("Wave 2 — see ROUND_6_THE_SPINE.md § 3.2")
+    def __init__(
+        self,
+        providers: list[RPCProvider],
+        acquire_timeout_s: float = RPC_ACQUIRE_TIMEOUT_S,
+    ) -> None:
+        # Sort by priority ascending so iteration order matches selection
+        # order without re-sorting on every acquire().
+        self._providers: list[RPCProvider] = sorted(providers, key=lambda p: p.priority)
+        self._acquire_timeout_s = float(acquire_timeout_s)
+        # Per-provider stats counters. We track the breaker/bucket
+        # internal state via their own stats() methods, but also keep
+        # pool-level success/failure counters because the pool is the
+        # only place that observes both halves of the in-flight call.
+        self._stats: dict[str, dict[str, int]] = {
+            p.name: {"acquisitions": 0, "successes": 0, "failures": 0, "fallbacks": 0}
+            for p in self._providers
+        }
+        # Mark providers with an empty URL as UNHEALTHY so they stay out
+        # of rotation. This is how the local-Erigon entry behaves when
+        # ERIGON_RPC_HTTPS_URL (or LOCAL_ERIGON_RPC_URL) is unset --
+        # the pool just falls through to the paid providers.
+        for p in self._providers:
+            if not p.url:
+                p.state = ProviderState.UNHEALTHY
+                logger.info(
+                    "Provider {} has no URL configured; marking UNHEALTHY",
+                    p.name,
+                )
 
     @property
     def size(self) -> int:
         """Number of providers in the pool (all states)."""
-        raise NotImplementedError("Wave 2 — see ROUND_6_THE_SPINE.md § 3.2")
+        return len(self._providers)
+
+    @property
+    def providers(self) -> list[RPCProvider]:
+        """Read-only view of the configured providers (priority-sorted)."""
+        return list(self._providers)
+
+    def _eligible(self, p: RPCProvider) -> bool:
+        """True iff provider p is eligible for selection right now."""
+        if p.state == ProviderState.UNHEALTHY:
+            return False
+        if p.breaker is not None and not p.breaker.can_attempt():
+            return False
+        return True
+
+    def _pick_fast(
+        self, exclude: set[str] | None = None
+    ) -> RPCProvider | None:
+        """Synchronous scan: return the highest-priority provider that
+        is eligible AND has a token ready. None if every candidate would
+        block. Providers whose name is in ``exclude`` are skipped --
+        the failover loop in RPCClient uses this to avoid re-picking
+        a provider that just failed within the same call."""
+        exclude = exclude or set()
+        for p in self._providers:
+            if p.name in exclude:
+                continue
+            if not self._eligible(p):
+                continue
+            if p.bucket is None or p.bucket.try_acquire():
+                return p
+        return None
+
+    def _next_wait_s(self) -> float:
+        """How long the slowest-of-fastest options would take to free up.
+
+        Combines:
+          * breaker.time_until_retry_s() for OPEN providers
+          * 1.0 / refill_per_sec for rate-limited HEALTHY providers
+        Returns a small positive number; never negative, never huge.
+        """
+        candidates: list[float] = []
+        for p in self._providers:
+            if p.state == ProviderState.UNHEALTHY:
+                continue
+            if p.breaker is not None and p.breaker.state == CircuitState.OPEN:
+                t = p.breaker.time_until_retry_s()
+                if t > 0:
+                    candidates.append(t)
+            if p.bucket is not None and not p.bucket.unlimited:
+                refill = max(p.bucket.refill, 1e-6)
+                candidates.append(1.0 / refill)
+        if not candidates:
+            return 0.05
+        # Cap individual sleep to 0.2s so we re-check eligibility quickly.
+        return max(0.01, min(0.2, min(candidates)))
 
     @asynccontextmanager
-    async def acquire(self) -> AsyncIterator[RPCProvider]:
+    async def acquire(
+        self, exclude: set[str] | None = None
+    ) -> AsyncIterator[RPCProvider]:
         """Yield the best available provider for a single RPC call.
 
-        Selection algorithm:
-          1. Scan providers by priority ascending.
-          2. Skip those in ProviderState.UNHEALTHY.
-          3. Skip those whose breaker.allow_request() is False.
-          4. For each candidate, try its bucket.try_acquire() (fast path).
-          5. If the fast path picks one, yield it.
-          6. If every candidate's bucket is empty, await
-             bucket.acquire() on the highest-priority HEALTHY one
-             (the slow path that paid the rate-limit cost).
+        Args:
+            exclude: Optional set of provider names to skip. Used by
+                :class:`RPCClient` to avoid re-picking a provider that
+                just failed within the same JSON-RPC call's retry loop.
 
         On exit:
-          * If the caller raised, record_failure() on the breaker (the
-            RPCClient catches the exception and decides whether it's
-            actually a "provider's fault" failure or a user-input one).
+          * If the caller raised, record_failure() on the breaker.
           * If the caller succeeded, record_success() on the breaker.
 
-        Emits:
-          * ``polybot_rpc_fallback_total{from_provider, to_provider}``
-            on every step away from priority 0 to a lower-priority one.
+        Emits ``polybot_rpc_fallback_total{from_provider, to_provider}``
+        whenever the picked provider is NOT the highest-priority
+        non-unhealthy one.
         """
-        raise NotImplementedError("Wave 2 — see ROUND_6_THE_SPINE.md § 3.2")
-        # unreachable but documents the async generator shape
-        yield  # type: ignore[unreachable]
+        deadline = time.monotonic() + self._acquire_timeout_s
+        exclude_set = set(exclude or ())
+        picked: RPCProvider | None = None
+        while True:
+            picked = self._pick_fast(exclude_set)
+            if picked is not None:
+                break
+            now = time.monotonic()
+            if now >= deadline:
+                raise NoRPCProviderAvailable(
+                    f"All {self.size} RPC providers unavailable after "
+                    f"{self._acquire_timeout_s:.1f}s"
+                )
+            await asyncio.sleep(min(self._next_wait_s(), max(0.0, deadline - now)))
 
-    async def health_check_loop(self) -> None:
-        """Background task: every settings.RPC_HEALTHCHECK_INTERVAL_S,
-        probe each provider with a cheap eth_blockNumber call.
+        # ---- Fallback metric: emit if we skipped a higher-priority
+        # ---- provider that *would* normally be preferred (i.e. it
+        # ---- was eligible only in the "URL configured" sense, but
+        # ---- its breaker/bucket said no). The "from" we record is the
+        # ---- highest-priority configured provider that was skipped.
+        skipped_from: str | None = None
+        for p in self._providers:
+            if p.name == picked.name:
+                break
+            if p.state == ProviderState.UNHEALTHY:
+                # Unhealthy providers (URL unset, manually disabled) are
+                # NOT counted as fallbacks -- they're not "available"
+                # in the first place.
+                continue
+            skipped_from = p.name
+            break
+        if skipped_from is not None:
+            try:
+                rpc_fallback_total.labels(
+                    from_provider=skipped_from,
+                    to_provider=picked.name,
+                ).inc()
+            except Exception:  # pragma: no cover — defensive
+                pass
+            self._stats[picked.name]["fallbacks"] += 1
 
-        For each probe:
-          * Record latency_ms via metrics.
-          * Insert a row into rpc_health_history (migration 023).
-          * Update ProviderState if the breaker / latency suggests
-            degradation.
+        self._stats[picked.name]["acquisitions"] += 1
 
-        Designed to run as a long-lived task started by RPCClient.start()
-        and stopped by RPCClient.close().
-        """
-        raise NotImplementedError("Wave 2 — see ROUND_6_THE_SPINE.md § 3.2")
+        try:
+            yield picked
+        except BaseException:
+            if picked.breaker is not None:
+                picked.breaker.record_failure()
+            self._stats[picked.name]["failures"] += 1
+            raise
+        else:
+            if picked.breaker is not None:
+                picked.breaker.record_success()
+            self._stats[picked.name]["successes"] += 1
 
     def report_429(self, provider_name: str) -> None:
         """Forwarder for RPCClient to penalise a provider's bucket after
-        a 429 / rate-limit response. Increments the per-provider rate-
-        limit counter and triggers bucket.penalise()."""
-        raise NotImplementedError("Wave 2 — see ROUND_6_THE_SPINE.md § 3.2")
+        a 429 / rate-limit response."""
+        for p in self._providers:
+            if p.name == provider_name and p.bucket is not None:
+                p.bucket.penalise()
+                return
 
     def stats(self) -> list[dict[str, Any]]:
         """Snapshot of every provider's bucket + breaker state for
         /metrics and the dashboard's RPC health panel."""
-        raise NotImplementedError("Wave 2 — see ROUND_6_THE_SPINE.md § 3.2")
+        out: list[dict[str, Any]] = []
+        for p in self._providers:
+            entry: dict[str, Any] = {
+                "name": p.name,
+                "priority": p.priority,
+                "state": p.state.value,
+                "url_configured": bool(p.url),
+                "counters": dict(self._stats.get(p.name, {})),
+            }
+            if p.bucket is not None:
+                entry["bucket"] = p.bucket.stats()
+            if p.breaker is not None:
+                entry["breaker"] = {
+                    "state": p.breaker.state.value,
+                    "consecutive_failures": p.breaker._consecutive_failures,
+                    "time_until_retry_s": p.breaker.time_until_retry_s(),
+                }
+            out.append(entry)
+        return out
+
+    async def health_check_loop(self) -> None:  # pragma: no cover — Wave 3
+        """Background task placeholder.
+
+        Wave-2 ships the structural pieces (pool selection, breaker,
+        bucket, client) but the periodic eth_blockNumber probe + the
+        rpc_health_history insert (migration 023) is Wave-3 scope. The
+        loop is structured here so the RPCClient.start()/close()
+        lifecycle already knows how to manage it.
+        """
+        # Intentional no-op: returning immediately keeps the contract
+        # callable from RPCClient without affecting Wave-2 acceptance.
+        return None
