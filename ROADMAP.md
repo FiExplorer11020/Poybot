@@ -76,6 +76,8 @@ time ≈ engineering time).
 
 ## Round 7 — Mempool watcher + pre-signed order pool
 
+**Full spec: [`docs/ROUND_7_MEMPOOL_AND_PREFILL.md`](docs/ROUND_7_MEMPOOL_AND_PREFILL.md)**
+
 **The headline.** The only legitimate path to "BEFORE the leader." Watch
 Polygon mempool for known leader-wallet transactions, decode them, fire
 pre-signed orders to the CLOB.
@@ -139,6 +141,8 @@ pre-signed orders to the CLOB.
 ---
 
 ## Round 8 — Strategy classifier (the "why" layer)
+
+**Full spec: [`docs/ROUND_8_STRATEGY_CLASSIFIER.md`](docs/ROUND_8_STRATEGY_CLASSIFIER.md)**
 
 **Why this matters**: today the bot treats every leader the same. A
 swing trader behaves nothing like a market-maker, but our FOLLOW
@@ -204,6 +208,8 @@ leader a per-strategy posterior.
 
 ## Round 9 — Multivariate Hawkes + follower-pool dynamics
 
+**Full spec: [`docs/ROUND_9_MULTIVARIATE_HAWKES.md`](docs/ROUND_9_MULTIVARIATE_HAWKES.md)**
+
 **Round 5's BIC fix closed the false-positive bug**. Round 9 generalises
 the model from pairwise causality to **population-level** dynamics. This
 is what enables the volume-prediction edge in VISION § 1.
@@ -258,6 +264,8 @@ careful initialization and observation-model design.
 ---
 
 ## Round 10 — Causal inference layer
+
+**Full spec: [`docs/ROUND_10_CAUSAL_INFERENCE.md`](docs/ROUND_10_CAUSAL_INFERENCE.md)**
 
 **Why**: Hawkes catches statistical association. Statistical association
 isn't causation. When a news event hits, both the leader and the
@@ -317,6 +325,8 @@ this is the most research-heavy round.
 
 ## Round 11 — CLOB book-level-3 ingestion + microstructure features
 
+**Full spec: [`docs/ROUND_11_CLOB_BOOK_MICROSTRUCTURE.md`](docs/ROUND_11_CLOB_BOOK_MICROSTRUCTURE.md)**
+
 **Why**: today we aggregate book data per minute (Round 2 orderbook
 pipeline). Real microstructure — iceberg orders, order-placement
 velocity, cancel-to-fill ratios — lives at the per-event level. This is
@@ -361,6 +371,8 @@ leverage features.
 ---
 
 ## Round 12 — Social signal + cross-market index
+
+**Full spec: [`docs/ROUND_12_SOCIAL_AND_CROSS_MARKET.md`](docs/ROUND_12_SOCIAL_AND_CROSS_MARKET.md)**
 
 **Why**: many leaders telegraph entries on X/Twitter/Discord MINUTES
 before the trade. Pre-trade signal. Plus cross-market arb wallets
@@ -407,6 +419,8 @@ positions is alpha.
 ---
 
 ## Round 13 — Continuous calibration loop + research notebook
+
+**Full spec: [`docs/ROUND_13_CALIBRATION_AND_RESEARCH.md`](docs/ROUND_13_CALIBRATION_AND_RESEARCH.md)**
 
 **Why**: a bot that doesn't know when it's wrong silently dies. The
 audit's Phase 0 work added the prerequisites (decision logging, outcome
