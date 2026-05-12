@@ -224,12 +224,20 @@ class CLOBBookObserver:
         """Push onto BOTH the DB queue and the stream queue. The
         :class:`collections.deque` with bounded ``maxlen`` gives us
         constant-time oldest-drop semantics for free — the spec contract.
+
+        The drop counter is **event-level** not sink-level: one increment
+        per incoming event that caused at least one sink to evict its
+        oldest entry. The spec § 6 acceptance gate
+        ``polybot_book_events_dropped_total{reason="queue_full"} = 0``
+        is defined per ingest event, not per sink overflow.
         """
+        any_dropped = False
         for q in (self._db_queue, self._stream_queue):
-            dropped = self._push_with_oldest_drop(q, event)
-            if dropped:
-                self.events_dropped_queue_full += 1
-                book_events_dropped_total.labels(reason="queue_full").inc()
+            if self._push_with_oldest_drop(q, event):
+                any_dropped = True
+        if any_dropped:
+            self.events_dropped_queue_full += 1
+            book_events_dropped_total.labels(reason="queue_full").inc()
         try:
             book_queue_depth.set(len(self._db_queue))
         except Exception:  # pragma: no cover
