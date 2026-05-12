@@ -3,17 +3,18 @@
 This directory holds the systemd unit files for the Round 6 split-daemon
 topology (see `docs/ROUND_6_THE_SPINE.md` § 3.5).
 
-| Unit                                   | Module                          | Memory budget |
-|----------------------------------------|---------------------------------|---------------|
-| `polymarket-engine.service`            | `src.engine.main`               | 800 MB        |
-| `polymarket-observer.service`          | `src.observer.main`             | 400 MB        |
-| `polymarket-onchain.service`           | `src.onchain.main` *(Wave 2)*   | 400 MB        |
-| `polymarket-crawler.service`           | `src.crawler.main` *(Wave 2)*   | 200 MB        |
-| `polymarket-falcon-refresher.service`  | `src.registry.refresher_main` *(Wave 2)* | 200 MB |
-| `polymarket-mempool.service`           | `src.mempool` *(Round 7)*       | 300 MB        |
-| `polymarket-api.service`               | `src.api.main` (uvicorn)        | 300 MB        |
+| Unit                                       | Module                          | Memory budget |
+|--------------------------------------------|---------------------------------|---------------|
+| `polymarket-engine.service`                | `src.engine.main`               | 800 MB        |
+| `polymarket-observer.service`              | `src.observer.main`             | 400 MB        |
+| `polymarket-onchain.service`               | `src.onchain.main` *(Wave 2)*   | 400 MB        |
+| `polymarket-crawler.service`               | `src.crawler.main` *(Wave 2)*   | 200 MB        |
+| `polymarket-falcon-refresher.service`      | `src.registry.refresher_main` *(Wave 2)* | 200 MB |
+| `polymarket-mempool.service`               | `src.mempool` *(Round 7)*       | 300 MB        |
+| `polymarket-strategy-classifier.service`   | `src.strategy_classifier` *(Round 8)* | 400 MB  |
+| `polymarket-api.service`                   | `src.api.main` (uvicorn)        | 300 MB        |
 
-Total budget: ~2.3 GB (CX23 has 4 GB; leaves headroom for Postgres + Redis).
+Total budget: ~2.7 GB (CX23 has 4 GB; leaves headroom for Postgres + Redis).
 
 ## Pre-flight
 

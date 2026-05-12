@@ -42,6 +42,15 @@ ALLOWED_KEYS: dict[str, str] = {
     "max_consecutive_losses": "Trip the warm-breaker after this many losses in a row.",
     "max_recent_losses_per_market": "Cap on losing trades on the same market in a 24h window.",
     "fade_size_ratio": "Multiplier applied to FADE positions vs FOLLOW (typically <1).",
+    # Round 8 (The Lens) — gate for the strategy-conditional confidence
+    # path. When False (default) the confidence engine is byte-identical
+    # to pre-Round-8 behavior. When True, STRATEGY_WEIGHTS multipliers
+    # (defined in src.strategy_classifier.model) modulate the Thompson
+    # output per leader's classified strategy class.
+    "strategy_conditional_confidence_enabled": (
+        "Round 8 gate: apply per-strategy FOLLOW/FADE/SKIP weight multipliers "
+        "to the Thompson sample. Boolean, default False (shadow phase)."
+    ),
 }
 
 # Inclusive (min, max) bounds for each editable key. Writes outside the
@@ -57,7 +66,18 @@ BOUNDS: dict[str, tuple[float, float]] = {
     "max_consecutive_losses": (1, 50),
     "max_recent_losses_per_market": (1, 50),
     "fade_size_ratio": (0.1, 2.0),
+    # Boolean coerced through 0/1 numeric bounds — see set_overrides
+    # coercion block below where keys ending in '_enabled' use the
+    # boolean-coerce path. Stored as 0.0 / 1.0 in the JSON blob.
+    "strategy_conditional_confidence_enabled": (0.0, 1.0),
 }
+
+# Keys that store booleans (not floats). set_overrides coerces these
+# through Python's standard truthy/falsy semantics so {"...": True} and
+# {"...": "true"} and {"...": 1} all land as the same boolean override.
+BOOLEAN_KEYS: frozenset[str] = frozenset({
+    "strategy_conditional_confidence_enabled",
+})
 
 REDIS_KEY = "runtime_config:overrides"
 REDIS_PUBSUB_CHANNEL = "runtime_config:changed"
@@ -82,6 +102,8 @@ def _defaults_from_settings() -> dict[str, Any]:
         "max_consecutive_losses": int(getattr(settings, "MAX_CONSECUTIVE_LOSSES", 5)),
         "max_recent_losses_per_market": int(getattr(settings, "MAX_RECENT_LOSSES_PER_MARKET", 3)),
         "fade_size_ratio": float(getattr(settings, "FADE_SIZE_RATIO", 0.5)),
+        # Round 8 — default OFF until operator flips it after A/B passes.
+        "strategy_conditional_confidence_enabled": False,
     }
 
 
@@ -154,19 +176,31 @@ class RuntimeConfig:
                 rejected.append(f"{k}: not in ALLOWED_KEYS")
                 continue
             try:
+                # Coerce booleans (R8 strategy gate, future flags...).
+                if k in BOOLEAN_KEYS:
+                    if isinstance(v, bool):
+                        coerced: Any = bool(v)
+                    elif isinstance(v, (int, float)):
+                        coerced = bool(int(v))
+                    elif isinstance(v, str):
+                        coerced = v.strip().lower() in {"true", "1", "yes", "on"}
+                    else:
+                        raise TypeError(f"cannot coerce {v!r} to bool")
                 # Coerce ints and floats.
-                if k in {"max_concurrent_positions", "cooldown_seconds",
+                elif k in {"max_concurrent_positions", "cooldown_seconds",
                          "max_consecutive_losses", "max_recent_losses_per_market"}:
-                    coerced: Any = int(v)
+                    coerced = int(v)
                 else:
                     coerced = float(v)
             except (TypeError, ValueError):
                 rejected.append(f"{k}: not numeric ({v!r})")
                 continue
-            lo, hi = BOUNDS[k]
-            if coerced < lo or coerced > hi:
-                rejected.append(f"{k}: {coerced} outside [{lo}, {hi}]")
-                continue
+            # Boolean keys bypass bounds — they're already {0,1}.
+            if k not in BOOLEAN_KEYS:
+                lo, hi = BOUNDS[k]
+                if coerced < lo or coerced > hi:
+                    rejected.append(f"{k}: {coerced} outside [{lo}, {hi}]")
+                    continue
             clean[k] = coerced
         if not clean:
             raise ValueError("No valid edits. Rejected: " + "; ".join(rejected))

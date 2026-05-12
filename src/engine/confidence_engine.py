@@ -29,6 +29,10 @@ from src.profiler.behavior_profiler import (
     _infer_reason_codes,
     _reason_penalty_from_profile,
 )
+# Round 8 (The Lens) — strategy-conditional weights. Imported here so the
+# confidence engine module is the single point of integration; everything
+# else is gated by RuntimeConfig at runtime.
+from src.strategy_classifier.model import STRATEGY_WEIGHTS
 
 
 @dataclass
@@ -276,6 +280,24 @@ class ConfidenceEngine:
 
         thompson_follow, thompson_fade = self._sample_thompson(wallet)
 
+        # ── Round 8 (The Lens) — strategy-conditional weighting ────────
+        # Gated by runtime config flag. When disabled (default) we leave
+        # the Thompson outputs untouched, byte-identical to pre-R8.
+        strategy_weights = await self._maybe_get_strategy_weights(wallet)
+        if strategy_weights is not None:
+            thompson_follow *= float(strategy_weights.get("follow", 1.0))
+            thompson_fade *= float(strategy_weights.get("fade", 1.0))
+            # We can't clamp to [0, 1] because Thompson values can exceed 1
+            # after a >1 multiplier — downstream comparisons are pairwise
+            # so the absolute scale doesn't matter, but log it once for
+            # provenance.
+            trade_context["strategy_weights_applied"] = {
+                "follow": float(strategy_weights.get("follow", 1.0)),
+                "fade": float(strategy_weights.get("fade", 1.0)),
+                "skip": float(strategy_weights.get("skip", 1.0)),
+                "primary_strategy": strategy_weights.get("primary_strategy"),
+            }
+
         follow_reason_codes = (
             self._profiler.get_reason_codes(profile, "follow", trade_context)
             if self._profiler is not None
@@ -459,6 +481,82 @@ class ConfidenceEngine:
             economic_model_version=decision.economic_model_version,
         )
         return decision
+
+    async def _maybe_get_strategy_weights(
+        self,
+        wallet: str,
+    ) -> dict[str, Any] | None:
+        """Round 8 (The Lens) — return per-leader strategy weights or None.
+
+        Returns None (no-op path) when EITHER:
+          1. The runtime flag ``strategy_conditional_confidence_enabled``
+             is False (default — shadow phase).
+          2. The leader's ``classification_json -> strategy_fingerprint``
+             is missing or the classifier hasn't run yet.
+
+        When both are present, returns the
+        :data:`src.strategy_classifier.model.STRATEGY_WEIGHTS` row for
+        the leader's primary strategy, augmented with the strategy name
+        for audit logging.
+
+        This method is dependency-injected via RuntimeConfig — the test
+        suite can flip it without touching DB-backed state.
+        """
+        # Step 1: read the runtime flag. We MUST NOT cache the result
+        # locally — the operator can flip the flag at any time and we
+        # want the next decision to honor it.
+        try:
+            from src.control.runtime_config import get_runtime_config
+
+            cfg = get_runtime_config()
+            effective = await cfg.effective()
+            enabled = bool(
+                effective.get("strategy_conditional_confidence_enabled", False)
+            )
+        except Exception as exc:  # pragma: no cover — defensive
+            logger.debug(f"Strategy gate: runtime_config read failed: {exc}")
+            return None
+
+        if not enabled:
+            return None
+
+        # Step 2: read the leader's classification fingerprint. Defensive
+        # against missing rows, partial JSON, and unknown strategy
+        # classes (forward-compat with future taxonomy growth).
+        try:
+            async with get_db() as conn:
+                row = await conn.fetchrow(
+                    """
+                    SELECT classification_json
+                    FROM leaders
+                    WHERE wallet_address = $1
+                    """,
+                    wallet,
+                )
+        except Exception as exc:  # pragma: no cover
+            logger.debug(f"Strategy gate: DB read failed for {wallet}: {exc}")
+            return None
+
+        if not row:
+            return None
+        raw = row["classification_json"]
+        if isinstance(raw, str):
+            try:
+                raw = json.loads(raw)
+            except json.JSONDecodeError:
+                return None
+        if not isinstance(raw, dict):
+            return None
+        fingerprint = raw.get("strategy_fingerprint")
+        if not isinstance(fingerprint, dict):
+            return None
+        primary = fingerprint.get("primary_strategy")
+        if primary not in STRATEGY_WEIGHTS:
+            # Unknown class (forward-compat / older fingerprint). No-op.
+            return None
+        weights = dict(STRATEGY_WEIGHTS[primary])
+        weights["primary_strategy"] = primary
+        return weights
 
     def _sample_thompson(self, wallet: str) -> tuple[float, float]:
         """Sample one value from each Beta distribution for this wallet."""

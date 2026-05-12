@@ -792,6 +792,55 @@ class Settings(BaseSettings):
             )
         return v
 
+    # ───── Round 8 (The Lens) — strategy classifier ────────────────────
+    # See docs/ROUND_8_STRATEGY_CLASSIFIER.md §§ 3.5 + 7.D for the spec.
+    #
+    # STRATEGY_CLASSIFIER_REFRESH_INTERVAL_H: how often the daemon
+    # re-classifies tier-0/1 wallets. Spec § 3.5 fires daily; 24 h
+    # matches that and keeps the cost bounded (~2k wallets × 1 s/wallet
+    # = ~30 min wall time per pass, well within budget).
+    STRATEGY_CLASSIFIER_REFRESH_INTERVAL_H: int = 24
+    # STRATEGY_DRIFT_JS_THRESHOLD: Jensen-Shannon divergence at which we
+    # flag a wallet for strategy-shift. Spec § 3.5 default is 0.3 (so
+    # that a true class flip — directional → market_maker — fires
+    # reliably but minor noise in strategy_probs does not).
+    STRATEGY_DRIFT_JS_THRESHOLD: float = 0.3
+    # STRATEGY_DRIFT_MIN_BASELINE_SAMPLES: cold-start guard. The drift
+    # detector silently no-ops until the wallet has at least this many
+    # rows in leader_strategy_history. 5 samples ~= 5 days of daemon
+    # operation, enough to stabilise the baseline mean.
+    STRATEGY_DRIFT_MIN_BASELINE_SAMPLES: int = 5
+    # Where the trained classifier pickle lives on disk. The daemon
+    # falls back to a uniform-prior dummy when this path is missing.
+    STRATEGY_CLASSIFIER_MODEL_PATH: str = "models/strategy_classifier.pkl"
+    # Unsupervised explorer thresholds — see § 3.4. Clusters with size
+    # >= MIN AND mean-supervised-confidence <= MAX surface as candidate
+    # new classes.
+    STRATEGY_CLUSTER_MIN_SIZE: int = 20
+    STRATEGY_CLUSTER_MAX_SUPERVISED_CONFIDENCE: float = 0.5
+
+    @field_validator("STRATEGY_CLASSIFIER_REFRESH_INTERVAL_H")
+    @classmethod
+    def _validate_strategy_refresh_interval(cls, v: int) -> int:
+        # < 1 h is wasteful (no new data accumulates that fast). > 168 h
+        # (one week) means drift detection lags too much to be useful.
+        if not 1 <= v <= 168:
+            raise ValueError(
+                f"STRATEGY_CLASSIFIER_REFRESH_INTERVAL_H must be in [1, 168], got {v}."
+            )
+        return v
+
+    @field_validator("STRATEGY_DRIFT_JS_THRESHOLD")
+    @classmethod
+    def _validate_strategy_drift_threshold(cls, v: float) -> float:
+        # JS divergence is bounded in [0, 1] under log_2. Operator-tunable
+        # but values < 0.05 fire on noise; > 0.7 effectively disables drift.
+        if not 0.05 <= v <= 0.7:
+            raise ValueError(
+                f"STRATEGY_DRIFT_JS_THRESHOLD must be in [0.05, 0.7], got {v}."
+            )
+        return v
+
 
 settings = Settings()
 

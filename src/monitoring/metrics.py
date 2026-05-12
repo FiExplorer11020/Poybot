@@ -626,6 +626,118 @@ mempool_shadow_vs_live_pnl_diff_usdc = Gauge(
 )
 
 
+# === Round 8 (The Lens) — Strategy classifier ===
+# Owned by src.strategy_classifier.*. Every metric is defensively
+# declared inside its own try/except so a duplicate registration on
+# pytest hot-reload doesn't break the import chain. The block follows
+# the same shape as the R6/R7 metric blocks above. See
+# docs/ROUND_8_STRATEGY_CLASSIFIER.md § 5 for the canonical list.
+try:
+    classifier_predictions_total = Counter(
+        "polybot_classifier_predictions_total",
+        "Strategy-classifier outputs, partitioned by primary class and "
+        "trigger source (scheduled = daemon pass, on_demand = ad-hoc).",
+        ["strategy", "source"],
+    )
+except Exception:  # pragma: no cover — registry collisions
+    pass
+
+try:
+    classifier_confidence = Histogram(
+        "polybot_classifier_confidence",
+        "Primary-class confidence per classifier output (max of "
+        "strategy_probs).",
+        ["strategy"],
+        # Calibration goal: a 0.7 directional truly means 70%. Buckets
+        # tuned to surface miscalibration in the bottom and top deciles.
+        buckets=(0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 0.95, 0.99),
+    )
+except Exception:  # pragma: no cover
+    pass
+
+try:
+    classifier_loss = Gauge(
+        "polybot_classifier_loss",
+        "Training / validation / live cross-entropy loss for the "
+        "supervised classifier.",
+        ["set"],  # train|val|live
+    )
+except Exception:  # pragma: no cover
+    pass
+
+try:
+    classifier_calibration_loss = Gauge(
+        "polybot_classifier_calibration_loss",
+        "Per-class Brier score on the held-out validation set "
+        "(acceptance criterion: <= 0.15).",
+        ["strategy"],
+    )
+except Exception:  # pragma: no cover
+    pass
+
+try:
+    classifier_drift_score = Gauge(
+        "polybot_classifier_drift_score",
+        "JS divergence of today's classifier output vs the 30-day "
+        "rolling baseline, per watched wallet.",
+        ["wallet"],
+    )
+except Exception:  # pragma: no cover
+    pass
+
+try:
+    strategy_drift_detected_total = Counter(
+        "polybot_strategy_drift_detected_total",
+        "Per-wallet drift transitions (from -> to primary class). "
+        "Fires once per pass where JS divergence > threshold.",
+        ["from", "to"],
+    )
+except Exception:  # pragma: no cover
+    pass
+
+try:
+    strategy_label_set_size = Gauge(
+        "polybot_strategy_label_set_size",
+        "Number of latest-per-(wallet,window) labels in strategy_labels, "
+        "by primary class. Watches the labelling sprint's progress.",
+        ["strategy"],
+    )
+except Exception:  # pragma: no cover
+    pass
+
+try:
+    unsupervised_clusters_unmatched = Gauge(
+        "polybot_unsupervised_clusters_unmatched",
+        "Count of K-means clusters that exceed the size threshold AND "
+        "the supervised model's mean confidence is below the threshold "
+        "(candidate new strategy classes).",
+    )
+except Exception:  # pragma: no cover
+    pass
+
+try:
+    classifier_inference_seconds = Histogram(
+        "polybot_classifier_inference_seconds",
+        "Wall time per classifier inference (single wallet).",
+        # Inference is a single LightGBM forward + isotonic — sub-ms in
+        # practice; histogram buckets are deliberately tight.
+        buckets=(0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25),
+    )
+except Exception:  # pragma: no cover
+    pass
+
+try:
+    classifier_feature_extraction_seconds = Histogram(
+        "polybot_classifier_feature_extraction_seconds",
+        "Wall time to compute the 42-feature vector for one wallet via "
+        "DuckDB / feature_store as-of reads (R8 acceptance gate: < 1s "
+        "per wallet, spec § 7.B).",
+        buckets=(0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0),
+    )
+except Exception:  # pragma: no cover
+    pass
+
+
 # ---------------------------------------------------------------------------
 # Build info — best-effort. Surfaces version + git short-SHA on /metrics so a
 # scrape can correlate metrics with a deploy. Failure here must NEVER break

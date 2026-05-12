@@ -1,0 +1,28 @@
+[Unit]
+Description=Polymarket Bot — Strategy Classifier daemon (Round 8 / The Lens)
+Documentation=https://github.com/your-org/polymarket-bot/blob/main/docs/ROUND_8_STRATEGY_CLASSIFIER.md
+After=network-online.target redis-server.service polymarket-engine.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=polymarket
+Group=polymarket
+WorkingDirectory=/opt/polymarket-bot/
+EnvironmentFile=/opt/polymarket-bot/.env
+ExecStart=/opt/polymarket-bot/.venv/bin/python -m src.strategy_classifier
+Restart=always
+RestartSec=5s
+
+# Per Round 8 — memory budget. The 42-feature vector × ~2000 tier-0/1
+# wallets stays well under 400 MB. LightGBM holds a ~10 MB model.
+MemoryMax=400M
+
+StandardOutput=journal
+StandardError=journal
+
+# Logging tag for journalctl filtering.
+SyslogIdentifier=polymarket-strategy-classifier
+
+[Install]
+WantedBy=multi-user.target
