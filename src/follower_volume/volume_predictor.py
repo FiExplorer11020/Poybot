@@ -224,7 +224,12 @@ class FollowerVolumePredictor:
         # Compute per-pool forecasts.
         by_pool: dict[str, float] = {}
         cis: list[tuple[float, float]] = []
-        half_life_for_dist: float = 1800.0
+        # Wave-3 fix: pick the DOMINANT-pool half-life (highest weighted
+        # contribution) for the time distribution, rather than seed with
+        # a default and ratchet UP via max() (which silently masks fast-
+        # decay pools).
+        dominant_half_life: float = 0.0
+        dominant_contribution: float = -1.0
         confidence_terms: list[float] = []
 
         # Hawkes modulation: if a fit is provided, multiply each pool's
@@ -274,13 +279,24 @@ class FollowerVolumePredictor:
                 conf = 0.0
             confidence_terms.append(max(0.0, min(1.0, conf)))
 
-            # Use the dominant-pool half-life for the time distribution.
-            if weights[pool] > 0.0:
-                half_life_for_dist = max(half_life_for_dist, fc.half_life_s)
+            # Use the dominant-pool half-life for the time distribution —
+            # the pool with the largest weighted volume contribution
+            # drives the CDF shape (an info_leak pool with a 30-s
+            # half-life should not be masked by a directional pool's
+            # 1-h half-life if the leader excites info_leak much more
+            # strongly).
+            contribution = float(weights[pool]) * float(by_pool[pool])
+            if contribution > dominant_contribution and weights[pool] > 0.0:
+                dominant_contribution = contribution
+                dominant_half_life = float(fc.half_life_s)
 
         total = float(sum(by_pool.values()))
         ci_low = float(sum(c[0] for c in cis))
         ci_high = float(sum(c[1] for c in cis))
+        # Fallback: if no pool fired, default to a flat 30-min kernel.
+        half_life_for_dist = (
+            dominant_half_life if dominant_half_life > 0.0 else 1800.0
+        )
         time_dist = _time_distribution(half_life_for_dist)
         confidence = float(np.mean(confidence_terms)) if confidence_terms else 0.0
 

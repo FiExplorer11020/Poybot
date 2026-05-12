@@ -226,7 +226,12 @@ class FollowerPoolKalman:
         K = (P_pred @ H) / S  # shape (3,)
         x_post = x_pred + K * innovation
         I3 = np.eye(3)
-        P_post = (I3 - np.outer(K, H)) @ P_pred
+        # Joseph form covariance update (wave-3 hardening): numerically
+        # stable — preserves symmetry + positive-definiteness even when
+        # (I - K H) departs from the textbook form due to float drift.
+        #     P = (I - K H) P⁻ (I - K H)ᵀ + K R Kᵀ
+        IKH = I3 - np.outer(K, H)
+        P_post = IKH @ P_pred @ IKH.T + np.outer(K, K) * self.R
 
         # Physical-bound clamps.
         x_post[0] = max(x_post[0], 0.0)
