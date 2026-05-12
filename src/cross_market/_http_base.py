@@ -16,7 +16,6 @@ from typing import Any
 
 from loguru import logger
 
-
 # Defensive metric imports.
 try:
     from src.monitoring.metrics import (  # type: ignore[attr-defined]

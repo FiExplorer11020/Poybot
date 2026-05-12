@@ -28,7 +28,6 @@ from src.cross_market.manifold_client import ManifoldClient
 from src.cross_market.predictit_client import PredictItClient
 from src.database.connection import get_db
 
-
 # Defensive metric imports.
 try:
     from src.monitoring.metrics import (  # type: ignore[attr-defined]

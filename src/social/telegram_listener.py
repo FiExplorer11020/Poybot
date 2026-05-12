@@ -14,8 +14,6 @@ Why no DMs / private groups: spec § 9 — ethical + legal floor.
 """
 from __future__ import annotations
 
-import asyncio
-import json
 from datetime import datetime, timezone
 from typing import Any
 
@@ -23,7 +21,6 @@ from loguru import logger
 
 from src.config import settings
 from src.social.x_firehose import SocialPost
-
 
 # Defensive metric imports.
 try:
@@ -109,7 +106,7 @@ class TelegramPublicChannelListener:
             return None
         if not self._token:
             return None
-        Application, MessageHandler, filters = ptb
+        Application, MessageHandler, filters = ptb  # noqa: N806 — class names from python-telegram-bot
         try:
             app = Application.builder().token(self._token).build()
             handler = MessageHandler(filters.ALL, self._on_message)

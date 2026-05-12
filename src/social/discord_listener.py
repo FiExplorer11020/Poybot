@@ -24,7 +24,6 @@ from loguru import logger
 from src.config import settings
 from src.social.x_firehose import SocialPost
 
-
 # Defensive metric imports.
 try:
     from src.monitoring.metrics import (  # type: ignore[attr-defined]

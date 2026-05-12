@@ -23,7 +23,6 @@ from __future__ import annotations
 import asyncio
 import json
 import signal
-from datetime import datetime, timezone
 from typing import Any
 
 import redis.asyncio as redis_async
@@ -44,7 +43,6 @@ from src.social.x_firehose import (
     XFirehoseSubscriber,
     decode_stream_fields,
 )
-
 
 # Defensive metric imports.
 try:

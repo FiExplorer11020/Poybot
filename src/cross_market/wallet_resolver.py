@@ -34,7 +34,6 @@ from loguru import logger
 from src.config import settings
 from src.database.connection import get_db
 
-
 # Defensive metric imports.
 try:
     from src.monitoring.metrics import (  # type: ignore[attr-defined]

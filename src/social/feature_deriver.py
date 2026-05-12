@@ -25,7 +25,7 @@ from __future__ import annotations
 import statistics
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import Any, Iterable
+from typing import Any
 
 
 @dataclass(frozen=True)

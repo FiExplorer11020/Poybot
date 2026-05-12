@@ -33,7 +33,6 @@ from typing import Any, Protocol
 
 from loguru import logger
 
-
 # Defensive metric imports (same pattern as src/profiler/feature_store.py).
 try:
     from src.monitoring.metrics import (  # type: ignore[attr-defined]

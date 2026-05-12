@@ -56,7 +56,7 @@ class ManifoldClient(VenueClient):
         ``amount`` (mana — we convert in the aggregator if needed),
         ``createdTime``, ``isFilled``, ``isCancelled``.
         """
-        resp = await self._get(f"/bets", params={"username": handle, "limit": 100})
+        resp = await self._get("/bets", params={"username": handle, "limit": 100})
         if resp.status != 200:
             return []
         data = resp.json_payload

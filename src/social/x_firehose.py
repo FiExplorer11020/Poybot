@@ -39,7 +39,6 @@ from loguru import logger
 
 from src.config import settings
 
-
 # Defensive metric imports.
 try:
     from src.monitoring.metrics import (  # type: ignore[attr-defined]
@@ -284,6 +283,37 @@ class XFirehoseSubscriber(_BaseXSubscriber):
         )
         return {"add": rules}
 
+    def _compute_429_pause(self, headers: Any) -> float:
+        """Pick a pause length on 429 by consulting Retry-After /
+        x-rate-limit-reset, clamped to [self._rate_limit_pause_s, 900s].
+
+        Per X v2 docs the streaming endpoint signals reset via the
+        ``x-rate-limit-reset`` epoch-seconds header; older clients also
+        emit a numeric ``retry-after`` (seconds). Either is accepted.
+        """
+        floor = float(self._rate_limit_pause_s)
+        ceil = 900.0  # 15-min hard cap so a malformed header can't park us forever
+        try:
+            ra = headers.get("retry-after") if hasattr(headers, "get") else None
+            if ra is not None:
+                v = float(ra)
+                if v > 0:
+                    return max(floor, min(ceil, v))
+        except (TypeError, ValueError):
+            pass
+        try:
+            reset = (
+                headers.get("x-rate-limit-reset")
+                if hasattr(headers, "get") else None
+            )
+            if reset is not None:
+                wait = float(reset) - time.time()
+                if wait > 0:
+                    return max(floor, min(ceil, wait))
+        except (TypeError, ValueError):
+            pass
+        return floor
+
     async def sync_rules(self) -> bool:
         """POST the filter rules to X. Returns True on success.
 
@@ -347,11 +377,15 @@ class XFirehoseSubscriber(_BaseXSubscriber):
                     except Exception:  # pragma: no cover
                         pass
                 if resp.status == 429:
+                    # Honour Retry-After / x-rate-limit-reset if present;
+                    # clamp to [floor, 15 min] so a malformed header can't
+                    # park the daemon forever.
+                    pause_s = self._compute_429_pause(resp.headers)
                     logger.warning(
                         "XFirehoseSubscriber: 429 Too Many Requests — "
-                        f"pausing {self._rate_limit_pause_s}s"
+                        f"pausing {pause_s:.1f}s"
                     )
-                    await asyncio.sleep(self._rate_limit_pause_s)
+                    await asyncio.sleep(pause_s)
                     return
                 if resp.status >= 400:
                     body = await resp.text()

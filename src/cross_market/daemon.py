@@ -27,7 +27,6 @@ from src.cross_market.wallet_resolver import WalletResolver
 from src.database.connection import close_pool, initialize_pool
 from src.logging_setup import configure_logging
 
-
 # Defensive metric imports.
 try:
     from src.monitoring.metrics import (  # type: ignore[attr-defined]
