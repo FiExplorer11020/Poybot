@@ -28,7 +28,14 @@
 
 BEGIN;
 
+-- IMPORTANT: PostgreSQL implicitly NOT-NULLs every PRIMARY KEY column. We
+-- store ``strategy_class = NULL`` for the aggregate-across-classes row, so
+-- we cannot use the natural triple as the primary key. Surrogate
+-- ``history_id`` keeps the PK; the natural key is enforced via a UNIQUE
+-- INDEX with PG-15+ ``NULLS NOT DISTINCT`` so NULL strategy_class collides
+-- with NULL on idempotent ON CONFLICT writes.
 CREATE TABLE IF NOT EXISTS calibration_loss_history (
+    history_id      BIGSERIAL PRIMARY KEY,
     model           VARCHAR(40) NOT NULL,
     strategy_class  VARCHAR(20),  -- NULL = aggregate across classes
     measured_at     DATE NOT NULL,
@@ -36,9 +43,12 @@ CREATE TABLE IF NOT EXISTS calibration_loss_history (
     brier_score     NUMERIC(8, 6),
     log_loss        NUMERIC(8, 6),
     mape            NUMERIC(8, 6),
-    ci_coverage     NUMERIC(5, 4),
-    PRIMARY KEY (model, strategy_class, measured_at)
+    ci_coverage     NUMERIC(5, 4)
 );
+
+CREATE UNIQUE INDEX IF NOT EXISTS uq_clh_natural_key
+    ON calibration_loss_history (model, strategy_class, measured_at)
+    NULLS NOT DISTINCT;
 
 -- The drift detector's rolling 30-day window joins on measured_at DESC
 -- per (model, strategy_class) — keep that path indexed.

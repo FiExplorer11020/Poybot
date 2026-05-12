@@ -145,7 +145,11 @@ def compute_causal_residual(
     """
     if ci_widths is None:
         ci_widths = [1.0] * len(hawkes_alpha_mus)
-    if len(hawkes_alpha_mus) != len(causal_ates) != len(ci_widths):
+    # Explicit pairwise length check — the natural chained comparison
+    # ``len(a) != len(b) != len(c)`` parses as ``(a != b) and (b != c)``
+    # and silently accepts ``len(a) != len(b), len(b) == len(c)``.
+    n = len(hawkes_alpha_mus)
+    if len(causal_ates) != n or len(ci_widths) != n:
         return None
     residuals: list[float] = []
     for h, c, w in zip(hawkes_alpha_mus, causal_ates, ci_widths):

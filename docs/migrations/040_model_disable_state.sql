@@ -48,18 +48,23 @@ COMMENT ON TABLE model_disable_state IS
 -- strategy_class); NULL strategy_class encodes the aggregate row.
 -- ----------------------------------------------------------------------------
 
+-- IMPORTANT: PostgreSQL implicitly NOT-NULLs PK columns. NULL strategy_class
+-- encodes the aggregate row, so we cannot put (model, strategy_class) in
+-- the PK. Surrogate ``streak_id`` keeps the PK; the natural pair is enforced
+-- via PG-15+ ``UNIQUE ... NULLS NOT DISTINCT`` so ON CONFLICT (model,
+-- strategy_class) collides on NULL.
 CREATE TABLE IF NOT EXISTS model_drift_streak (
+    streak_id          BIGSERIAL PRIMARY KEY,
     model              VARCHAR(40) NOT NULL,
     strategy_class     VARCHAR(20),
     consecutive_days   INTEGER NOT NULL DEFAULT 0,
-    last_breach_at     DATE,
-    PRIMARY KEY (model, strategy_class)
+    last_breach_at     DATE
 );
 
--- NULL-tolerant uniqueness: PostgreSQL treats NULL != NULL by default in
--- PRIMARY KEY, but the (model, strategy_class) composite PK above with
--- strategy_class nullable is fine — only one NULL row per model exists in
--- practice because of the application-level enforcement.
+CREATE UNIQUE INDEX IF NOT EXISTS uq_mds_streak_key
+    ON model_drift_streak (model, strategy_class)
+    NULLS NOT DISTINCT;
+
 CREATE INDEX IF NOT EXISTS idx_mds_streak_recent
     ON model_drift_streak (last_breach_at DESC)
     WHERE consecutive_days > 0;
