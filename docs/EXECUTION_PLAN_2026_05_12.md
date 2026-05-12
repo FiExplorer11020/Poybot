@@ -675,5 +675,129 @@ Activation des nouveaux services : **toujours `--no-deps`** pour éviter cascade
 
 ---
 
+## 16. Sprint 3 completed (2026-05-12, Phase A — R11 rollup-only + R12 services)
+
+> **Statut** : Phase A déployée et roule en prod. 4 nouveaux containers
+> healthy (`book_l3`, `microstructure`, `social`, `crossmarket`) sous le
+> profile compose `sprint3`. Total : **18 containers actifs** (cible § 11
+> finale était 18, atteinte). R7 mempool re-aim DÉFÉRÉ à Sprint 3.5
+> (décision archi pendante). R11 a un gap decoder pré-existant qui
+> empêche le flux complet d'événements WS — services UP mais
+> `microstructure_features` ne se peuple pas pour l'instant (sprint 3.5).
+> Commit : `7a57e10` ("feat(sprint-3): R11 rollup-only + R12 ...").
+
+### Ce qui a été fait
+
+| Tâche § 6 Day 5-6 | Livrable | Détail |
+|---|---|---|
+| **R11 rollup-only** | `CLOB_BOOK_PERSIST_RAW: bool = False` ajouté dans `src/config.py`. `clob_book_observer.py` gate `_db_writer_loop` start + skip de l'enqueue vers `_db_queue` quand le flag est False. Stream Redis `book:events:stream` toujours alimenté ⇒ le deriver microstructure consomme inchangé. Économie disque : ~13 GB/jour évités sur la table `clob_book_events`. | `src/config.py`, `src/observer/clob_book_observer.py` (start() + _enqueue()). |
+| **R11 services compose** | 2 services ajoutés sous `profiles:["sprint3"]` : `book_l3` (firehose, `python -m src.observer.clob_book_main`) + `microstructure` (deriver, `python -m src.microstructure`). Healthcheck standard (`/app/scripts/docker_healthcheck.py`). | `docker-compose.yml` (lignes 239-280). |
+| **R12 social stub** | Service `social` ajouté (`python -m src.social`) avec `X_API_KEY=""` hardcodé dans l'env. Daemon UP, exposer health, ingère 0 tweet (mode dormant conforme spec § 12 hors-scope). | `docker-compose.yml` (lignes 281-300). |
+| **R12 cross-market** | Service `crossmarket` ajouté (`python -m src.cross_market`) avec `KALSHI_API_KEY=""` hardcodé. Daemon poll Manifold + PredictIt selon cycles internes. Skip gracieux Kalshi + X. | `docker-compose.yml` (lignes 301-318). |
+| **R7 mempool** | **DÉFÉRÉ à Sprint 3.5**. Compose entry documenté (commenté) mais service NON défini. Raison : `src/mempool/node_client.py` actuel cible `eth_subscribe` sur Erigon (qu'on n'a pas sur Hetzner), et le re-aim vers Polymarket WS demande une décision archi qui n'est pas encore prise (direct WS connection vs proxy via `trades:observed` pub/sub). Le service de loop sur Erigon-unreachable ferait du bruit pour rien. | `docker-compose.yml` (commentaire R7 ligne 319). |
+
+### Activation prod (séquence exacte)
+
+```bash
+# 1. rsync sources (5 fichiers, ~46 KB delta)
+rsync -avz --delete --exclude '.git/' --exclude '__pycache__/' ... \
+  ./ polymarket@89.167.23.215:/opt/polymarket-bot/
+
+# 2. rebuild image (152 s — invalidation layer `COPY src/`)
+ssh hetzner-polymarket
+cd /opt/polymarket-bot
+docker compose -f docker-compose.yml -f docker-compose.prod.yml build engine
+
+# 3. up les 4 sprint3 daemons SANS recreate des baseline (--no-deps !)
+docker compose -f docker-compose.yml -f docker-compose.prod.yml \
+  --profile sprint3 up -d --no-deps book_l3 microstructure social crossmarket
+```
+
+Le `--no-deps` est mandatoire (leçon Sprint 2 § 14 déviation #4) : sans
+ça, Docker recrée la cascade `postgres + redis` à chaque activation de
+profile, ce qui kill tous les subscribers engine/observer.
+
+### Tests locaux
+
+```
+pytest -q --timeout=60 --ignore=tests/test_docker.py --ignore=tests/integration
+→ 1799 passed, 2 skipped, 2 xfailed (89.44s)
+```
+
+**8 tests adaptés** : `test_clob_book_observer.py` (3 tests) +
+`test_clob_book_observer_hardening.py` (5 tests). Ils assertent
+la topologie legacy à 2 sinks (`_db_queue` + `_stream_queue`) ; ajout
+de `monkeypatch.setattr(settings, "CLOB_BOOK_PERSIST_RAW", True)` pour
+réactiver le DB-queue path. Production reste `False` ; le stream-queue
+path applique la même semantique deque (maxlen, oldest-drop).
+
+### État actuel mesuré (2026-05-12 22:57 UTC, POST Sprint 3 Phase A)
+
+| Ressource | Valeur | Vs § 15 Sprint 2.5 |
+|---|---|---|
+| Containers running | **18 / 18 healthy** (14 baseline + 4 sprint3) | +4 |
+| RAM serveur | 1,073 MB / 3,815 MB (28%) | -1 pt |
+| Disk avant prune | 29 GB / 38 GB (81%) | +16 pt (rebuilds Sprint 2.5 + Sprint 3 = 18 GB build cache) |
+| **Disk après `docker builder prune --all -f`** | **12 GB / 38 GB (34%)** | gain net : -31 pts |
+| Swap | 0 / 2,048 MB utilisé | dispo |
+| Image polymarket-bot:latest | rebuilt 2026-05-12 22:50 UTC (Sprint 3) | nouvelle |
+| `microstructure_features` | 0 rows | sprint3.5 (gap decoder, voir ci-dessous) |
+| `clob_book_events` 24h | 0 rows (intentionnel, rollup-only) | ✅ |
+| `cross_market_positions` | 0 rows | attendre 1ère poll Manifold (hourly cycle) |
+| `social_signals` | 0 rows | X_API_KEY="" — comportement stub attendu |
+| Redis stream `book:events:stream` | 0 entries | gap decoder R11 (voir #1 ci-dessous) |
+| Redis DBSIZE | 39,514 keys | identique |
+
+### Gaps identifiés (à adresser en Sprint 3.5)
+
+**1. R11 decoder gap** — Polymarket WS Market channel envoie des
+événements `book` / `price_change` / `last_trade_price`, PAS
+`order_placed` / `order_cancelled` / `order_filled` comme le suppose
+`src/observer/clob_book_decoder.py`. Conséquence : `decode_ws_message`
+retourne `None` pour 100% des messages WS réels en prod. Le book_l3
+reçoit ~500 msgs/sec (vérifié), aucun n'arrive jusqu'au stream Redis.
+Fix : enrichir le decoder pour mapper :
+
+- `price_change` (delta event sur le book) → BookEvent `placed` ou `cancelled` selon le sign du size delta
+- `last_trade_price` → BookEvent `filled`
+- `book` (full snapshot) → ignorer ou recalculer le delta vs précédent snapshot
+
+Ce gap est ANTÉRIEUR à Sprint 3 — il existe depuis l'implémentation
+R11 initiale. Sprint 3 a câblé l'infrastructure ; Sprint 3.5 fera le
+fix decoder.
+
+**2. R7 WS re-aim** — DÉFÉRÉ. Décision archi à prendre :
+- (a) Direct Polymarket WS subscription dans le mempool daemon (nouveau client WS, indépendant)
+- (b) Proxy via `trades:observed` Redis pub/sub (le mempool daemon devient consumer du pubsub de l'observer existant)
+
+Option (b) est plus simple (réutilise l'infra existante, pas de 2e
+connection WS à maintenir). Option (a) est plus "front-door" pure
+(catch les `order_placed` AVANT qu'ils soient `filled`). Spec § 6
+Day 6 dit "subscribe à Polymarket WS event 'order_placed'" → suggère
+(a) mais (b) marche aussi avec un trade leader comme proxy d'"order
+intent". À pinner avant de coder.
+
+**3. crossmarket data flow** — daemon UP healthy mais
+`cross_market_positions` toujours à 0 après 7 min. Cycle de poll
+Manifold/PredictIt est lent (per spec § 4.1 : hourly). Re-checker
+demain matin pour vérifier que la 1ère poll a tourné.
+
+### Déviations vs plan initial
+
+1. **R7 mempool DÉFÉRÉ** — pas dans le périmètre Phase A. Justification : la décision archi (direct WS vs proxy pub/sub) demande input ; mieux vaut shipper R11+R12 propre que R7 bâclé.
+
+2. **R11 decoder gap découvert pendant la vérif** — l'infra Sprint 3 est posée correctement, mais le pipeline complet d'événements ne fonctionne pas tant que le decoder R11 ne mappe pas les vrais formats WS Polymarket. Ce n'est pas une régression Sprint 3 — c'est une dette R11 pré-existante.
+
+3. **Disk a explosé à 81%** — les rebuilds successifs Sprint 2.5 + Sprint 3 ont laissé 18 GB de build cache orphan. `docker builder prune --all -f` a récupéré 18.33 GB, retour à 34%. À refaire après chaque session de déploiement (à automatiser en post-deploy hook éventuellement).
+
+### Prochain sprint : Sprint 3.5 — Decoder gap + R7 re-aim
+
+**Périmètre** :
+1. **R11 decoder fix** : enrichir `src/observer/clob_book_decoder.py` pour reconnaître `price_change` / `last_trade_price` / `book` events. Tester contre des messages réels capturés depuis prod (`docker exec polymarket_book_l3 redis-cli MONITOR` pour exemple). Cible : `book:events:stream` > 100 entries/sec en prod.
+2. **R7 mempool re-aim** : prendre une décision (a) vs (b), implémenter, ajouter compose service `mempool` sous `profiles:["sprint3"]`. `PREFILL_LIVE_ENABLED=false` strict.
+3. Vérifier `microstructure_features` + `cross_market_positions` > 0 après 24h.
+
+---
+
 **FIN. Ce doc est le single source of truth pour cet effort. Le mettre
 à jour à chaque fin de sprint dans `## N. Sprint X completed` section.**
