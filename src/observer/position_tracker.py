@@ -430,6 +430,27 @@ class PositionTracker:
             logger.error(f"Failed to insert closed position: {e}")
             return
 
+        # R13 — calibration outcome hook (audit § 9.A).
+        # Fire-and-forget: looks up the most recent decision_log row for
+        # (wallet, market) before open_time and back-fills the matching
+        # decision_predictions row with the realised pnl + followup volume.
+        # Wrapped in its own try/except so a R13 failure can never affect
+        # position close semantics.
+        try:
+            from src.calibration import fill_actual_outcomes_for_position
+            await fill_actual_outcomes_for_position(
+                wallet_address=pos.wallet_address,
+                market_id=pos.market_id,
+                open_time=pos.open_time,
+                pnl_usdc=float(pnl_usdc),
+                followup_volume_usdc=None,  # not tracked at close time; nightly batch fills
+                closed_at=close_time,
+            )
+        except Exception as r13_exc:
+            logger.debug(
+                f"R13 outcome fill skipped for {pos.wallet_address[:10]}/{pos.market_id}: {r13_exc}"
+            )
+
         # Outside the tx: if any slots remain for this (wallet, market,
         # token, direction) the state-row needs to come back. _close_position
         # is invoked with a slot in hand BEFORE the caller mutates the list,

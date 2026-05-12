@@ -496,6 +496,7 @@ class ConfidenceEngine:
             signal_audit=decision.signal_audit,
             strategy_track=decision.strategy_track,
             economic_model_version=decision.economic_model_version,
+            decision=decision,
         )
         return decision
 
@@ -1138,17 +1139,20 @@ class ConfidenceEngine:
         signal_audit: dict | None = None,
         strategy_track: str | None = None,
         economic_model_version: str | None = None,
+        decision: Any | None = None,
     ) -> None:
         audit_payload = signal_audit or {}
+        decision_id: int | None = None
         try:
             async with get_db() as conn:
-                await conn.execute(
+                decision_id = await conn.fetchval(
                     """
                     INSERT INTO decision_log
                         (leader_wallet, market_id, action, thompson_follow, thompson_fade,
                          kelly_fraction, confidence, reason, strategy_track,
                          economic_model_version, signal_audit)
                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11::jsonb)
+                    RETURNING id
                     """,
                     wallet,
                     market_id,
@@ -1162,16 +1166,38 @@ class ConfidenceEngine:
                     economic_model_version or ECONOMIC_MODEL_VERSION,
                     json.dumps(audit_payload),
                 )
+                # R13 — same-transaction prediction snapshot. Spec § 3.1 +
+                # audit § 9.A: every decision_log row gets a sister
+                # decision_predictions row so the nightly calibration
+                # batch can score each model's at-decision-time output.
+                # Failures here MUST NOT break the decision write — wrapped
+                # in its own try/except.
+                if decision_id is not None and decision is not None:
+                    try:
+                        from src.calibration import (
+                            DecisionPrediction,
+                            record_decision_predictions,
+                        )
+                        await record_decision_predictions(
+                            conn,
+                            int(decision_id),
+                            DecisionPrediction.from_decision_context(decision),
+                        )
+                    except Exception as r13_exc:
+                        logger.debug(
+                            f"R13 prediction snapshot skipped (decision_id={decision_id}): {r13_exc}"
+                        )
         except Exception as e:
             logger.warning(f"Extended decision log failed, retrying legacy insert: {e}")
             try:
                 async with get_db() as conn:
-                    await conn.execute(
+                    decision_id = await conn.fetchval(
                         """
                         INSERT INTO decision_log
                             (leader_wallet, market_id, action, thompson_follow, thompson_fade,
                              kelly_fraction, confidence, reason)
                         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+                        RETURNING id
                         """,
                         wallet,
                         market_id,
@@ -1182,6 +1208,20 @@ class ConfidenceEngine:
                         round(confidence, 4),
                         reason,
                     )
+                    # Best-effort R13 snapshot on the legacy path too.
+                    if decision_id is not None and decision is not None:
+                        try:
+                            from src.calibration import (
+                                DecisionPrediction,
+                                record_decision_predictions,
+                            )
+                            await record_decision_predictions(
+                                conn,
+                                int(decision_id),
+                                DecisionPrediction.from_decision_context(decision),
+                            )
+                        except Exception:
+                            pass
             except Exception as fallback_exc:
                 logger.error(f"Failed to log decision: {fallback_exc}")
 

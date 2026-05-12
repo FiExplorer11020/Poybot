@@ -26,7 +26,7 @@ def make_engine() -> ConfidenceEngine:
     return ConfidenceEngine(redis_client=redis)
 
 
-def _mock_get_db(execute_mock=None, fetchrow_mock=None):
+def _mock_get_db(execute_mock=None, fetchrow_mock=None, fetchval_mock=None):
     """
     Return a patcher for src.database.connection.get_db that yields a mock
     asyncpg connection.
@@ -40,6 +40,12 @@ def _mock_get_db(execute_mock=None, fetchrow_mock=None):
         conn.fetchrow = fetchrow_mock
     else:
         conn.fetchrow = AsyncMock(return_value=None)
+    if fetchval_mock is not None:
+        conn.fetchval = fetchval_mock
+    else:
+        # R13 hook: _log_decision now INSERTs with RETURNING id via fetchval.
+        # Return a dummy decision_id so the prediction-snapshot path is exercised.
+        conn.fetchval = AsyncMock(return_value=42)
 
     @asynccontextmanager
     async def _ctx():
@@ -177,9 +183,9 @@ class TestEvaluate:
         """When readiness is zero, evaluate must return None and log 'skip'."""
         engine = make_engine()
 
-        execute_mock = AsyncMock()
+        fetchval_mock = AsyncMock(return_value=42)
         patcher, conn = _mock_get_db(
-            execute_mock=execute_mock,
+            fetchval_mock=fetchval_mock,
             fetchrow_mock=AsyncMock(return_value=None),  # no profile row
         )
         trade = {
@@ -192,9 +198,10 @@ class TestEvaluate:
             result = await engine.evaluate(trade)
 
         assert result is None
-        # INSERT into decision_log must have been called with action='skip'
-        execute_mock.assert_awaited_once()
-        call_args = execute_mock.await_args[0]
+        # R13 hook: INSERT into decision_log now uses fetchval (RETURNING id).
+        # The first awaited call must be the decision_log INSERT with 'skip'.
+        fetchval_mock.assert_awaited()
+        call_args = fetchval_mock.await_args_list[0][0]
         assert "skip" in call_args
 
     @pytest.mark.asyncio
