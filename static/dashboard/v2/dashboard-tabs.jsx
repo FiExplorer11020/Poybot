@@ -619,17 +619,22 @@ const WalletLabTab = ({ tab, setTab, tabDef }) => {
       />
       <SubTabNav tabs={tabDef.subTabs} value={tab.subTab} onChange={s => setTab({ ...tab, subTab: s })} />
       <div style={{ flex: 1, overflow: 'auto' }}>
-        {tab.subTab === 'universe' && <WalletUniverse />}
-        {tab.subTab === 'graph'    && <WalletGraphLite />}
-        {tab.subTab === 'scanner'  && <WalletScanner />}
+        {tab.subTab === 'universe' && <WalletUniverse setTab={setTab} />}
+        {tab.subTab === 'graph'    && <WalletGraphFull />}
+        {tab.subTab === 'scanner'  && <WalletScanner setTab={setTab} />}
         {tab.subTab === 'profile'  && <WalletProfileSelect />}
       </div>
     </>
   );
 };
 
-const WalletUniverse = () => {
-  const { data: universe, loading } = useApi('/api/wallet/universe?limit=200', { interval: 30000 });
+const WalletUniverse = ({ setTab }) => {
+  const [tierFilter, setTierFilter] = useState('all');
+  const [stratFilter, setStratFilter] = useState('all');
+  const [sortKey, setSortKey] = useState('volume_30d_usdc');
+  const [sortDir, setSortDir] = useState('desc');
+  const { data: universe, loading } = useApi('/api/wallet/universe?limit=500', { interval: 30000 });
+
   const kpis = [
     { label: 'UNIVERSE SIZE',  value: universe?.total ?? 0, loading },
     { label: 'TIER-0 WHALES',  value: universe?.tier_0 ?? 0, color: T.accent.amber, loading },
@@ -637,24 +642,84 @@ const WalletUniverse = () => {
     { label: 'TIER-2 DEPTH',   value: universe?.tier_2 ?? 0, color: T.text.tertiary, loading },
     { label: 'LAST CRAWL',     value: universe?.last_crawl_at || '—', loading },
   ];
+
+  const allClasses = ['directional','momentum','contrarian','arb_2way','arb_3way','market_maker','structural_bot','info_leak','social_driven'];
+
+  const filtered = useMemo(() => {
+    const wallets = universe?.wallets || [];
+    return wallets
+      .filter(w => tierFilter === 'all' || String(w.depth_tier) === tierFilter)
+      .filter(w => stratFilter === 'all' || w.strategy_class === stratFilter)
+      .slice()
+      .sort((a, b) => {
+        const av = a[sortKey], bv = b[sortKey];
+        if (av == null) return 1;
+        if (bv == null) return -1;
+        const cmp = typeof av === 'number' ? av - bv : String(av).localeCompare(String(bv));
+        return sortDir === 'asc' ? cmp : -cmp;
+      });
+  }, [universe, tierFilter, stratFilter, sortKey, sortDir]);
+
+  const toggleSort = (key) => {
+    if (sortKey === key) setSortDir(d => d === 'asc' ? 'desc' : 'asc');
+    else { setSortKey(key); setSortDir('desc'); }
+  };
+
+  const sortableHeader = (key, label, align = 'left') => (
+    <button
+      onClick={() => toggleSort(key)}
+      style={{
+        padding: 0, background: 'transparent', border: 'none',
+        color: sortKey === key ? T.accent.amber : T.text.tertiary,
+        textAlign: align,
+        fontFamily: 'inherit', fontSize: 'inherit', fontWeight: 'inherit',
+        cursor: 'pointer', display: 'inline-flex', alignItems: 'center', gap: 4,
+      }}
+    >
+      {label}
+      {sortKey === key && <Icon name={sortDir === 'asc' ? 'chevron-up' : 'chevron-down'} size={10} />}
+    </button>
+  );
+
   return (
     <>
       <KpiStrip items={kpis} loading={loading} />
       <div style={{ padding: 'var(--section-padding)' }}>
-        <Panel title="UNIVERSE BROWSER">
+        <Panel
+          title={`UNIVERSE BROWSER · ${filtered.length} of ${universe?.wallets?.length ?? 0}`}
+          action={
+            <div style={{ display: 'flex', gap: 8 }}>
+              <select value={tierFilter} onChange={e => setTierFilter(e.target.value)}>
+                <option value="all">All tiers</option>
+                <option value="0">Tier 0 (whales)</option>
+                <option value="1">Tier 1 (top)</option>
+                <option value="2">Tier 2 (depth)</option>
+              </select>
+              <select value={stratFilter} onChange={e => setStratFilter(e.target.value)}>
+                <option value="all">All strategies</option>
+                {allClasses.map(c => <option key={c} value={c}>{c}</option>)}
+              </select>
+            </div>
+          }
+        >
           <DataTable
             loading={loading}
-            emptyMessage="No wallets crawled yet. Run polymarket-crawler.service."
+            emptyMessage="No wallets match. Adjust filter or run polymarket-crawler.service."
             columns={[
-              { key: 'wallet_address', label: 'WALLET', render: v => <WalletCell wallet={v} /> },
-              { key: 'depth_tier',     label: 'TIER', align: 'right' },
-              { key: 'strategy_class', label: 'STRATEGY', color: T.accent.amber },
-              { key: 'volume_30d_usdc',label: 'VOL 30D $', align: 'right',
+              { key: 'wallet_address', label: 'WALLET',
+                render: (v) => <WalletCell wallet={v} onClick={() => {
+                  window.location.hash = `wallet/profile?w=${v}`;
+                  setTab({ id: 'wallet', subTab: 'profile' });
+                }} /> },
+              { key: 'depth_tier',     label: sortableHeader('depth_tier', 'TIER', 'right'), align: 'right' },
+              { key: 'strategy_class', label: 'STRATEGY', color: T.accent.amber,
+                render: v => v ? <StatusPill status="info" label={v} /> : <span style={{ color: T.text.tertiary }}>—</span> },
+              { key: 'volume_30d_usdc',label: sortableHeader('volume_30d_usdc', 'VOL 30D $', 'right'), align: 'right',
                 render: v => v != null ? `$${Number(v).toLocaleString()}` : '—' },
-              { key: 'trades_30d',     label: 'TRADES', align: 'right' },
+              { key: 'trades_30d',     label: sortableHeader('trades_30d', 'TRADES', 'right'), align: 'right' },
               { key: 'last_seen',      label: 'LAST SEEN' },
             ]}
-            rows={universe?.wallets || []}
+            rows={filtered}
             rowKey={r => r.wallet_address}
           />
         </Panel>
@@ -663,43 +728,251 @@ const WalletUniverse = () => {
   );
 };
 
-const WalletGraphLite = () => (
-  <div style={{ padding: 'var(--section-padding)' }}>
-    <Banner tone="info" icon="users" title="GRAPH VIEW">
-      The R5 leader→follower graph + confirmed-edges scatter live here.
-      The original v1 component (<code>WalletGraph</code> in
-      <code> static/dashboard/dashboard-tabs.jsx</code>) renders correctly
-      under the v2 shell — wiring is operator follow-up (P-2 polish PR).
-    </Banner>
-  </div>
-);
+// ── Wallet Graph (full SVG view) ─────────────────────────────────────────
+const WalletGraphFull = () => {
+  const { data: graph, loading } = useApi('/api/graph/top-edges?limit=80', { interval: 30000 });
+  const [confirmedOnly, setConfirmedOnly] = useState(true);
+  const [hoveredEdge, setHoveredEdge] = useState(null);
 
-const WalletScanner = () => {
-  const { data: scanner, loading } = useApi('/api/leaders?limit=100', { interval: 30000 });
+  const edges = (graph?.edges || [])
+    .filter(e => !confirmedOnly || e.is_confirmed)
+    .slice(0, 80);
+
+  // Build node positions: leaders on left, followers on right, deterministic layout
+  const nodes = useMemo(() => {
+    const leaderSet = new Set();
+    const followerSet = new Set();
+    edges.forEach(e => {
+      leaderSet.add(e.leader_wallet);
+      followerSet.add(e.follower_wallet);
+    });
+    const leaders = Array.from(leaderSet);
+    const followers = Array.from(followerSet);
+    const W = 720, H = 480, padding = 40;
+    const colLeftX = padding + 60;
+    const colRightX = W - padding - 60;
+    const positions = {};
+    leaders.forEach((w, i) => {
+      positions[w] = {
+        x: colLeftX,
+        y: padding + (i + 0.5) * ((H - 2 * padding) / Math.max(leaders.length, 1)),
+        role: 'leader',
+      };
+    });
+    followers.forEach((w, i) => {
+      positions[w] = {
+        x: colRightX,
+        y: padding + (i + 0.5) * ((H - 2 * padding) / Math.max(followers.length, 1)),
+        role: 'follower',
+      };
+    });
+    return { positions, W, H, leaderCount: leaders.length, followerCount: followers.length };
+  }, [edges]);
+
+  const kpis = [
+    { label: 'TOTAL EDGES',     value: graph?.edges?.length ?? 0, loading },
+    { label: 'CONFIRMED EDGES', value: (graph?.edges || []).filter(e => e.is_confirmed).length, color: T.status.ok, loading },
+    { label: 'UNIQUE LEADERS',  value: nodes.leaderCount, loading },
+    { label: 'UNIQUE FOLLOWERS',value: nodes.followerCount, loading },
+  ];
+
   return (
-    <div style={{ padding: 'var(--section-padding)' }}>
-      <Panel title="WALLET SCANNER">
-        <DataTable
-          loading={loading}
-          emptyMessage="No leaders ingested yet."
-          columns={[
-            { key: 'wallet_address', label: 'WALLET',   render: v => <WalletCell wallet={v} /> },
-            { key: 'phase',          label: 'PHASE',    align: 'center', color: T.accent.amber },
-            { key: 'falcon_score',   label: 'FALCON',   align: 'right',
-              render: v => v != null ? Number(v).toFixed(2) : '—' },
-            { key: 'trades_24h',     label: 'TRADES 24H', align: 'right' },
-            { key: 'win_rate',       label: 'WIN %',    align: 'right',
-              render: v => v != null ? fmtPct(v * 100, 1) : '—' },
-            { key: 'pnl_30d',        label: 'PNL 30D',  align: 'right',
-              render: v => fmtPnl(v) },
-            { key: 'readiness',      label: 'READINESS',align: 'right',
-              render: v => v != null ? Number(v).toFixed(2) : '—' },
-          ]}
-          rows={scanner?.leaders || []}
-          rowKey={r => r.wallet_address}
-        />
-      </Panel>
-    </div>
+    <>
+      <KpiStrip items={kpis} loading={loading} />
+      <div style={{ padding: 'var(--section-padding)', display: 'flex', flexDirection: 'column', gap: 'var(--grid-gap)' }}>
+        <Panel
+          title="LEADER → FOLLOWER GRAPH"
+          subtitle="Edges from follower_edges table. Confirmed = α/μ > 1 AND BIC accepted (R5/R9)."
+          action={
+            <label style={{ display: 'inline-flex', alignItems: 'center', gap: 6, color: T.text.secondary, fontSize: 'var(--font-size-sm)', cursor: 'pointer' }}>
+              <input type="checkbox" checked={confirmedOnly} onChange={e => setConfirmedOnly(e.target.checked)} />
+              Confirmed only
+            </label>
+          }
+        >
+          {loading ? (
+            <ChartSkeleton height={480} />
+          ) : edges.length === 0 ? (
+            <div style={{ padding: 32, color: T.text.tertiary, fontSize: 'var(--font-size-sm)', textAlign: 'center' }}>
+              No edges in <code>follower_edges</code>. Run R5 graph engine + nightly Hawkes batch.
+            </div>
+          ) : (
+            <div style={{ overflow: 'auto' }}>
+              <svg width={nodes.W} height={nodes.H} role="img" aria-label="Leader to follower graph">
+                {/* edges */}
+                {edges.map((e, i) => {
+                  const a = nodes.positions[e.leader_wallet];
+                  const b = nodes.positions[e.follower_wallet];
+                  if (!a || !b) return null;
+                  const isHovered = hoveredEdge === i;
+                  const stroke = e.is_confirmed ? T.status.ok : T.text.tertiary;
+                  const opacity = isHovered ? 1 : 0.25 + (e.follow_probability || 0.5) * 0.6;
+                  return (
+                    <g key={i} onMouseEnter={() => setHoveredEdge(i)} onMouseLeave={() => setHoveredEdge(null)}>
+                      <path
+                        d={`M ${a.x} ${a.y} Q ${(a.x + b.x) / 2} ${(a.y + b.y) / 2 - 40} ${b.x} ${b.y}`}
+                        fill="none"
+                        stroke={stroke}
+                        strokeWidth={isHovered ? 2.5 : 1}
+                        opacity={opacity}
+                      >
+                        <title>{`${truncateAddr(e.leader_wallet)} → ${truncateAddr(e.follower_wallet)}\nα/μ=${(e.alpha_mu || 0).toFixed(2)} · p=${(e.follow_probability || 0).toFixed(2)}${e.is_confirmed ? ' · CONFIRMED' : ''}`}</title>
+                      </path>
+                    </g>
+                  );
+                })}
+                {/* nodes */}
+                {Object.entries(nodes.positions).map(([w, p]) => (
+                  <g key={w}>
+                    <circle
+                      cx={p.x} cy={p.y} r={p.role === 'leader' ? 8 : 5}
+                      fill={p.role === 'leader' ? T.accent.amber : T.accent.violet}
+                      stroke={T.bg.page} strokeWidth="2"
+                    />
+                    <text
+                      x={p.role === 'leader' ? p.x - 14 : p.x + 14}
+                      y={p.y + 3}
+                      textAnchor={p.role === 'leader' ? 'end' : 'start'}
+                      fill={T.text.secondary}
+                      fontSize="9"
+                      fontFamily="var(--font-mono)"
+                    >
+                      {truncateAddr(w)}
+                    </text>
+                  </g>
+                ))}
+                {/* legend */}
+                <g transform="translate(20, 20)">
+                  <circle cx="6" cy="0" r="6" fill={T.accent.amber} />
+                  <text x="18" y="3" fontSize="10" fill={T.text.secondary}>LEADER</text>
+                  <circle cx="6" cy="16" r="4" fill={T.accent.violet} />
+                  <text x="18" y="19" fontSize="10" fill={T.text.secondary}>FOLLOWER</text>
+                </g>
+              </svg>
+            </div>
+          )}
+        </Panel>
+
+        <Panel title="TOP CONFIRMED EDGES · BY α/μ">
+          <DataTable
+            loading={loading}
+            emptyMessage="No confirmed edges yet."
+            dense
+            columns={[
+              { key: 'leader_wallet',   label: 'LEADER',   render: v => <WalletCell wallet={v} /> },
+              { key: 'follower_wallet', label: 'FOLLOWER', render: v => <WalletCell wallet={v} /> },
+              { key: 'alpha_mu',        label: 'α/μ', align: 'right',
+                render: v => v != null ? Number(v).toFixed(2) : '—' },
+              { key: 'follow_probability', label: 'P(follow)', align: 'right',
+                render: v => v != null ? Number(v).toFixed(2) : '—' },
+              { key: 'co_occurrences',  label: 'CO-OCC', align: 'right' },
+              { key: 'is_confirmed', label: 'STATUS',
+                render: v => <StatusPill status={v ? 'ok' : 'pending'} label={v ? 'CONFIRMED' : 'PENDING'} /> },
+            ]}
+            rows={(graph?.edges || []).slice().sort((a, b) => (b.alpha_mu || 0) - (a.alpha_mu || 0)).slice(0, 30)}
+            rowKey={(r, i) => `${r.leader_wallet}-${r.follower_wallet}`}
+          />
+        </Panel>
+      </div>
+    </>
+  );
+};
+
+const WalletScanner = ({ setTab }) => {
+  const [search, setSearch] = useState('');
+  const [phaseFilter, setPhaseFilter] = useState('all');
+  const [sortKey, setSortKey] = useState('readiness');
+  const [sortDir, setSortDir] = useState('desc');
+  const { data: scanner, loading } = useApi('/api/leaders?limit=200', { interval: 30000 });
+
+  const leaders = (scanner?.leaders || [])
+    .filter(l => phaseFilter === 'all' || String(l.phase) === phaseFilter)
+    .filter(l => !search || l.wallet_address.toLowerCase().includes(search.toLowerCase()))
+    .slice()
+    .sort((a, b) => {
+      const av = a[sortKey], bv = b[sortKey];
+      if (av == null) return 1;
+      if (bv == null) return -1;
+      const cmp = typeof av === 'number' ? av - bv : String(av).localeCompare(String(bv));
+      return sortDir === 'asc' ? cmp : -cmp;
+    });
+
+  const kpis = [
+    { label: 'LEADERS',          value: scanner?.leaders?.length ?? 0, loading },
+    { label: 'PHASE 1',          value: (scanner?.leaders || []).filter(l => l.phase === 1).length, color: T.chart.c1, loading },
+    { label: 'PHASE 2',          value: (scanner?.leaders || []).filter(l => l.phase === 2).length, color: T.chart.c2, loading },
+    { label: 'PHASE 3',          value: (scanner?.leaders || []).filter(l => l.phase === 3).length, color: T.chart.c3, loading },
+    { label: 'WIN RATE MEDIAN',  value: scanner?.win_rate_median ? fmtPct(scanner.win_rate_median * 100, 1) : '—', loading },
+    { label: 'FILTERED RESULTS', value: leaders.length, loading },
+  ];
+
+  const toggleSort = (key) => {
+    if (sortKey === key) setSortDir(d => d === 'asc' ? 'desc' : 'asc');
+    else { setSortKey(key); setSortDir('desc'); }
+  };
+
+  const sortableHeader = (key, label, align = 'left') => (
+    <button onClick={() => toggleSort(key)} style={{
+      padding: 0, background: 'transparent', border: 'none',
+      color: sortKey === key ? T.accent.amber : T.text.tertiary,
+      textAlign: align, fontFamily: 'inherit', fontSize: 'inherit', fontWeight: 'inherit',
+      cursor: 'pointer', display: 'inline-flex', alignItems: 'center', gap: 4,
+    }}>
+      {label}
+      {sortKey === key && <Icon name={sortDir === 'asc' ? 'chevron-up' : 'chevron-down'} size={10} />}
+    </button>
+  );
+
+  return (
+    <>
+      <KpiStrip items={kpis} loading={loading} />
+      <div style={{ padding: 'var(--section-padding)' }}>
+        <Panel
+          title="WALLET SCANNER"
+          action={
+            <div style={{ display: 'flex', gap: 8 }}>
+              <input
+                type="search"
+                placeholder="Search wallet…"
+                value={search}
+                onChange={e => setSearch(e.target.value)}
+                style={{ width: 180 }}
+              />
+              <select value={phaseFilter} onChange={e => setPhaseFilter(e.target.value)}>
+                <option value="all">All phases</option>
+                <option value="1">Phase 1</option>
+                <option value="2">Phase 2</option>
+                <option value="3">Phase 3</option>
+              </select>
+            </div>
+          }
+        >
+          <DataTable
+            loading={loading}
+            emptyMessage="No leaders match. Try clearing filters."
+            columns={[
+              { key: 'wallet_address', label: 'WALLET',
+                render: (v) => <WalletCell wallet={v} onClick={() => {
+                  window.location.hash = `wallet/profile?w=${v}`;
+                  setTab && setTab({ id: 'wallet', subTab: 'profile' });
+                }} /> },
+              { key: 'phase',          label: sortableHeader('phase', 'PHASE', 'center'), align: 'center', color: T.accent.amber },
+              { key: 'falcon_score',   label: sortableHeader('falcon_score', 'FALCON', 'right'), align: 'right',
+                render: v => v != null ? Number(v).toFixed(2) : '—' },
+              { key: 'trades_24h',     label: sortableHeader('trades_24h', 'TRADES 24H', 'right'), align: 'right' },
+              { key: 'win_rate',       label: sortableHeader('win_rate', 'WIN %', 'right'), align: 'right',
+                render: v => v != null ? fmtPct(v * 100, 1) : '—' },
+              { key: 'pnl_30d',        label: sortableHeader('pnl_30d', 'PNL 30D', 'right'), align: 'right',
+                render: v => fmtPnl(v) },
+              { key: 'readiness',      label: sortableHeader('readiness', 'READINESS', 'right'), align: 'right',
+                render: v => v != null ? Number(v).toFixed(2) : '—' },
+            ]}
+            rows={leaders}
+            rowKey={r => r.wallet_address}
+          />
+        </Panel>
+      </div>
+    </>
   );
 };
 

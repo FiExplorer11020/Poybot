@@ -1255,6 +1255,71 @@ async def root_v2():
     return HTMLResponse(content=TEMPLATE_V2_PATH.read_text())
 
 
+# ---------------------------------------------------------------------------
+# Shared helpers for the v2 endpoints
+# ---------------------------------------------------------------------------
+
+# Models that the confidence engine treats as core / never auto-disabled.
+# Imported lazily inside the endpoints so test collection without the
+# calibration package still works.
+_V2_PROTECTED_MODELS = {"follow_confidence"}
+
+# Strategy taxonomy mirrors strategy_labels CHECK constraint (migration 026).
+_V2_STRATEGY_CLASSES = (
+    "directional", "momentum", "contrarian",
+    "arb_2way", "arb_3way", "market_maker",
+    "structural_bot", "info_leak", "social_driven",
+)
+
+
+def _v2_fmt_time(ts) -> str:
+    """Format a TIMESTAMPTZ for the v2 timeline / DataTable LAST SEEN column."""
+    if ts is None:
+        return ""
+    try:
+        return ts.strftime("%H:%M:%S")
+    except Exception:
+        return str(ts)
+
+
+def _v2_fmt_iso(ts) -> str | None:
+    if ts is None:
+        return None
+    try:
+        return ts.isoformat()
+    except Exception:
+        return str(ts)
+
+
+def _v2_loss_column_for(model: str) -> str:
+    """Pick the loss column to plot per model (spec § 3.2)."""
+    if model == "follow_confidence":
+        return "brier_score"
+    if model == "strategy_class":
+        return "log_loss"
+    if model in ("volume_forecast", "causal_ate"):
+        return "mape"
+    return "brier_score"
+
+
+async def _v2_runtime_gate_flags() -> dict[str, bool]:
+    """Read the three R8/R9/R10 boolean gates from runtime_config (fail-soft)."""
+    out = {
+        "strategy_class_enabled": False,
+        "volume_forecast_enabled": False,
+        "causal_enabled": False,
+    }
+    try:
+        cfg = get_runtime_config()
+        snap = await cfg.effective()
+        out["strategy_class_enabled"] = bool(snap.get("strategy_conditional_confidence_enabled", False))
+        out["volume_forecast_enabled"] = bool(snap.get("volume_anticipation_enabled", False))
+        out["causal_enabled"] = bool(snap.get("causal_gating_enabled", False))
+    except Exception as exc:
+        logger.warning(f"_v2_runtime_gate_flags failed: {exc}")
+    return out
+
+
 # --- Overview --------------------------------------------------------------
 
 
@@ -1262,27 +1327,139 @@ async def root_v2():
 async def api_overview_timeline():
     """Last 5 'what changed' events for the OVERVIEW timeline panel.
 
-    Operator wire-up: the calibration daemon + control endpoints already
-    log these; this endpoint joins them into a single feed. Returns an
-    empty list until that join lands.
+    Builds a union of three sources:
+      * decision_log last 24h (action='follow'|'fade')
+      * model_disable_state recent disables
+      * mempool_observations recent decoded intents
     """
-    return {"events": []}
+    events: list[dict] = []
+    try:
+        async with _pool.acquire() as conn:
+            decisions = await conn.fetch(
+                """
+                SELECT id, time, leader_wallet, market_id, action
+                FROM decision_log
+                WHERE time >= NOW() - INTERVAL '24 hours'
+                  AND action IN ('follow', 'fade')
+                ORDER BY time DESC
+                LIMIT 5
+                """
+            )
+            disables = await conn.fetch(
+                """
+                SELECT model, disabled_at, disabled_reason, auto_or_manual
+                FROM model_disable_state
+                WHERE disabled_at IS NOT NULL
+                ORDER BY disabled_at DESC
+                LIMIT 5
+                """
+            )
+            intents = await conn.fetch(
+                """
+                SELECT intent_id, intent_received_at, wallet_address, fire_result
+                FROM mempool_observations
+                WHERE intent_received_at >= NOW() - INTERVAL '24 hours'
+                ORDER BY intent_received_at DESC
+                LIMIT 5
+                """
+            )
+        for row in decisions:
+            events.append({
+                "_sort": row["time"],
+                "time": _v2_fmt_time(row["time"]),
+                "severity": "ok" if row["action"] == "follow" else "warn",
+                "message": f"DECISION {row['action'].upper()} · leader {row['leader_wallet'][:10]}…",
+                "deepLink": {"id": "execution", "subTab": "decisions"},
+            })
+        for row in disables:
+            kind = (row["auto_or_manual"] or "auto").upper()
+            events.append({
+                "_sort": row["disabled_at"],
+                "time": _v2_fmt_time(row["disabled_at"]),
+                "severity": "err",
+                "message": f"MODEL DISABLED ({kind}) · {row['model']} — {row['disabled_reason'] or 'no reason'}",
+                "deepLink": {"id": "operations", "subTab": "calibration"},
+            })
+        for row in intents:
+            severity = "info"
+            if row["fire_result"] == "filled":
+                severity = "ok"
+            elif row["fire_result"] in ("risk_blocked", "killswitch_off"):
+                severity = "warn"
+            events.append({
+                "_sort": row["intent_received_at"],
+                "time": _v2_fmt_time(row["intent_received_at"]),
+                "severity": severity,
+                "message": f"INTENT {row['fire_result'] or 'pending'} · wallet {row['wallet_address'][:10]}…",
+                "deepLink": {"id": "mempool", "subTab": "live"},
+            })
+        # Sort newest first and keep top 5 across all three streams.
+        events.sort(key=lambda e: e.get("_sort") or datetime.min.replace(tzinfo=timezone.utc), reverse=True)
+        events = [{k: v for k, v in e.items() if k != "_sort"} for e in events[:5]]
+        return {"events": events}
+    except Exception as exc:
+        logger.warning(f"api_overview_timeline failed: {exc}")
+        return {"events": []}
 
 
 @app.get("/api/calibration/summary")
 async def api_calibration_summary():
     """R13 high-level rollup for the OVERVIEW Mirror bento card."""
-    return {
-        "disabled_count": 0,
-        "auto_disabled_count": 0,
-        "manual_disabled_count": 0,
-        "drift_alerts_24h": 0,
-        "last_batch_at": None,
-        "predictions_logged_24h": 0,
-        "strategy_class_enabled": False,
-        "volume_forecast_enabled": False,
-        "causal_enabled": False,
-    }
+    try:
+        async with _pool.acquire() as conn:
+            disable_rows = await conn.fetch(
+                """
+                SELECT auto_or_manual, COUNT(*)::int AS n
+                FROM model_disable_state
+                WHERE is_disabled = TRUE
+                GROUP BY auto_or_manual
+                """
+            )
+            auto_n = 0
+            manual_n = 0
+            for row in disable_rows:
+                if row["auto_or_manual"] == "manual":
+                    manual_n = int(row["n"])
+                else:
+                    auto_n = int(row["n"])
+            drift_alerts_24h = await conn.fetchval(
+                """
+                SELECT COUNT(*)::int FROM model_drift_streak
+                WHERE last_breach_at >= CURRENT_DATE - INTERVAL '1 day'
+                """
+            ) or 0
+            last_batch_at = await conn.fetchval(
+                "SELECT MAX(measured_at) FROM calibration_loss_history"
+            )
+            predictions_logged_24h = await conn.fetchval(
+                """
+                SELECT COUNT(*)::int FROM decision_predictions
+                WHERE predicted_at >= NOW() - INTERVAL '24 hours'
+                """
+            ) or 0
+        gates = await _v2_runtime_gate_flags()
+        return {
+            "disabled_count": auto_n + manual_n,
+            "auto_disabled_count": auto_n,
+            "manual_disabled_count": manual_n,
+            "drift_alerts_24h": int(drift_alerts_24h),
+            "last_batch_at": _v2_fmt_iso(last_batch_at),
+            "predictions_logged_24h": int(predictions_logged_24h),
+            **gates,
+        }
+    except Exception as exc:
+        logger.warning(f"api_calibration_summary failed: {exc}")
+        return {
+            "disabled_count": 0,
+            "auto_disabled_count": 0,
+            "manual_disabled_count": 0,
+            "drift_alerts_24h": 0,
+            "last_batch_at": None,
+            "predictions_logged_24h": 0,
+            "strategy_class_enabled": False,
+            "volume_forecast_enabled": False,
+            "causal_enabled": False,
+        }
 
 
 # --- Mempool (R7) ----------------------------------------------------------
@@ -1290,34 +1467,270 @@ async def api_calibration_summary():
 
 @app.get("/api/mempool/summary")
 async def api_mempool_summary():
-    return {
-        "connected": False,
-        "intents_per_min": 0,
-        "intents_per_hour": 0,
-        "decode_hit_rate": 0.0,
-        "pool_size": 0,
-        "pool_capacity": 40,
-        "pool_freshness_pct": 0.0,
-        "intent_to_fire_p50_ms": None,
-        "shadow_fires_24h": 0,
-        "live_fires_24h": 0,
-        "active_nonce_chains": 0,
-    }
+    """Mempool watcher rollup.
+
+    Pool inventory + freshness + intent->fire latency live in-memory in the
+    R7 daemon. Operator wire-up: surface those via a Redis health key
+    (``polybot:prefill_pool:snapshot``) so the API can read them without a
+    direct RPC into the daemon process. Until that lands we report 0 with
+    a known capacity so the UI shows ``0/40`` instead of ``—``.
+    """
+    try:
+        async with _pool.acquire() as conn:
+            intents_15m = await conn.fetchval(
+                """
+                SELECT COUNT(*)::int FROM mempool_observations
+                WHERE intent_received_at >= NOW() - INTERVAL '15 minutes'
+                """
+            ) or 0
+            intents_60m = await conn.fetchval(
+                """
+                SELECT COUNT(*)::int FROM mempool_observations
+                WHERE intent_received_at >= NOW() - INTERVAL '60 minutes'
+                """
+            ) or 0
+            decode_row = await conn.fetchrow(
+                """
+                SELECT COUNT(*)::int AS total,
+                       COUNT(*) FILTER (
+                         WHERE fire_result IS NOT NULL
+                         AND fire_result <> 'killswitch_off'
+                       )::int AS decoded
+                FROM mempool_observations
+                WHERE intent_received_at >= NOW() - INTERVAL '60 minutes'
+                """
+            )
+            total = int(decode_row["total"] or 0) if decode_row else 0
+            decoded = int(decode_row["decoded"] or 0) if decode_row else 0
+            decode_hit_rate = (decoded / total) if total > 0 else 0.0
+            fires_row = await conn.fetchrow(
+                """
+                SELECT
+                  COUNT(*) FILTER (WHERE fire_result = 'shadow')::int AS shadow,
+                  COUNT(*) FILTER (WHERE fire_result = 'filled')::int AS live
+                FROM mempool_observations
+                WHERE intent_received_at >= NOW() - INTERVAL '24 hours'
+                """
+            )
+            shadow_24 = int(fires_row["shadow"] or 0) if fires_row else 0
+            live_24 = int(fires_row["live"] or 0) if fires_row else 0
+            nonce_chains = await conn.fetchval(
+                """
+                SELECT COUNT(*)::int FROM (
+                    SELECT wallet_address, nonce
+                    FROM mempool_observations
+                    WHERE intent_received_at >= NOW() - INTERVAL '60 minutes'
+                      AND replaces_tx_hash IS NOT NULL
+                    GROUP BY wallet_address, nonce
+                ) sub
+                """
+            ) or 0
+        # Daemon liveness: read the Redis heartbeat key the R7 watcher
+        # writes. Absent / stale = "off".
+        connected = False
+        if _redis is not None:
+            try:
+                hb = await _redis.get("polybot:mempool:heartbeat")
+                connected = hb is not None
+            except Exception:
+                connected = False
+        return {
+            "connected": connected,
+            "intents_per_min": round((intents_15m / 15.0), 2) if intents_15m else 0,
+            "intents_per_hour": int(intents_60m),
+            "decode_hit_rate": float(decode_hit_rate),
+            # NOTE: pool inventory + freshness + intent->fire timing live
+            # in-memory in the R7 daemon. Operator must expose via Redis
+            # snapshot key (polybot:prefill_pool:snapshot) before these
+            # populate. Returning known shape for now.
+            "pool_size": 0,
+            "pool_capacity": 40,
+            "pool_freshness_pct": 0.0,
+            "intent_to_fire_p50_ms": None,
+            "shadow_fires_24h": shadow_24,
+            "live_fires_24h": live_24,
+            "active_nonce_chains": int(nonce_chains),
+        }
+    except Exception as exc:
+        logger.warning(f"api_mempool_summary failed: {exc}")
+        return {
+            "connected": False,
+            "intents_per_min": 0,
+            "intents_per_hour": 0,
+            "decode_hit_rate": 0.0,
+            "pool_size": 0,
+            "pool_capacity": 40,
+            "pool_freshness_pct": 0.0,
+            "intent_to_fire_p50_ms": None,
+            "shadow_fires_24h": 0,
+            "live_fires_24h": 0,
+            "active_nonce_chains": 0,
+        }
 
 
 @app.get("/api/mempool/live")
 async def api_mempool_live():
-    return {"intents": [], "nonce_chains": []}
+    """Last 15 minutes of intents + active nonce replacement chains."""
+    try:
+        async with _pool.acquire() as conn:
+            intent_rows = await conn.fetch(
+                """
+                SELECT mo.intent_id::text AS intent_id,
+                       mo.wallet_address AS wallet,
+                       mo.side,
+                       mo.size_usdc,
+                       NULL::numeric AS price,
+                       mo.market_id,
+                       m.question AS market_title,
+                       mo.intent_received_at,
+                       EXTRACT(EPOCH FROM (NOW() - mo.intent_received_at))::int AS age_s,
+                       (mo.fire_result IS NOT NULL
+                        AND mo.fire_result NOT IN ('killswitch_off'))::bool AS decoded,
+                       mo.fire_result AS skip_reason
+                FROM mempool_observations mo
+                LEFT JOIN markets m ON m.market_id = mo.market_id
+                WHERE mo.intent_received_at >= NOW() - INTERVAL '15 minutes'
+                ORDER BY mo.intent_received_at DESC
+                LIMIT 100
+                """
+            )
+            chain_rows = await conn.fetch(
+                """
+                SELECT wallet_address AS wallet,
+                       nonce,
+                       COUNT(*)::int AS chain_len,
+                       MAX(fire_result) AS state
+                FROM mempool_observations
+                WHERE intent_received_at >= NOW() - INTERVAL '60 minutes'
+                GROUP BY wallet_address, nonce
+                HAVING COUNT(*) > 1
+                ORDER BY chain_len DESC
+                LIMIT 50
+                """
+            )
+        intents = [
+            {
+                "intent_id": r["intent_id"],
+                "wallet": r["wallet"],
+                "side": r["side"],
+                "size_usdc": float(r["size_usdc"]) if r["size_usdc"] is not None else None,
+                "price": float(r["price"]) if r["price"] is not None else None,
+                "market_id": r["market_id"],
+                "market_title": r["market_title"] or r["market_id"],
+                "age_s": int(r["age_s"] or 0),
+                "decoded": bool(r["decoded"]),
+                "skip_reason": r["skip_reason"],
+            }
+            for r in intent_rows
+        ]
+        nonce_chains = [
+            {
+                "wallet": r["wallet"],
+                "nonce": int(r["nonce"]),
+                "chain_summary": f"{r['chain_len']} txs",
+                "state": r["state"] or "pending",
+            }
+            for r in chain_rows
+        ]
+        return {"intents": intents, "nonce_chains": nonce_chains}
+    except Exception as exc:
+        logger.warning(f"api_mempool_live failed: {exc}")
+        return {"intents": [], "nonce_chains": []}
 
 
 @app.get("/api/mempool/pool")
 async def api_mempool_pool():
-    return {"entries": [], "miss_reasons_last_hour": {}}
+    """Pre-signed pool inventory.
+
+    Pool state is in-memory in the R7 daemon (see
+    src/execution/prefill/pool.py) — not in the DB. Operator wire-up:
+    have the daemon publish a snapshot to the Redis key
+    ``polybot:prefill_pool:snapshot`` on each rotation and read it here.
+    Until that's wired, return the known empty shape so the UI shows
+    "Pool empty" instead of crashing.
+    """
+    try:
+        entries: list[dict] = []
+        miss_reasons: dict[str, int] = {}
+        if _redis is not None:
+            try:
+                raw = await _redis.get("polybot:prefill_pool:snapshot")
+                if raw:
+                    snap = json.loads(raw) if isinstance(raw, str) else json.loads(raw.decode())
+                    entries = list(snap.get("entries", []))[:200]
+                    miss_reasons = dict(snap.get("miss_reasons_last_hour", {}))
+            except Exception:
+                entries = []
+                miss_reasons = {}
+        return {"entries": entries, "miss_reasons_last_hour": miss_reasons}
+    except Exception as exc:
+        logger.warning(f"api_mempool_pool failed: {exc}")
+        return {"entries": [], "miss_reasons_last_hour": {}}
 
 
 @app.get("/api/mempool/decisions")
 async def api_mempool_decisions(filter: str = "all"):  # noqa: A002
-    return {"decisions": [], "filter": filter}
+    """IntentRouter outcome feed from mempool_observations.
+
+    The router writes the result vocabulary
+    (filled/pool_miss/risk_blocked/killswitch_off/shadow/cooldown/
+    confidence_skip/size_cap) onto mempool_observations.fire_result;
+    we surface it directly so the v2 MempoolDecisions table can
+    filter by it.
+    """
+    try:
+        async with _pool.acquire() as conn:
+            if filter and filter != "all":
+                rows = await conn.fetch(
+                    """
+                    SELECT mo.intent_id::text AS decision_id,
+                           mo.intent_received_at AS time,
+                           mo.wallet_address AS wallet,
+                           mo.market_id,
+                           m.question AS market_title,
+                           mo.fire_result AS result,
+                           mo.tx_hash AS detail
+                    FROM mempool_observations mo
+                    LEFT JOIN markets m ON m.market_id = mo.market_id
+                    WHERE mo.intent_received_at >= NOW() - INTERVAL '24 hours'
+                      AND mo.fire_result = $1
+                    ORDER BY mo.intent_received_at DESC
+                    LIMIT 200
+                    """,
+                    filter,
+                )
+            else:
+                rows = await conn.fetch(
+                    """
+                    SELECT mo.intent_id::text AS decision_id,
+                           mo.intent_received_at AS time,
+                           mo.wallet_address AS wallet,
+                           mo.market_id,
+                           m.question AS market_title,
+                           mo.fire_result AS result,
+                           mo.tx_hash AS detail
+                    FROM mempool_observations mo
+                    LEFT JOIN markets m ON m.market_id = mo.market_id
+                    WHERE mo.intent_received_at >= NOW() - INTERVAL '24 hours'
+                    ORDER BY mo.intent_received_at DESC
+                    LIMIT 200
+                    """
+                )
+        decisions = [
+            {
+                "decision_id": r["decision_id"],
+                "time": _v2_fmt_time(r["time"]),
+                "wallet": r["wallet"],
+                "market": r["market_title"] or r["market_id"],
+                "result": r["result"] or "pending",
+                "detail": (r["detail"] or "")[:16] if r["detail"] else "",
+            }
+            for r in rows
+        ]
+        return {"decisions": decisions, "filter": filter}
+    except Exception as exc:
+        logger.warning(f"api_mempool_decisions failed: {exc}")
+        return {"decisions": [], "filter": filter}
 
 
 # --- Microscope (R11) ------------------------------------------------------
@@ -1325,32 +1738,199 @@ async def api_mempool_decisions(filter: str = "all"):  # noqa: A002
 
 @app.get("/api/microscope/summary")
 async def api_microscope_summary():
-    return {
-        "events_per_sec": 0,
-        "queue_depth": 0,
-        "queue_capacity": 50_000,
-        "dropped_24h": 0,
-        "iceberg_per_hour": 0,
-        "spoof_per_hour": 0,
-        "ofi_mean": None,
-        "place_to_fill_p50_ms": None,
-        "storage_gb": None,
-    }
+    """R11 microstructure rollup."""
+    try:
+        async with _pool.acquire() as conn:
+            events_per_sec = await conn.fetchval(
+                """
+                SELECT COALESCE(COUNT(*)/60.0, 0)::float FROM clob_book_events
+                WHERE event_time >= NOW() - INTERVAL '1 minute'
+                """
+            ) or 0.0
+            ms_row = await conn.fetchrow(
+                """
+                SELECT COALESCE(SUM(iceberg_orders_count), 0)::int AS iceberg_n,
+                       COALESCE(SUM(spoof_orders_count),   0)::int AS spoof_n,
+                       AVG(ofi_mean)::float                      AS ofi_mean
+                FROM microstructure_features
+                WHERE bucket_ts >= NOW() - INTERVAL '1 hour'
+                """
+            )
+            iceberg_n = int(ms_row["iceberg_n"] or 0) if ms_row else 0
+            spoof_n = int(ms_row["spoof_n"] or 0) if ms_row else 0
+            ofi_mean = float(ms_row["ofi_mean"]) if ms_row and ms_row["ofi_mean"] is not None else None
+            # Storage from pg_total_relation_size — fail-soft on unknown table.
+            storage_gb = None
+            try:
+                size_bytes = await conn.fetchval(
+                    "SELECT pg_total_relation_size('clob_book_events')::bigint"
+                )
+                if size_bytes:
+                    storage_gb = float(size_bytes) / 1e9
+            except Exception:
+                storage_gb = None
+        return {
+            "events_per_sec": float(events_per_sec),
+            # NOTE: queue depth + dropped counter are in-memory in the R11
+            # ingestion daemon. Operator must expose via Redis or
+            # Prometheus gauge. Returning safe placeholders.
+            "queue_depth": 0,
+            "queue_capacity": 50_000,
+            "dropped_24h": 0,
+            "iceberg_per_hour": iceberg_n,
+            "spoof_per_hour": spoof_n,
+            "ofi_mean": ofi_mean,
+            "place_to_fill_p50_ms": None,
+            "storage_gb": storage_gb,
+        }
+    except Exception as exc:
+        logger.warning(f"api_microscope_summary failed: {exc}")
+        return {
+            "events_per_sec": 0,
+            "queue_depth": 0,
+            "queue_capacity": 50_000,
+            "dropped_24h": 0,
+            "iceberg_per_hour": 0,
+            "spoof_per_hour": 0,
+            "ofi_mean": None,
+            "place_to_fill_p50_ms": None,
+            "storage_gb": None,
+        }
 
 
 @app.get("/api/microscope/firehose")
 async def api_microscope_firehose():
-    return {"events": []}
+    """L3 book event firehose — last 5 minutes."""
+    try:
+        async with _pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT cbe.event_id::text AS event_id,
+                       cbe.event_time,
+                       EXTRACT(EPOCH FROM (NOW() - cbe.event_time))::int AS age_s,
+                       cbe.market_id,
+                       m.question AS market_title,
+                       cbe.event_type,
+                       cbe.side,
+                       cbe.size_delta,
+                       cbe.wallet_address AS wallet
+                FROM clob_book_events cbe
+                LEFT JOIN markets m ON m.market_id = cbe.market_id
+                WHERE cbe.event_time >= NOW() - INTERVAL '5 minutes'
+                ORDER BY cbe.event_time DESC
+                LIMIT 200
+                """
+            )
+        events = [
+            {
+                "event_id": r["event_id"],
+                "event_time": _v2_fmt_iso(r["event_time"]),
+                "age_s": int(r["age_s"] or 0),
+                "market_id": r["market_id"],
+                "market_title": r["market_title"] or r["market_id"],
+                "event_type": r["event_type"],
+                "side": r["side"],
+                "size_delta": float(r["size_delta"]) if r["size_delta"] is not None else None,
+                "wallet": r["wallet"],
+            }
+            for r in rows
+        ]
+        return {"events": events}
+    except Exception as exc:
+        logger.warning(f"api_microscope_firehose failed: {exc}")
+        return {"events": []}
 
 
 @app.get("/api/microscope/microstructure")
 async def api_microscope_microstructure(limit: int = 50):
-    return {"rows": [], "limit": limit}
+    """Per-market microstructure rollup."""
+    try:
+        limit = max(1, min(int(limit), 500))
+        async with _pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT mf.market_id,
+                       mf.token_id,
+                       m.question AS market_title,
+                       mf.bucket_ts,
+                       mf.iceberg_orders_count,
+                       mf.spoof_orders_count,
+                       mf.ofi_mean,
+                       mf.ofi_max,
+                       mf.ofi_min,
+                       mf.ofi_std
+                FROM microstructure_features mf
+                LEFT JOIN markets m ON m.market_id = mf.market_id
+                ORDER BY mf.bucket_ts DESC
+                LIMIT $1
+                """,
+                limit,
+            )
+        out = [
+            {
+                "market_id": r["market_id"],
+                "token_id": r["token_id"],
+                "market_title": r["market_title"] or r["market_id"],
+                "bucket_ts": _v2_fmt_iso(r["bucket_ts"]),
+                "iceberg_orders_count": int(r["iceberg_orders_count"] or 0),
+                "spoof_orders_count": int(r["spoof_orders_count"] or 0),
+                "ofi_mean": float(r["ofi_mean"]) if r["ofi_mean"] is not None else None,
+                "ofi_max": float(r["ofi_max"]) if r["ofi_max"] is not None else None,
+                "ofi_min": float(r["ofi_min"]) if r["ofi_min"] is not None else None,
+                "ofi_std": float(r["ofi_std"]) if r["ofi_std"] is not None else None,
+            }
+            for r in rows
+        ]
+        return {"rows": out, "limit": limit}
+    except Exception as exc:
+        logger.warning(f"api_microscope_microstructure failed: {exc}")
+        return {"rows": [], "limit": limit}
 
 
 @app.get("/api/microscope/signatures")
 async def api_microscope_signatures(limit: int = 100):
-    return {"signatures": [], "limit": limit}
+    """Per-wallet 30-day microstructure signatures (tier-0/1)."""
+    try:
+        limit = max(1, min(int(limit), 500))
+        async with _pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT wms.wallet_address,
+                       wms.rollup_at,
+                       wms.cancel_to_fill_ratio_30d,
+                       wms.iceberg_score_30d,
+                       wms.spoof_score_30d,
+                       wms.place_to_fill_seconds_p50,
+                       wms.place_to_fill_seconds_p99,
+                       wms.n_orders_30d,
+                       wms.n_fills_30d,
+                       wu.depth_tier
+                FROM wallet_microstructure_signature wms
+                LEFT JOIN wallet_universe wu
+                       ON wu.wallet_address = wms.wallet_address
+                ORDER BY wms.rollup_at DESC
+                LIMIT $1
+                """,
+                limit,
+            )
+        out = []
+        for r in rows:
+            out.append({
+                "wallet_address": r["wallet_address"],
+                "rollup_at": _v2_fmt_iso(r["rollup_at"]),
+                "cancel_to_fill_ratio_30d": float(r["cancel_to_fill_ratio_30d"]) if r["cancel_to_fill_ratio_30d"] is not None else None,
+                "iceberg_score_30d": float(r["iceberg_score_30d"]) if r["iceberg_score_30d"] is not None else None,
+                "spoof_score_30d": float(r["spoof_score_30d"]) if r["spoof_score_30d"] is not None else None,
+                "place_to_fill_seconds_p50": float(r["place_to_fill_seconds_p50"]) if r["place_to_fill_seconds_p50"] is not None else None,
+                "place_to_fill_seconds_p99": float(r["place_to_fill_seconds_p99"]) if r["place_to_fill_seconds_p99"] is not None else None,
+                "n_orders_30d": int(r["n_orders_30d"]) if r["n_orders_30d"] is not None else None,
+                "n_fills_30d": int(r["n_fills_30d"]) if r["n_fills_30d"] is not None else None,
+                "depth_tier": int(r["depth_tier"]) if r["depth_tier"] is not None else None,
+            })
+        return {"signatures": out, "limit": limit}
+    except Exception as exc:
+        logger.warning(f"api_microscope_signatures failed: {exc}")
+        return {"signatures": [], "limit": limit}
 
 
 # --- Periphery (R12 + R10 instruments) -------------------------------------
@@ -1358,44 +1938,211 @@ async def api_microscope_signatures(limit: int = 100):
 
 @app.get("/api/periphery/summary")
 async def api_periphery_summary():
-    return {
-        "tweets_24h": 0,
-        "entry_pct": 0.0,
-        "exit_pct": 0.0,
-        "x_quota_pct": 1.0,
-        "operators_resolved": 0,
-        "operators_pending": 0,
-        "instrument_events_24h": 0,
-    }
+    """R12 social + cross-market + R10 instrument event rollup."""
+    try:
+        async with _pool.acquire() as conn:
+            social_row = await conn.fetchrow(
+                """
+                SELECT COUNT(*)::int AS total,
+                       COUNT(*) FILTER (WHERE intent = 'entry_signal')::int AS entry_n,
+                       COUNT(*) FILTER (WHERE intent = 'exit_signal')::int  AS exit_n
+                FROM social_signals
+                WHERE posted_at >= NOW() - INTERVAL '24 hours'
+                """
+            )
+            tweets_24h = int(social_row["total"] or 0) if social_row else 0
+            entry_n = int(social_row["entry_n"] or 0) if social_row else 0
+            exit_n = int(social_row["exit_n"] or 0) if social_row else 0
+            entry_pct = (entry_n / tweets_24h) if tweets_24h > 0 else 0.0
+            exit_pct = (exit_n / tweets_24h) if tweets_24h > 0 else 0.0
+            ops_row = await conn.fetchrow(
+                """
+                SELECT
+                  COUNT(*) FILTER (WHERE confidence >= 0.8)::int AS resolved_n,
+                  COUNT(*) FILTER (WHERE confidence < 0.8)::int  AS pending_n
+                FROM cross_market_operators
+                """
+            )
+            resolved = int(ops_row["resolved_n"] or 0) if ops_row else 0
+            pending = int(ops_row["pending_n"] or 0) if ops_row else 0
+            instrument_events_24h = await conn.fetchval(
+                """
+                SELECT COUNT(*)::int FROM instrumental_events
+                WHERE event_time >= NOW() - INTERVAL '24 hours'
+                """
+            ) or 0
+        # X quota lives in the social daemon's runtime state. Read from
+        # Redis if available; default to 1.0 (no signal of exhaustion).
+        x_quota_pct = 1.0
+        if _redis is not None:
+            try:
+                raw = await _redis.get("polybot:social:x:quota_remaining")
+                if raw is not None:
+                    x_quota_pct = float(raw)
+            except Exception:
+                x_quota_pct = 1.0
+        return {
+            "tweets_24h": tweets_24h,
+            "entry_pct": float(entry_pct),
+            "exit_pct": float(exit_pct),
+            "x_quota_pct": float(x_quota_pct),
+            "operators_resolved": resolved,
+            "operators_pending": pending,
+            "instrument_events_24h": int(instrument_events_24h),
+        }
+    except Exception as exc:
+        logger.warning(f"api_periphery_summary failed: {exc}")
+        return {
+            "tweets_24h": 0,
+            "entry_pct": 0.0,
+            "exit_pct": 0.0,
+            "x_quota_pct": 1.0,
+            "operators_resolved": 0,
+            "operators_pending": 0,
+            "instrument_events_24h": 0,
+        }
 
 
 @app.get("/api/periphery/social/feed")
 async def api_periphery_social_feed():
-    return {"signals": []}
+    """Per-author social signal stream (last 24h)."""
+    try:
+        async with _pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT signal_id, source, author_handle, resolved_wallet,
+                       posted_at, text, intent, intent_confidence,
+                       parsed_market, parsed_direction,
+                       EXTRACT(EPOCH FROM (NOW() - posted_at))::int AS age_s
+                FROM social_signals
+                ORDER BY posted_at DESC
+                LIMIT 200
+                """
+            )
+        signals = [
+            {
+                "signal_id": int(r["signal_id"]),
+                "source": r["source"],
+                "author_handle": r["author_handle"],
+                "resolved_wallet": r["resolved_wallet"],
+                "posted_at": _v2_fmt_iso(r["posted_at"]),
+                "text": r["text"],
+                "intent": r["intent"],
+                "intent_confidence": float(r["intent_confidence"]) if r["intent_confidence"] is not None else None,
+                "parsed_market": r["parsed_market"],
+                "parsed_direction": r["parsed_direction"],
+                "age_s": int(r["age_s"] or 0),
+            }
+            for r in rows
+        ]
+        return {"signals": signals}
+    except Exception as exc:
+        logger.warning(f"api_periphery_social_feed failed: {exc}")
+        return {"signals": []}
 
 
 @app.get("/api/periphery/crossmarket/status")
 async def api_periphery_crossmarket_status():
-    return {
-        "kalshi":    {"reachable": False, "latency_p50_ms": None, "api_calls_24h": 0, "positions_observed": 0},
-        "manifold":  {"reachable": False, "latency_p50_ms": None, "api_calls_24h": 0, "positions_observed": 0},
-        "predictit": {"reachable": False, "latency_p50_ms": None, "api_calls_24h": 0, "positions_observed": 0},
+    """Cross-venue daemon liveness.
+
+    No DB table — daemons publish health to Redis keys
+    ``polybot:crossmarket:{venue}:health`` (JSON). Operator must wire the
+    R12 R&D daemons to publish there. Until that lands every venue
+    reports reachable=False.
+    """
+    out = {
+        venue: {"reachable": False, "latency_p50_ms": None, "api_calls_24h": 0, "positions_observed": 0}
+        for venue in ("kalshi", "manifold", "predictit")
     }
+    if _redis is None:
+        return out
+    try:
+        for venue in out:
+            try:
+                raw = await _redis.get(f"polybot:crossmarket:{venue}:health")
+                if raw:
+                    payload = json.loads(raw) if isinstance(raw, str) else json.loads(raw.decode())
+                    out[venue] = {
+                        "reachable": bool(payload.get("reachable", False)),
+                        "latency_p50_ms": payload.get("latency_p50_ms"),
+                        "api_calls_24h": int(payload.get("api_calls_24h", 0) or 0),
+                        "positions_observed": int(payload.get("positions_observed", 0) or 0),
+                    }
+            except Exception:
+                continue
+    except Exception as exc:
+        logger.warning(f"api_periphery_crossmarket_status failed: {exc}")
+    return out
 
 
 @app.get("/api/periphery/crossmarket/operators")
 async def api_periphery_crossmarket_operators():
-    return {"operators": []}
+    """Cross-market operator resolution table."""
+    try:
+        async with _pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT operator_id, polymarket_wallet, kalshi_account,
+                       manifold_handle, predictit_account, x_handle,
+                       resolution_source, confidence, resolved_at, notes
+                FROM cross_market_operators
+                ORDER BY confidence DESC, resolved_at DESC
+                LIMIT 100
+                """
+            )
+        ops = []
+        for r in rows:
+            conf = float(r["confidence"]) if r["confidence"] is not None else 0.0
+            ops.append({
+                "operator_id": int(r["operator_id"]),
+                "polymarket_wallet": r["polymarket_wallet"],
+                "kalshi_account": r["kalshi_account"],
+                "manifold_handle": r["manifold_handle"],
+                "predictit_account": r["predictit_account"],
+                "x_handle": r["x_handle"],
+                "resolution_source": r["resolution_source"],
+                "confidence": conf,
+                "resolved_at": _v2_fmt_iso(r["resolved_at"]),
+                "notes": r["notes"],
+                # Pending review when confidence is below the operator
+                # gate. Mirrors the cross_market_operators column header
+                # comment in migration 036 (fingerprint rows < threshold).
+                "is_pending_review": bool(conf < 0.8),
+            })
+        return {"operators": ops}
+    except Exception as exc:
+        logger.warning(f"api_periphery_crossmarket_operators failed: {exc}")
+        return {"operators": []}
 
 
 @app.post("/api/periphery/crossmarket/confirm/{op_id}")
 async def api_periphery_crossmarket_confirm(op_id: int):
     """Operator confirms an auto-suggested cross-market resolution.
 
-    Wires to src.cross_market.wallet_resolver.WalletResolver.confirm_match.
-    Currently a no-op stub.
+    Promotes a low-confidence fingerprint match to confirmed by setting
+    confidence to 1.0. The dashboard polls
+    ``/api/periphery/crossmarket/operators`` which keys
+    ``is_pending_review`` off confidence < 0.8.
     """
-    return {"ok": True, "operator_id": op_id}
+    try:
+        async with _pool.acquire() as conn:
+            result = await conn.execute(
+                """
+                UPDATE cross_market_operators
+                   SET confidence = 1.0
+                 WHERE operator_id = $1
+                """,
+                int(op_id),
+            )
+        ok = False
+        try:
+            ok = int(str(result).split()[-1]) > 0
+        except Exception:
+            ok = True
+        return {"ok": ok, "operator_id": int(op_id)}
+    except Exception as exc:
+        logger.warning(f"api_periphery_crossmarket_confirm failed: {exc}")
+        return {"ok": False, "operator_id": int(op_id)}
 
 
 # --- Intelligence (R8 Lens, R9 Web, R10 Causal) ---------------------------
@@ -1403,52 +2150,379 @@ async def api_periphery_crossmarket_confirm(op_id: int):
 
 @app.get("/api/intelligence/lens/distribution")
 async def api_intelligence_lens_distribution():
-    return {
-        "total": 0,
-        "trained_classes": None,
-        "cohens_kappa": None,
-        "drift_alerts_24h": 0,
-        "by_class": {},
-        "drift_rows": [],
-        "drift_cols": [],
-        "drift_values": [],
-    }
+    """R8 strategy distribution + drift heatmap."""
+    try:
+        async with _pool.acquire() as conn:
+            total = await conn.fetchval(
+                "SELECT COUNT(DISTINCT wallet_address)::int FROM leader_strategy_history"
+            ) or 0
+            trained_classes = await conn.fetchval(
+                "SELECT COUNT(DISTINCT primary_strategy)::int FROM strategy_labels"
+            )
+            drift_alerts_24h = await conn.fetchval(
+                """
+                SELECT COUNT(*)::int FROM model_drift_streak
+                WHERE model = 'strategy_class'
+                  AND last_breach_at >= CURRENT_DATE - INTERVAL '1 day'
+                """
+            ) or 0
+            by_class_rows = await conn.fetch(
+                """
+                SELECT primary_strategy, COUNT(*)::int AS n
+                FROM (
+                  SELECT DISTINCT ON (wallet_address)
+                         wallet_address, primary_strategy
+                  FROM leader_strategy_history
+                  ORDER BY wallet_address, classified_at DESC
+                ) sub
+                GROUP BY primary_strategy
+                """
+            )
+            # Drift heatmap: per-(wallet, day) drift score for top-20
+            # most-active wallets over the last 7 days.
+            drift_rows = await conn.fetch(
+                """
+                WITH top_wallets AS (
+                  SELECT wallet_address
+                  FROM leader_strategy_history
+                  WHERE classified_at >= NOW() - INTERVAL '7 days'
+                  GROUP BY wallet_address
+                  ORDER BY COUNT(*) DESC
+                  LIMIT 20
+                )
+                SELECT lsh.wallet_address,
+                       DATE_TRUNC('day', lsh.classified_at) AS day,
+                       AVG(COALESCE(lsh.drift_js_divergence, 0))::float AS val
+                FROM leader_strategy_history lsh
+                JOIN top_wallets tw ON tw.wallet_address = lsh.wallet_address
+                WHERE lsh.classified_at >= NOW() - INTERVAL '7 days'
+                GROUP BY lsh.wallet_address, DATE_TRUNC('day', lsh.classified_at)
+                ORDER BY lsh.wallet_address, day
+                """
+            )
+        by_class: dict[str, int] = {row["primary_strategy"]: int(row["n"]) for row in by_class_rows}
+
+        # Build the wallet × day matrix.
+        wallets_seen: list[str] = []
+        days_seen: list[str] = []
+        cell_map: dict[tuple[str, str], float] = {}
+        for r in drift_rows:
+            w = r["wallet_address"]
+            d = r["day"].strftime("%a") if r["day"] else ""
+            if w not in wallets_seen:
+                wallets_seen.append(w)
+            if d and d not in days_seen:
+                days_seen.append(d)
+            cell_map[(w, d)] = float(r["val"] or 0.0)
+        # Force 7-day column order Mon..Sun for stable heatmap.
+        day_order = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+        cols = [d for d in day_order if d in days_seen] or days_seen
+        matrix: list[list[float]] = []
+        for w in wallets_seen:
+            matrix.append([cell_map.get((w, d), 0.0) for d in cols])
+
+        return {
+            "total": int(total),
+            "trained_classes": int(trained_classes) if trained_classes is not None else None,
+            "cohens_kappa": None,  # Optional helper not yet implemented.
+            "drift_alerts_24h": int(drift_alerts_24h),
+            "by_class": by_class,
+            "drift_rows": [{"wallet": w} for w in wallets_seen],
+            "drift_cols": cols,
+            "drift_values": matrix,
+        }
+    except Exception as exc:
+        logger.warning(f"api_intelligence_lens_distribution failed: {exc}")
+        return {
+            "total": 0,
+            "trained_classes": None,
+            "cohens_kappa": None,
+            "drift_alerts_24h": 0,
+            "by_class": {},
+            "drift_rows": [],
+            "drift_cols": [],
+            "drift_values": [],
+        }
 
 
 @app.get("/api/intelligence/lens/labels/pending")
 async def api_intelligence_lens_labels_pending():
-    return {"wallets": []}
+    """High-confidence classifier outputs awaiting a hand label."""
+    try:
+        async with _pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT DISTINCT ON (lsh.wallet_address)
+                       lsh.wallet_address AS wallet,
+                       lsh.primary_strategy AS suggested,
+                       lsh.confidence::float AS confidence
+                FROM leader_strategy_history lsh
+                LEFT JOIN strategy_labels sl
+                       ON sl.wallet_address = lsh.wallet_address
+                WHERE sl.label_id IS NULL
+                  AND lsh.confidence > 0.7
+                ORDER BY lsh.wallet_address, lsh.confidence DESC
+                LIMIT 50
+                """
+            )
+        wallets = [
+            {
+                "wallet": r["wallet"],
+                "suggested": r["suggested"],
+                "confidence": float(r["confidence"]) if r["confidence"] is not None else None,
+            }
+            for r in rows
+        ]
+        return {"wallets": wallets}
+    except Exception as exc:
+        logger.warning(f"api_intelligence_lens_labels_pending failed: {exc}")
+        return {"wallets": []}
 
 
 @app.get("/api/intelligence/web/summary")
 async def api_intelligence_web_summary():
-    return {
-        "active_fits": 0,
-        "accepted_couplings": 0,
-        "kalman_updates_24h": 0,
-        "forecasts_24h": 0,
-        "alpha": {"row_labels": [], "col_labels": [], "matrix": []},
-        "kalman": [],
-        "forecast": None,
-    }
+    """R9 multivariate Hawkes + Kalman summary."""
+    try:
+        async with _pool.acquire() as conn:
+            active_fits = await conn.fetchval(
+                """
+                SELECT COUNT(DISTINCT leader_wallet)::int
+                FROM multivariate_hawkes_fits
+                WHERE fit_at >= NOW() - INTERVAL '7 days'
+                """
+            ) or 0
+            # Count accepted couplings across all recent fits — sum the
+            # number of TRUE values in accepted_couplings_json.
+            accepted_couplings_raw = await conn.fetch(
+                """
+                SELECT accepted_couplings_json
+                FROM multivariate_hawkes_fits
+                WHERE fit_at >= NOW() - INTERVAL '7 days'
+                  AND accepted_couplings_json IS NOT NULL
+                """
+            )
+            accepted = 0
+            for r in accepted_couplings_raw:
+                payload = r["accepted_couplings_json"]
+                if isinstance(payload, str):
+                    try:
+                        payload = json.loads(payload)
+                    except Exception:
+                        payload = {}
+                if isinstance(payload, dict):
+                    accepted += sum(1 for v in payload.values() if bool(v))
+            kalman_updates_24h = await conn.fetchval(
+                """
+                SELECT COUNT(*)::int FROM follower_pool_state_history
+                WHERE snapshot_at >= NOW() - INTERVAL '24 hours'
+                """
+            ) or 0
+            # Latest converged multivariate fit — render its α matrix.
+            latest_fit = await conn.fetchrow(
+                """
+                SELECT leader_wallet, alpha_matrix_json, pool_classes
+                FROM multivariate_hawkes_fits
+                WHERE convergence = 'converged'
+                ORDER BY fit_at DESC
+                LIMIT 1
+                """
+            )
+            alpha = {"row_labels": [], "col_labels": [], "matrix": []}
+            kalman_rows: list[dict] = []
+            if latest_fit:
+                pool_classes = (latest_fit["pool_classes"] or "").split(",")
+                pool_classes = [p.strip() for p in pool_classes if p.strip()]
+                labels = ["leader"] + pool_classes
+                alpha_payload = latest_fit["alpha_matrix_json"]
+                if isinstance(alpha_payload, str):
+                    try:
+                        alpha_payload = json.loads(alpha_payload)
+                    except Exception:
+                        alpha_payload = {}
+                if not isinstance(alpha_payload, dict):
+                    alpha_payload = {}
+                # alpha_matrix_json keyed by "(i,j)" → float.
+                n = len(labels)
+                matrix = [[0.0] * n for _ in range(n)]
+                for key, val in alpha_payload.items():
+                    try:
+                        i, j = key.strip("()").split(",")
+                        ii, jj = int(i), int(j)
+                        if 0 <= ii < n and 0 <= jj < n:
+                            matrix[ii][jj] = float(val)
+                    except Exception:
+                        continue
+                alpha = {"row_labels": labels, "col_labels": labels, "matrix": matrix}
+                kalman_rows_raw = await conn.fetch(
+                    """
+                    SELECT pool_class AS pool,
+                           pool_size_usdc,
+                           recent_response_pct,
+                           decay_rate,
+                           n_observations
+                    FROM follower_pool_state
+                    WHERE leader_wallet = $1
+                    ORDER BY updated_at DESC
+                    LIMIT 4
+                    """,
+                    latest_fit["leader_wallet"],
+                )
+                for kr in kalman_rows_raw:
+                    kalman_rows.append({
+                        "pool": kr["pool"],
+                        "pool_size_usdc": float(kr["pool_size_usdc"]) if kr["pool_size_usdc"] is not None else None,
+                        "recent_response_pct": float(kr["recent_response_pct"]) if kr["recent_response_pct"] is not None else None,
+                        "decay_rate": float(kr["decay_rate"]) if kr["decay_rate"] is not None else None,
+                        "n_observations": int(kr["n_observations"] or 0),
+                    })
+        return {
+            "active_fits": int(active_fits),
+            "accepted_couplings": int(accepted),
+            "kalman_updates_24h": int(kalman_updates_24h),
+            # Forecasts are computed on-demand by the R9 daemon; no
+            # persistence table yet (see ROUND_9_MULTIVARIATE_HAWKES.md
+            # § 3.3). Surface as 0 with forecast=None.
+            "forecasts_24h": 0,
+            "alpha": alpha,
+            "kalman": kalman_rows,
+            "forecast": None,
+        }
+    except Exception as exc:
+        logger.warning(f"api_intelligence_web_summary failed: {exc}")
+        return {
+            "active_fits": 0,
+            "accepted_couplings": 0,
+            "kalman_updates_24h": 0,
+            "forecasts_24h": 0,
+            "alpha": {"row_labels": [], "col_labels": [], "matrix": []},
+            "kalman": [],
+            "forecast": None,
+        }
 
 
 @app.get("/api/intelligence/causal/scatter")
 async def api_intelligence_causal_scatter():
-    return {
-        "estimates_24h": 0,
-        "wu_hausman_pass_rate": 0.0,
-        "first_stage_pass_rate": 0.0,
-        "disagreement_pct": 0.0,
-        "points": [],
-        "wu_hausman_histogram": [],
-        "first_stage_f_histogram": [],
-    }
+    """R10 IV vs Hawkes scatter + diagnostic histograms."""
+    try:
+        async with _pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT leader_wallet, pool_class,
+                       hawkes_alpha_mu_ratio, causal_ate,
+                       causal_ate_ci_low, causal_ate_ci_high,
+                       wu_hausman_p, first_stage_f,
+                       estimated_at
+                FROM causal_estimates
+                WHERE estimated_at >= NOW() - INTERVAL '7 days'
+                ORDER BY estimated_at DESC
+                LIMIT 500
+                """
+            )
+        points = []
+        wh_vals = []
+        f_vals = []
+        recent_24h = 0
+        wh_pass = 0
+        fs_pass = 0
+        disagree = 0
+        now_aware = datetime.now(timezone.utc)
+        for r in rows:
+            est_at = r["estimated_at"]
+            if est_at and (now_aware - est_at).total_seconds() <= 86400:
+                recent_24h += 1
+            ratio = float(r["hawkes_alpha_mu_ratio"]) if r["hawkes_alpha_mu_ratio"] is not None else None
+            ate = float(r["causal_ate"]) if r["causal_ate"] is not None else None
+            ate_hi = float(r["causal_ate_ci_high"]) if r["causal_ate_ci_high"] is not None else None
+            wh_p = float(r["wu_hausman_p"]) if r["wu_hausman_p"] is not None else None
+            fs_f = float(r["first_stage_f"]) if r["first_stage_f"] is not None else None
+            if wh_p is not None:
+                wh_vals.append(wh_p)
+                if wh_p < 0.05:
+                    wh_pass += 1
+            if fs_f is not None:
+                f_vals.append(fs_f)
+                if fs_f > 10:
+                    fs_pass += 1
+            if ratio is not None and ate_hi is not None and ratio > 1.0 and ate_hi < 0.1:
+                disagree += 1
+            points.append({
+                "leader_wallet": r["leader_wallet"],
+                "pool_class": r["pool_class"],
+                "hawkes_alpha_mu_ratio": ratio,
+                "causal_ate": ate,
+                "causal_ate_ci_low": float(r["causal_ate_ci_low"]) if r["causal_ate_ci_low"] is not None else None,
+                "causal_ate_ci_high": ate_hi,
+                "wu_hausman_p": wh_p,
+                "first_stage_f": fs_f,
+            })
+        total = len(rows)
+        wh_pass_rate = (wh_pass / total) if total > 0 else 0.0
+        fs_pass_rate = (fs_pass / total) if total > 0 else 0.0
+        disagreement_pct = (disagree / total) if total > 0 else 0.0
+        # 10-bin histograms.
+        def _hist(values, lo, hi, bins=10):
+            out = [0] * bins
+            if not values:
+                return out
+            width = (hi - lo) / bins
+            for v in values:
+                if v is None:
+                    continue
+                idx = int((v - lo) / width) if width > 0 else 0
+                if idx < 0:
+                    idx = 0
+                if idx >= bins:
+                    idx = bins - 1
+                out[idx] += 1
+            return out
+        wu_hausman_histogram = _hist(wh_vals, 0.0, 1.0, 10)
+        # First-stage F can grow large — bucket by log scale up to F=100.
+        f_log = [v for v in f_vals if v is not None and v > 0]
+        first_stage_f_histogram = _hist(f_log, 0.0, 100.0, 10)
+        return {
+            "estimates_24h": recent_24h,
+            "wu_hausman_pass_rate": float(wh_pass_rate),
+            "first_stage_pass_rate": float(fs_pass_rate),
+            "disagreement_pct": float(disagreement_pct),
+            "points": points,
+            "wu_hausman_histogram": wu_hausman_histogram,
+            "first_stage_f_histogram": first_stage_f_histogram,
+        }
+    except Exception as exc:
+        logger.warning(f"api_intelligence_causal_scatter failed: {exc}")
+        return {
+            "estimates_24h": 0,
+            "wu_hausman_pass_rate": 0.0,
+            "first_stage_pass_rate": 0.0,
+            "disagreement_pct": 0.0,
+            "points": [],
+            "wu_hausman_histogram": [],
+            "first_stage_f_histogram": [],
+        }
 
 
 @app.get("/api/intelligence/causal/instruments")
 async def api_intelligence_causal_instruments():
-    return {"events": []}
+    """R10 instrumental events for the last 24h."""
+    try:
+        async with _pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT event_type, event_time
+                FROM instrumental_events
+                WHERE event_time >= NOW() - INTERVAL '24 hours'
+                ORDER BY event_time DESC
+                LIMIT 500
+                """
+            )
+        events = [
+            {"type": r["event_type"], "time": _v2_fmt_iso(r["event_time"])}
+            for r in rows
+        ]
+        return {"events": events}
+    except Exception as exc:
+        logger.warning(f"api_intelligence_causal_instruments failed: {exc}")
+        return {"events": []}
 
 
 # --- Wallet Lab (R6 universe + augmented profile) -------------------------
@@ -1458,36 +2532,169 @@ async def api_intelligence_causal_instruments():
 async def api_wallet_universe(limit: int = 200):
     """R6 wallet_universe browser. Joins on depth_tier + strategy_class
     where available."""
-    return {
-        "total": 0,
-        "tier_0": 0,
-        "tier_1": 0,
-        "tier_2": 0,
-        "last_crawl_at": None,
-        "wallets": [],
-        "limit": limit,
-    }
+    try:
+        limit = max(1, min(int(limit), 1000))
+        async with _pool.acquire() as conn:
+            stats_row = await conn.fetchrow(
+                """
+                SELECT COUNT(*)::int AS total,
+                       COUNT(*) FILTER (WHERE depth_tier = 0)::int AS tier_0,
+                       COUNT(*) FILTER (WHERE depth_tier = 1)::int AS tier_1,
+                       COUNT(*) FILTER (WHERE depth_tier = 2)::int AS tier_2,
+                       MAX(last_active) AS last_crawl_at
+                FROM wallet_universe
+                """
+            )
+            total = int(stats_row["total"] or 0) if stats_row else 0
+            tier_0 = int(stats_row["tier_0"] or 0) if stats_row else 0
+            tier_1 = int(stats_row["tier_1"] or 0) if stats_row else 0
+            tier_2 = int(stats_row["tier_2"] or 0) if stats_row else 0
+            last_crawl_at = stats_row["last_crawl_at"] if stats_row else None
+            rows = await conn.fetch(
+                """
+                SELECT wu.wallet_address,
+                       wu.depth_tier,
+                       wu.total_trades_ever AS trades_30d,
+                       wu.total_volume_usdc_ever AS volume_30d_usdc,
+                       wu.last_active AS last_seen,
+                       latest.primary_strategy AS strategy_class
+                FROM wallet_universe wu
+                LEFT JOIN LATERAL (
+                    SELECT primary_strategy
+                    FROM leader_strategy_history lsh
+                    WHERE lsh.wallet_address = wu.wallet_address
+                    ORDER BY lsh.classified_at DESC
+                    LIMIT 1
+                ) latest ON TRUE
+                ORDER BY wu.depth_tier ASC, wu.total_volume_usdc_ever DESC
+                LIMIT $1
+                """,
+                limit,
+            )
+        wallets = []
+        for r in rows:
+            wallets.append({
+                "wallet_address": r["wallet_address"],
+                "depth_tier": int(r["depth_tier"]) if r["depth_tier"] is not None else None,
+                "trades_30d": int(r["trades_30d"]) if r["trades_30d"] is not None else None,
+                "volume_30d_usdc": float(r["volume_30d_usdc"]) if r["volume_30d_usdc"] is not None else None,
+                "last_seen": _v2_fmt_iso(r["last_seen"]),
+                "strategy_class": r["strategy_class"],
+            })
+        return {
+            "total": int(total),
+            "tier_0": tier_0,
+            "tier_1": tier_1,
+            "tier_2": tier_2,
+            "last_crawl_at": _v2_fmt_iso(last_crawl_at),
+            "wallets": wallets,
+            "limit": limit,
+        }
+    except Exception as exc:
+        logger.warning(f"api_wallet_universe failed: {exc}")
+        return {
+            "total": 0,
+            "tier_0": 0,
+            "tier_1": 0,
+            "tier_2": 0,
+            "last_crawl_at": None,
+            "wallets": [],
+            "limit": limit,
+        }
 
 
 @app.get("/api/wallet/{wallet}/strategy")
 async def api_wallet_strategy(wallet: str):
     """R8 strategy fingerprint per wallet — 9-class probability vector."""
-    return {"wallet": wallet, "probs": {}, "last_trained_at": None, "drift_score": None}
+    try:
+        async with _pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                SELECT primary_strategy, confidence, classified_at, strategy_probs,
+                       drift_js_divergence
+                FROM leader_strategy_history
+                WHERE wallet_address = $1
+                ORDER BY classified_at DESC
+                LIMIT 1
+                """,
+                wallet,
+            )
+        if not row:
+            return {"wallet": wallet, "probs": {}, "last_trained_at": None, "drift_score": None}
+        probs_payload = row["strategy_probs"]
+        if isinstance(probs_payload, str):
+            try:
+                probs_payload = json.loads(probs_payload)
+            except Exception:
+                probs_payload = {}
+        if not isinstance(probs_payload, dict):
+            probs_payload = {}
+        # Normalize all known classes (zeros for missing).
+        probs = {cls: float(probs_payload.get(cls, 0.0) or 0.0) for cls in _V2_STRATEGY_CLASSES}
+        return {
+            "wallet": wallet,
+            "primary_strategy": row["primary_strategy"],
+            "confidence": float(row["confidence"]) if row["confidence"] is not None else None,
+            "probs": probs,
+            "last_trained_at": _v2_fmt_iso(row["classified_at"]),
+            "drift_score": float(row["drift_js_divergence"]) if row["drift_js_divergence"] is not None else None,
+        }
+    except Exception as exc:
+        logger.warning(f"api_wallet_strategy failed: {exc}")
+        return {"wallet": wallet, "probs": {}, "last_trained_at": None, "drift_score": None}
 
 
 @app.get("/api/wallet/{wallet}/microstructure")
 async def api_wallet_microstructure(wallet: str):
     """R11 per-wallet microstructure signature."""
-    return {
-        "wallet": wallet,
-        "cancel_to_fill_ratio_30d": None,
-        "iceberg_score_30d": None,
-        "spoof_score_30d": None,
-        "place_to_fill_seconds_p50": None,
-        "place_to_fill_seconds_p99": None,
-        "n_orders_30d": None,
-        "n_fills_30d": None,
-    }
+    try:
+        async with _pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                SELECT cancel_to_fill_ratio_30d, iceberg_score_30d, spoof_score_30d,
+                       place_to_fill_seconds_p50, place_to_fill_seconds_p99,
+                       n_orders_30d, n_fills_30d, rollup_at
+                FROM wallet_microstructure_signature
+                WHERE wallet_address = $1
+                ORDER BY rollup_at DESC
+                LIMIT 1
+                """,
+                wallet,
+            )
+        if not row:
+            return {
+                "wallet": wallet,
+                "cancel_to_fill_ratio_30d": None,
+                "iceberg_score_30d": None,
+                "spoof_score_30d": None,
+                "place_to_fill_seconds_p50": None,
+                "place_to_fill_seconds_p99": None,
+                "n_orders_30d": None,
+                "n_fills_30d": None,
+            }
+        return {
+            "wallet": wallet,
+            "cancel_to_fill_ratio_30d": float(row["cancel_to_fill_ratio_30d"]) if row["cancel_to_fill_ratio_30d"] is not None else None,
+            "iceberg_score_30d": float(row["iceberg_score_30d"]) if row["iceberg_score_30d"] is not None else None,
+            "spoof_score_30d": float(row["spoof_score_30d"]) if row["spoof_score_30d"] is not None else None,
+            "place_to_fill_seconds_p50": float(row["place_to_fill_seconds_p50"]) if row["place_to_fill_seconds_p50"] is not None else None,
+            "place_to_fill_seconds_p99": float(row["place_to_fill_seconds_p99"]) if row["place_to_fill_seconds_p99"] is not None else None,
+            "n_orders_30d": int(row["n_orders_30d"]) if row["n_orders_30d"] is not None else None,
+            "n_fills_30d": int(row["n_fills_30d"]) if row["n_fills_30d"] is not None else None,
+            "rollup_at": _v2_fmt_iso(row["rollup_at"]),
+        }
+    except Exception as exc:
+        logger.warning(f"api_wallet_microstructure failed: {exc}")
+        return {
+            "wallet": wallet,
+            "cancel_to_fill_ratio_30d": None,
+            "iceberg_score_30d": None,
+            "spoof_score_30d": None,
+            "place_to_fill_seconds_p50": None,
+            "place_to_fill_seconds_p99": None,
+            "n_orders_30d": None,
+            "n_fills_30d": None,
+        }
 
 
 # --- Execution + Operations rollups ----------------------------------------
@@ -1495,15 +2702,68 @@ async def api_wallet_microstructure(wallet: str):
 
 @app.get("/api/execution/summary")
 async def api_execution_summary():
-    return {
-        "positions_open": 0,
-        "max_positions": 10,
-        "filled_24h": 0,
-        "shadow_24h": 0,
-        "decisions_per_hour": 0,
-        "actionable": 0,
-        "net_pnl": 0.0,
-    }
+    """Execution + decision rollups for the EXECUTION tab KPI strip."""
+    try:
+        max_positions = int(getattr(settings, "MAX_CONCURRENT_POSITIONS", 10) or 10)
+        async with _pool.acquire() as conn:
+            positions_open = await conn.fetchval(
+                "SELECT COUNT(*)::int FROM paper_trades WHERE status = 'open'"
+            ) or 0
+            filled_24h = await conn.fetchval(
+                """
+                SELECT COUNT(*)::int FROM decision_log
+                WHERE action IN ('follow', 'fade')
+                  AND time >= NOW() - INTERVAL '24 hours'
+                """
+            ) or 0
+            shadow_24h = await conn.fetchval(
+                """
+                SELECT COUNT(*)::int FROM mempool_observations
+                WHERE fire_result = 'shadow'
+                  AND intent_received_at >= NOW() - INTERVAL '24 hours'
+                """
+            ) or 0
+            # Decisions per hour over the last hour (rate).
+            decisions_last_hour = await conn.fetchval(
+                """
+                SELECT COUNT(*)::int FROM decision_log
+                WHERE time >= NOW() - INTERVAL '1 hour'
+                """
+            ) or 0
+            actionable = await conn.fetchval(
+                """
+                SELECT COUNT(*)::int FROM decision_log
+                WHERE action IN ('follow', 'fade')
+                  AND time >= NOW() - INTERVAL '1 hour'
+                """
+            ) or 0
+            net_pnl = await conn.fetchval(
+                """
+                SELECT COALESCE(SUM(pnl_usdc), 0)::float
+                FROM paper_trades
+                WHERE status = 'closed'
+                """
+            ) or 0.0
+        return {
+            "positions_open": int(positions_open),
+            "max_positions": max_positions,
+            "filled_24h": int(filled_24h),
+            "shadow_24h": int(shadow_24h),
+            "decisions_per_hour": int(decisions_last_hour),
+            "actionable": int(actionable),
+            "net_pnl": float(net_pnl),
+        }
+    except Exception as exc:
+        logger.warning(f"api_execution_summary failed: {exc}")
+        return {
+            "positions_open": 0,
+            "max_positions": 10,
+            "filled_24h": 0,
+            "shadow_24h": 0,
+            "decisions_per_hour": 0,
+            "actionable": 0,
+            "net_pnl": 0.0,
+        }
 
 
 # --- Calibration (R13) ----------------------------------------------------
@@ -1512,29 +2772,149 @@ async def api_execution_summary():
 @app.get("/api/calibration/losses")
 async def api_calibration_losses(days: int = 30):
     """Per-model loss trajectory for the OPERATIONS / Calibration chart."""
-    return {"series": [], "days": days}
+    try:
+        days = max(1, min(int(days), 365))
+        async with _pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT model, strategy_class, measured_at,
+                       brier_score, log_loss, mape, ci_coverage
+                FROM calibration_loss_history
+                WHERE measured_at >= CURRENT_DATE - ($1::int || ' days')::interval
+                  AND strategy_class IS NULL
+                ORDER BY model, measured_at
+                """,
+                days,
+            )
+        series_map: dict[str, list[dict]] = {}
+        for r in rows:
+            model = r["model"]
+            col = _v2_loss_column_for(model)
+            val = r[col]
+            if val is None:
+                continue
+            series_map.setdefault(model, []).append({
+                "day": r["measured_at"].isoformat() if r["measured_at"] else None,
+                "loss": float(val),
+            })
+        series = [{"model": m, "points": pts} for m, pts in series_map.items()]
+        return {"series": series, "days": days}
+    except Exception as exc:
+        logger.warning(f"api_calibration_losses failed: {exc}")
+        return {"series": [], "days": days}
 
 
 @app.get("/api/calibration/drift")
 async def api_calibration_drift():
-    """Per-model drift gauges."""
-    return {"models": []}
+    """Per-model drift gauges with today's z-score + protected/disabled flags."""
+    try:
+        async with _pool.acquire() as conn:
+            # Union of every model the system has ever seen.
+            model_rows = await conn.fetch(
+                """
+                SELECT model FROM model_drift_streak
+                UNION
+                SELECT model FROM model_disable_state
+                UNION
+                SELECT DISTINCT model FROM calibration_loss_history WHERE strategy_class IS NULL
+                """
+            )
+            models = sorted({r["model"] for r in model_rows if r["model"]})
+            disabled_rows = await conn.fetch(
+                "SELECT model, is_disabled FROM model_disable_state"
+            )
+            disabled_map = {r["model"]: bool(r["is_disabled"]) for r in disabled_rows}
+            out_models = []
+            for model in models:
+                col = _v2_loss_column_for(model)
+                stats = await conn.fetchrow(
+                    f"""
+                    SELECT AVG({col})::float AS mean,
+                           STDDEV_POP({col})::float AS std,
+                           (
+                             SELECT {col}::float FROM calibration_loss_history
+                             WHERE model = $1 AND strategy_class IS NULL
+                             ORDER BY measured_at DESC LIMIT 1
+                           ) AS today
+                    FROM calibration_loss_history
+                    WHERE model = $1 AND strategy_class IS NULL
+                      AND measured_at >= CURRENT_DATE - INTERVAL '30 days'
+                    """,
+                    model,
+                )
+                z_score = None
+                if stats and stats["today"] is not None and stats["mean"] is not None and stats["std"]:
+                    try:
+                        z_score = float((stats["today"] - stats["mean"]) / stats["std"])
+                    except Exception:
+                        z_score = None
+                out_models.append({
+                    "model": model,
+                    "z_score": z_score,
+                    "protected": model in _V2_PROTECTED_MODELS,
+                    "disabled": disabled_map.get(model, False),
+                })
+        return {"models": out_models}
+    except Exception as exc:
+        logger.warning(f"api_calibration_drift failed: {exc}")
+        return {"models": []}
 
 
 @app.get("/api/calibration/disabled")
 async def api_calibration_disabled():
     """List of currently disabled models."""
-    return {"rows": []}
+    try:
+        async with _pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT model, disabled_at, disabled_reason, auto_or_manual
+                FROM model_disable_state
+                WHERE is_disabled = TRUE
+                ORDER BY disabled_at DESC NULLS LAST
+                LIMIT 50
+                """
+            )
+        out = [
+            {
+                "model": r["model"],
+                "disabled_at": _v2_fmt_iso(r["disabled_at"]),
+                "disabled_reason": r["disabled_reason"],
+                "auto_or_manual": r["auto_or_manual"] or "auto",
+            }
+            for r in rows
+        ]
+        return {"rows": out}
+    except Exception as exc:
+        logger.warning(f"api_calibration_disabled failed: {exc}")
+        return {"rows": []}
 
 
 @app.post("/api/calibration/disable/{model}")
 async def api_calibration_disable(model: str):
-    return {"ok": True, "model": model, "auto_or_manual": "manual"}
+    """Manually disable a model via ModelAutoDisabler."""
+    try:
+        from src.calibration.auto_disable import get_auto_disabler
+        await get_auto_disabler().disable_model(
+            model=model,
+            reason="manual operator override",
+            auto_or_manual="manual",
+        )
+        return {"ok": True, "model": model, "auto_or_manual": "manual"}
+    except Exception as exc:
+        logger.warning(f"api_calibration_disable failed for {model!r}: {exc}")
+        return {"ok": False, "model": model, "auto_or_manual": "manual"}
 
 
 @app.post("/api/calibration/enable/{model}")
 async def api_calibration_enable(model: str):
-    return {"ok": True, "model": model}
+    """Manually re-enable a model via ModelAutoDisabler."""
+    try:
+        from src.calibration.auto_disable import get_auto_disabler
+        await get_auto_disabler().enable_model(model)
+        return {"ok": True, "model": model}
+    except Exception as exc:
+        logger.warning(f"api_calibration_enable failed for {model!r}: {exc}")
+        return {"ok": False, "model": model}
 
 
 # --- Research (R13 § 3.5) -------------------------------------------------
@@ -1544,7 +2924,10 @@ async def api_calibration_enable(model: str):
 async def api_research_notebook_run(notebook_id: str):
     """Kicks a `jupyter nbconvert --execute` for the notebook.
 
-    Currently a no-op stub. Operator must implement the run dispatcher.
+    Currently a no-op stub. Operator must implement the run dispatcher
+    (papermill subprocess in a worker, status pushed via Redis). Until
+    that lands the v2 NotebookTile just shows "Run queued" optimistically
+    but no execution actually happens.
     """
     return {"ok": True, "notebook_id": notebook_id, "queued": False}
 
