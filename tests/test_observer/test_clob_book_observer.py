@@ -150,12 +150,18 @@ class TestDecodeWsMessage:
 
 class TestBackpressure:
     @pytest.mark.asyncio
-    async def test_50001st_event_drops_oldest(self, redis_client):
+    async def test_50001st_event_drops_oldest(self, redis_client, monkeypatch):
         """50,001st event into a 50,000-capacity queue must drop the
         OLDEST event (per spec § 3.1), NOT the incoming one. Verify by
         ensuring the queue still contains the most-recent N events and
         the dropped counter incremented exactly once.
+
+        Sprint 3 (R11 rollup-only): the default is to skip ``_db_queue``
+        entirely. This test asserts the legacy DB-queue path so we flip
+        the flag back on via monkeypatch.
         """
+        from src.config import settings
+        monkeypatch.setattr(settings, "CLOB_BOOK_PERSIST_RAW", True)
         # Bound the queue small (50) so the test runs fast; the
         # semantic is identical at 50_000.
         observer = CLOBBookObserver(
@@ -190,11 +196,16 @@ class TestBackpressure:
 
     @pytest.mark.asyncio
     async def test_n_events_above_capacity_increment_drop_counter(
-        self, redis_client
+        self, redis_client, monkeypatch
     ):
         """Pushing 60 events into a 50-slot queue produces exactly 10
         drops (40 fit + 10 over capacity → 10 evictions on the
-        oldest-drop semantic)."""
+        oldest-drop semantic).
+
+        Sprint 3: legacy DB-queue path — flip the flag on.
+        """
+        from src.config import settings
+        monkeypatch.setattr(settings, "CLOB_BOOK_PERSIST_RAW", True)
         # Notably the deque applies oldest-drop on each push past
         # capacity, so each event after the 50th evicts one older.
         observer = CLOBBookObserver(
@@ -217,10 +228,18 @@ class TestBackpressure:
 
 class TestWalletAttribution:
     @pytest.mark.asyncio
-    async def test_placement_wallet_null_preserved(self, redis_client):
+    async def test_placement_wallet_null_preserved(self, redis_client, monkeypatch):
         """The observer must NOT invent a wallet for placement events
         (spec § 3.1 — Polymarket WS doesn't ship one). Downstream joins
-        with trades_observed handle the attribution."""
+        with trades_observed handle the attribution.
+
+        Sprint 3: this assertion is about the BookEvent payload, not the
+        sink. We flip CLOB_BOOK_PERSIST_RAW=True so the legacy
+        ``_db_queue`` reception is exercised; the same NULL preservation
+        also holds on ``_stream_queue`` (single decode path).
+        """
+        from src.config import settings
+        monkeypatch.setattr(settings, "CLOB_BOOK_PERSIST_RAW", True)
         observer = CLOBBookObserver(
             redis_client=redis_client,
             ws_factory=None,

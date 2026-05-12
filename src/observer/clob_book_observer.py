@@ -171,7 +171,13 @@ class CLOBBookObserver:
         self._stop_event.clear()
         if self._ws_factory is not None:
             self._ws_task = asyncio.create_task(self._ws_reader_loop())
-        self._writer_task = asyncio.create_task(self._db_writer_loop())
+        # Sprint 3: `_db_writer_loop` only runs when CLOB_BOOK_PERSIST_RAW
+        # is True. Default is False (rollup-only mode) — the Redis stream
+        # path stays active so the microstructure deriver still gets
+        # every event, but no row hits `clob_book_events`. See R11 spec
+        # § 2.3 (13 GB/day raw vs ~100 MB/day rollup).
+        if bool(getattr(settings, "CLOB_BOOK_PERSIST_RAW", False)):
+            self._writer_task = asyncio.create_task(self._db_writer_loop())
         self._stream_task = asyncio.create_task(self._stream_publisher_loop())
 
     async def stop(self) -> None:
@@ -230,16 +236,30 @@ class CLOBBookObserver:
         oldest entry. The spec § 6 acceptance gate
         ``polybot_book_events_dropped_total{reason="queue_full"} = 0``
         is defined per ingest event, not per sink overflow.
+
+        Sprint 3 (R11 rollup-only): when ``CLOB_BOOK_PERSIST_RAW`` is
+        False (default) we don't bother feeding ``_db_queue`` — no
+        writer task is running and an unbounded growth there would be
+        a slow leak. The stream queue still gets the event so the
+        microstructure deriver runs unchanged.
         """
+        persist_raw = bool(getattr(settings, "CLOB_BOOK_PERSIST_RAW", False))
         any_dropped = False
-        for q in (self._db_queue, self._stream_queue):
+        queues = (
+            (self._db_queue, self._stream_queue) if persist_raw else (self._stream_queue,)
+        )
+        for q in queues:
             if self._push_with_oldest_drop(q, event):
                 any_dropped = True
         if any_dropped:
             self.events_dropped_queue_full += 1
             book_events_dropped_total.labels(reason="queue_full").inc()
         try:
-            book_queue_depth.set(len(self._db_queue))
+            # Report stream-queue depth in rollup-only mode so the gauge
+            # still reflects backpressure on the active sink.
+            book_queue_depth.set(
+                len(self._db_queue if persist_raw else self._stream_queue)
+            )
         except Exception:  # pragma: no cover
             pass
         self._queue_event.set()

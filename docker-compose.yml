@@ -237,6 +237,102 @@ services:
       start_period: 60s
       retries: 3
 
+  # ----------------------------------------------------------------- #
+  # Sprint 3 — Enrichments (R11 + R12 + R7).                          #
+  # All under `--profile sprint3`. Activate with                       #
+  #   docker compose --profile sprint3 up -d --no-deps <service>       #
+  # `--no-deps` mandatory to avoid the db/redis cascade-recreate that  #
+  # bit us at Sprint 2 deploy (cf. EXECUTION_PLAN § 14 deviation #4).  #
+  # ----------------------------------------------------------------- #
+
+  # R11 — The Microscope. CLOB Book L3 firehose. Subscribes to
+  # Polymarket WS at order-event granularity, pushes events to the
+  # Redis Stream `book:events:stream`. In rollup-only mode
+  # (CLOB_BOOK_PERSIST_RAW=False, default) the raw clob_book_events
+  # rows are NOT persisted — only the per-minute rollups via the
+  # `microstructure` daemon below. Saves ~13 GB/day disk.
+  book_l3:
+    <<: *app-base
+    profiles: ["sprint3"]
+    container_name: polymarket_book_l3
+    command: ["python", "-m", "src.observer.clob_book_main"]
+    environment:
+      DATABASE_URL: postgresql://polymarket:polymarket_dev_password@postgres:5432/polymarket
+      REDIS_URL: redis://redis:6379/0
+      CLOB_BOOK_PERSIST_RAW: "false"
+    healthcheck:
+      test: ["CMD", "python", "/app/scripts/docker_healthcheck.py"]
+      interval: 60s
+      timeout: 5s
+      start_period: 60s
+      retries: 3
+
+  # R11 — The Microscope. Microstructure feature deriver. Consumes the
+  # book:events:stream Redis Stream produced by `book_l3` and writes
+  # per-minute rollups to `microstructure_features` (iceberg/spoof/OFI/
+  # place-to-fill/cancel-to-fill metrics). ~100 MB/day disk.
+  microstructure:
+    <<: *app-base
+    profiles: ["sprint3"]
+    container_name: polymarket_microstructure
+    command: ["python", "-m", "src.microstructure"]
+    healthcheck:
+      test: ["CMD", "python", "/app/scripts/docker_healthcheck.py"]
+      interval: 120s
+      timeout: 5s
+      start_period: 60s
+      retries: 3
+
+  # R12 — The Periphery (social half). X firehose + Telegram +
+  # Discord listeners + NLP intent classifier. Stub mode when
+  # X_API_KEY="" (default in Sprint 3 — no budget for $100/mo X API):
+  # the daemon stays up, exposes a healthcheck, but ingests zero
+  # tweets. Spec § 12 hors-scope hardcodes X_API_KEY="".
+  social:
+    <<: *app-base
+    profiles: ["sprint3"]
+    container_name: polymarket_social
+    command: ["python", "-m", "src.social"]
+    environment:
+      DATABASE_URL: postgresql://polymarket:polymarket_dev_password@postgres:5432/polymarket
+      REDIS_URL: redis://redis:6379/0
+      X_API_KEY: ""
+    healthcheck:
+      test: ["CMD", "python", "/app/scripts/docker_healthcheck.py"]
+      interval: 120s
+      timeout: 5s
+      start_period: 60s
+      retries: 3
+
+  # R12 — The Periphery (cross-market half). Polls Manifold +
+  # PredictIt for wallet/position cross-references. Kalshi disabled
+  # (KALSHI_API_KEY=""). The wallet_resolver matches across venues so
+  # an R8 strategy classifier can spot leaders running multi-venue
+  # arbitrage. Memory: ~200 MB.
+  crossmarket:
+    <<: *app-base
+    profiles: ["sprint3"]
+    container_name: polymarket_crossmarket
+    command: ["python", "-m", "src.cross_market"]
+    environment:
+      DATABASE_URL: postgresql://polymarket:polymarket_dev_password@postgres:5432/polymarket
+      REDIS_URL: redis://redis:6379/0
+      KALSHI_API_KEY: ""
+    healthcheck:
+      test: ["CMD", "python", "/app/scripts/docker_healthcheck.py"]
+      interval: 120s
+      timeout: 5s
+      start_period: 60s
+      retries: 3
+
+  # R7 — DEFERRED to Sprint 3.5. The current `src/mempool/node_client.py`
+  # targets Erigon `eth_subscribe('newPendingTransactions')` which
+  # doesn't carry off-chain CLOB trades (EXECUTION_PLAN § 4 Décision
+  # #5). Re-aiming onto Polymarket WS requires an architectural choice
+  # — direct WS connection vs proxying through the observer's existing
+  # `trades:observed` pub/sub — that hasn't been pinned yet. Ship the
+  # rest of Sprint 3 first, then refactor.
+
   # FastAPI dashboard + health endpoints. Disabled by default in dev —
   # uncomment ports to expose.
   api:

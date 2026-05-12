@@ -70,6 +70,20 @@ def _msg(**overrides):
 
 
 class TestBackpressureLoadBearing:
+    """Sprint 3: these load-bearing assertions are written against the
+    legacy two-sink topology (DB queue + stream queue). The rollup-only
+    default introduced in Sprint 3 routes events only to the stream
+    queue. We flip the legacy flag back on for the whole class so the
+    backpressure semantic stays exercised in CI. Production runs with
+    the flag at False; the stream-queue path is equivalent (same deque
+    semantics) and the metric counter is shared.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _enable_db_queue(self, monkeypatch):
+        from src.config import settings
+        monkeypatch.setattr(settings, "CLOB_BOOK_PERSIST_RAW", True)
+
     @pytest.mark.asyncio
     async def test_exact_drop_count_burst_above_capacity(self, redis_client):
         """Push 60 events into a 50-slot queue and assert the dropped
@@ -305,6 +319,14 @@ class TestDecoderRobustness:
 
 
 class TestQueueSinkIndependence:
+    """Sprint 3: assertion specific to the legacy two-sink topology.
+    Flip CLOB_BOOK_PERSIST_RAW=True so both sinks receive events."""
+
+    @pytest.fixture(autouse=True)
+    def _enable_db_queue(self, monkeypatch):
+        from src.config import settings
+        monkeypatch.setattr(settings, "CLOB_BOOK_PERSIST_RAW", True)
+
     @pytest.mark.asyncio
     async def test_draining_one_sink_does_not_drain_the_other(self, redis_client):
         """The DB queue and the stream queue are independent. Draining

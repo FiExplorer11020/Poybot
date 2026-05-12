@@ -1027,6 +1027,15 @@ class Settings(BaseSettings):
     # efficiency; 0.5 s matches the per-minute rollup cadence so the
     # rollup never sees a write more than ~0.5 s stale.
     CLOB_BOOK_DB_BATCH_INTERVAL_S: float = 0.5
+    # CLOB_BOOK_PERSIST_RAW: when False (Sprint 3 rollup-only mode), the
+    # observer does NOT enqueue events to `_db_queue` and does NOT spawn
+    # `_db_writer_loop` — events are still pushed to the Redis stream
+    # `book:events:stream` for real-time derivation by the microstructure
+    # daemon, but raw `clob_book_events` rows are skipped. Saves the
+    # ~13 GB/day storage cost (R11 spec § 2.3) while preserving the
+    # per-minute rollups in `microstructure_features`. Set to True only
+    # for firehose tests or one-off research-tier replays.
+    CLOB_BOOK_PERSIST_RAW: bool = False
     # CLOB_BOOK_STREAM_NAME: Redis Stream the observer publishes to.
     # Consumed by src.microstructure.daemon for real-time derivation.
     CLOB_BOOK_STREAM_NAME: str = "book:events:stream"
