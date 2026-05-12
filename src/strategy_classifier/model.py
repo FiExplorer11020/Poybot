@@ -254,13 +254,21 @@ class StrategyClassifier:
 
         probs = np.asarray(self._model.predict_proba(X_arr), dtype=float)
 
-        # Re-order columns: LightGBM's `classes_` may differ from
-        # STRATEGY_CLASSES (lexicographic vs spec order).
+        # Re-order columns to the canonical STRATEGY_CLASSES order. When the
+        # model was trained on a STRICT SUBSET of the 9 classes (common
+        # during the early labelling sprint when info_leak / arb_3way etc.
+        # have zero labelled wallets), missing classes get zero-filled —
+        # NOT crashed via ``tuple.index`` raising ValueError. Spec § 7.A
+        # rollout explicitly anticipates this regime.
         if self._lgb_classes is not None and tuple(self._lgb_classes) != STRATEGY_CLASSES:
-            col_idx = [self._lgb_classes.index(c) for c in STRATEGY_CLASSES]
-            probs = probs[:, col_idx]
+            aligned = np.zeros((probs.shape[0], k), dtype=float)
+            for j, cls in enumerate(STRATEGY_CLASSES):
+                if cls in self._lgb_classes:
+                    aligned[:, j] = probs[:, self._lgb_classes.index(cls)]
+            probs = aligned
 
-        # Defensive renormalisation (calibration can leave tiny drift).
+        # Defensive renormalisation (calibration + missing-class zero-fill
+        # both leave row sums ≠ 1.0).
         row_sums = probs.sum(axis=1, keepdims=True)
         row_sums = np.where(row_sums > 0, row_sums, 1.0)
         return probs / row_sums
