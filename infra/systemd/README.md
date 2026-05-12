@@ -18,6 +18,7 @@ topology (see `docs/ROUND_6_THE_SPINE.md` § 3.5).
 | `polymarket-microstructure.service`        | `src.microstructure` *(Round 11)* | 400 MB        |
 | `polymarket-social.service`                | `src.social` *(Round 12)*       | 300 MB        |
 | `polymarket-crossmarket.service`           | `src.cross_market` *(Round 12)* | 300 MB        |
+| `polymarket-calibration.service`           | `src.calibration` *(Round 13)*  | 300 MB        |
 | `polymarket-api.service`                   | `src.api.main` (uvicorn)        | 300 MB        |
 
 Total budget: ~4.7 GB (CX23 has 4 GB; Round 12 adds two more daemons —

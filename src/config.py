@@ -1152,6 +1152,59 @@ class Settings(BaseSettings):
             )
         return v
 
+    # ────────────────────────────────────────────────────────────────────────
+    # Round 13 (The Mirror) — Continuous Calibration + Auto-Disable
+    # See docs/ROUND_13_CALIBRATION_AND_RESEARCH.md for the spec.
+    # ────────────────────────────────────────────────────────────────────────
+
+    # Nightly batch fires at 04:30 UTC (AFTER R10's 04:00 causal pass).
+    CALIBRATION_BATCH_HOUR_UTC: int = 4
+    CALIBRATION_BATCH_MINUTE: int = 30
+    # |z| above which a (model, strategy_class) day is a "breach".
+    CALIBRATION_DRIFT_Z_THRESHOLD: float = 2.0
+    # Consecutive breach days that trigger auto-disable. 3 days keeps
+    # the false-positive rate < 0.05^3 ≈ 0.01% on stationary baseline.
+    CALIBRATION_DRIFT_CONSECUTIVE_DAYS_FOR_DISABLE: int = 3
+    # Rolling-mean window for the baseline. 30 days matches the R8
+    # drift detector and R9 Kalman observation scale.
+    CALIBRATION_BASELINE_WINDOW_DAYS: int = 30
+    # Master switch for the prediction-logging hook in
+    # confidence_engine. Default True; operator can flip False to skip.
+    CALIBRATION_REPLAY_ENABLED: bool = True
+    # Per-(model, strategy_class) Telegram-alert rate-limit. 1 h
+    # matches spec § 3.3.
+    CALIBRATION_TELEGRAM_RATE_LIMIT_S: float = 3600.0
+    # Initial cold-start backfill window for the daemon.
+    CALIBRATION_INITIAL_BACKFILL_DAYS: int = 90
+
+    @field_validator("CALIBRATION_DRIFT_Z_THRESHOLD")
+    @classmethod
+    def _validate_drift_z(cls, v: float) -> float:
+        if not 0.5 <= v <= 10.0:
+            raise ValueError(
+                f"CALIBRATION_DRIFT_Z_THRESHOLD must be in [0.5, 10], got {v}."
+            )
+        return v
+
+    @field_validator("CALIBRATION_DRIFT_CONSECUTIVE_DAYS_FOR_DISABLE")
+    @classmethod
+    def _validate_drift_consecutive_days(cls, v: int) -> int:
+        if not 1 <= v <= 30:
+            raise ValueError(
+                f"CALIBRATION_DRIFT_CONSECUTIVE_DAYS_FOR_DISABLE must be in "
+                f"[1, 30], got {v}."
+            )
+        return v
+
+    @field_validator("CALIBRATION_BASELINE_WINDOW_DAYS")
+    @classmethod
+    def _validate_baseline_window(cls, v: int) -> int:
+        if not 7 <= v <= 365:
+            raise ValueError(
+                f"CALIBRATION_BASELINE_WINDOW_DAYS must be in [7, 365], got {v}."
+            )
+        return v
+
 
 settings = Settings()
 

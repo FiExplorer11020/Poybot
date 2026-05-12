@@ -1,0 +1,34 @@
+# Research substrate — Round 13 (The Mirror)
+#
+# These dependencies are SEPARATE from the production pyproject.toml so
+# the runtime daemon containers stay lean. Install with
+# `pip install -r research/requirements.txt` in a venv dedicated to the
+# notebook workspace (recommended) or a shared analyst env.
+#
+# Version pins target the anaconda3 baseline + the production-side
+# DuckDB / numpy / scipy that the cold tier was written with. Loosely
+# pinned (>=) where notebook results don't depend on specific version
+# behaviour; tightly pinned where they do.
+
+# Notebook runtime + kernel
+jupyter>=1.0.0
+jupyterlab>=4.0.0
+ipykernel>=6.25.0
+ipywidgets>=8.0.0
+
+# Cold-tier query engine — same major as src/cold_storage/duckdb_view.py
+duckdb>=1.0.0,<2.0.0
+pyarrow>=14.0.0
+
+# Tabular analysis (banned in production; allowed offline in research)
+pandas>=2.0.0
+numpy>=1.26.0,<2.0.0
+scipy>=1.12.0
+
+# Plotting
+matplotlib>=3.7.0
+seaborn>=0.13.0
+
+# Async DB read-out from notebook cells
+asyncpg>=0.29.0
+nest-asyncio>=1.6.0  # lets asyncio.run() be called from a Jupyter event loop

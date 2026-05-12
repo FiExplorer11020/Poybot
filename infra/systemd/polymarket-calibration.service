@@ -1,0 +1,29 @@
+[Unit]
+Description=Polymarket Bot — Round 13 nightly calibration daemon (The Mirror)
+Documentation=file:///opt/polymarket-bot/docs/ROUND_13_CALIBRATION_AND_RESEARCH.md
+After=network-online.target postgresql.service redis.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/polymarket-bot
+EnvironmentFile=/opt/polymarket-bot/.env
+ExecStart=/opt/polymarket-bot/venv/bin/python -m src.calibration
+Restart=always
+RestartSec=5
+MemoryMax=300M
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=polymarket-calibration
+# Run as a non-privileged user matching the rest of the stack.
+User=polymarket
+Group=polymarket
+
+# The daemon polls every CALIBRATION_TELEGRAM_RATE_LIMIT_S (default 1h)
+# and only runs the batch when the UTC date has rolled over since the
+# last execution. Memory envelope mirrors polymarket-causal.service —
+# the daemon holds at most one day of decision_predictions in memory
+# during a single aggregation pass.
+
+[Install]
+WantedBy=multi-user.target

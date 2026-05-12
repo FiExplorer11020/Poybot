@@ -15,3 +15,6 @@ venv/
 data/
 data_cache/
 .claude/settings.local.json
+
+# R13 research workspace — local DuckDB working files
+research/duckdb/

@@ -1252,6 +1252,115 @@ except Exception:  # pragma: no cover
 
 
 # ---------------------------------------------------------------------------
+# === Round 13 (The Mirror) — Continuous Calibration Loop + Auto-Disable ===
+# ---------------------------------------------------------------------------
+# 10 metrics per spec § 5. Each lives in its own defensive try/except so a
+# late prometheus_client unavailability never breaks import — the calibration
+# daemon's no-metric path silently no-ops (see ModelAutoDisabler._inc_*).
+
+try:
+    calibration_runs_total = Counter(
+        "polybot_calibration_runs_total",
+        "Nightly calibration batch executions. Spec § 5.",
+    )
+except Exception:  # pragma: no cover
+    pass
+
+try:
+    calibration_loss = Gauge(
+        "polybot_calibration_loss",
+        "Per-model calibration loss measured by the nightly batch "
+        "(Brier for follow_confidence, MAPE for volume_forecast, "
+        "log_loss for strategy_class, residual for causal_ate).",
+        ["model", "strategy_class"],
+    )
+except Exception:  # pragma: no cover
+    pass
+
+try:
+    calibration_baseline_loss = Gauge(
+        "polybot_calibration_baseline_loss",
+        "Rolling 30-day baseline mean of calibration loss per model. "
+        "Compared with calibration_loss to derive drift_score.",
+        ["model", "strategy_class"],
+    )
+except Exception:  # pragma: no cover
+    pass
+
+try:
+    model_drift_score = Gauge(
+        "polybot_model_drift_score",
+        "Z-score of today's calibration loss vs the rolling baseline. "
+        "|z| > 2 triggers a Telegram alert; 3 consecutive days "
+        "triggers auto-disable.",
+        ["model", "strategy_class"],
+    )
+except Exception:  # pragma: no cover
+    pass
+
+try:
+    model_disabled = Gauge(
+        "polybot_model_disabled",
+        "0/1 gauge per model indicating whether the model_disable_state "
+        "row is currently is_disabled=TRUE.",
+        ["model"],
+    )
+except Exception:  # pragma: no cover
+    pass
+
+try:
+    model_auto_disable_total = Counter(
+        "polybot_model_auto_disable_total",
+        "Total auto-disable events per model. Incremented when the "
+        "drift detector flips the row.",
+        ["model"],
+    )
+except Exception:  # pragma: no cover
+    pass
+
+try:
+    model_manual_disable_total = Counter(
+        "polybot_model_manual_disable_total",
+        "Total manual-disable events per model. Incremented when the "
+        "operator flips the row via Telegram /disable.",
+        ["model"],
+    )
+except Exception:  # pragma: no cover
+    pass
+
+try:
+    model_enable_total = Counter(
+        "polybot_model_enable_total",
+        "Total re-enable events per model (auto or manual).",
+        ["model"],
+    )
+except Exception:  # pragma: no cover
+    pass
+
+try:
+    counterfactual_replay_duration_seconds = Histogram(
+        "polybot_counterfactual_replay_duration_seconds",
+        "Wall-clock duration of a counterfactual replay execution. "
+        "The R13 research substrate uses R10's CounterfactualReplayer; "
+        "this surfaces the spec § 6 <5 min gate.",
+        ["kind"],
+        buckets=(1.0, 5.0, 30.0, 60.0, 300.0, 600.0, 1800.0),
+    )
+except Exception:  # pragma: no cover
+    pass
+
+try:
+    research_notebook_executions_total = Counter(
+        "polybot_research_notebook_executions_total",
+        "Operator-driven research notebook execution count. Best-effort: "
+        "an analyst increments this on notebook completion via a magic "
+        "cell that calls into the metrics endpoint.",
+    )
+except Exception:  # pragma: no cover
+    pass
+
+
+# ---------------------------------------------------------------------------
 # Build info — best-effort. Surfaces version + git short-SHA on /metrics so a
 # scrape can correlate metrics with a deploy. Failure here must NEVER break
 # import (the rest of the contract is the actual deliverable).
