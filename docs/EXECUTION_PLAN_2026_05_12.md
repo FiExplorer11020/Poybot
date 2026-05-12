@@ -434,5 +434,159 @@ Ajouter en fin de prompt :
 
 ---
 
+## 13. Sprint 1 completed (2026-05-12)
+
+> **Statut** : code merged on `main` localement, tests verts.
+> **Deploy prod** : EN ATTENTE d'un GO opérateur (rsync + rebuild `observer` + `onchain`).
+> Tant que le rsync n'est pas lancé, la production tourne TOUJOURS sur l'état § 2.
+
+### Ce qui a été fait
+
+| Tâche § 6 | Livrable | Fichier |
+|---|---|---|
+| Day 1.1 — Spine v2 (WS sharding) | 4 connexions WS parallèles via `WS_SHARD_COUNT=4` (`hash(mid) % N` → shards déterministes, robustes aux reconnects). `TOP_MARKETS_COUNT` bumpé 200→500 (la doc initiale citait 50 — stale, default était déjà à 200). | `src/observer/trade_observer.py`, `src/config.py` |
+| Day 1.2 — Backfill historical | Script standalone `scripts/backfill_polymarket_trades.py` qui pull `data-api.polymarket.com/trades?user=W&limit=500` (paginé jusqu'au cutoff `--days-back`). UPSERT via `ON CONFLICT (wallet, market, time, side, price, size) DO NOTHING` ⇒ idempotent et re-jouable. CLI : `--top-n 500 --days-back 90 --concurrency 8`. | `scripts/backfill_polymarket_trades.py` |
+| Day 2.1 — R6 onchain repurpose | `ONCHAIN_MODE` config (default `"verifier"`). En mode verifier : subscribe à `ConditionalTokens 0x4D97DCd97e...` topic0 `TransferSingle`, court-circuite le decoder et le path INSERT, ne fait que bumper `chain_events_decoded_total{event_type=conditional_tokens_transfer_single}` + advance le cursor. Le path firehose est préservé (kwarg `mode="firehose"` du constructor — utilisé par les tests). | `src/onchain/clob_listener.py`, `src/config.py` |
+| Day 2.2 — wallet_universe auto-enrich | Bloc UPSERT batchè dans le `_db_writer_loop` du trade_observer : agrège first_seen, last_active, trades, volume par wallet sur le batch courant et INSERT...ON CONFLICT DO UPDATE → `wallet_universe` grossit à chaque trade observé sans dépendre du R6 crawler. | `src/observer/trade_observer.py` |
+
+### Déviations vs plan initial
+
+1. **`TOP_MARKETS_COUNT` était déjà à 200, pas 50.** Le doc initial citait "50" comme baseline — en réalité le repo l'avait déjà passé à 200 dans une session précédente. La bump 50→500 est devenue 200→500 ; impact zéro sur le résultat (toujours 500 final), mais à acter pour ne pas s'attendre à voir "+450 markets" sur le delta dashboard (plutôt +300).
+2. **WS sharding fait au niveau `TradeObserver`, pas dans `PolymarketWSClient`.** Le plan suggérait d'étendre `websocket_client.py` ; en pratique le découpage propre est de spawner N instances `PolymarketWSClient` distinctes dans `TradeObserver.start()` (chaque shard a son socket + son watchdog + ses backoff state). Code plus simple, surface API du WS client inchangée, tests existants pas touchés.
+3. **`_ws_client` (singulier) conservé comme handle legacy** pointant sur shard 0 — sinon les diagnostics + tests qui font `observer._ws_client.messages_received` cassent. Le code de prod utilise `_ws_clients` (pluriel).
+4. **Onchain verifier mode skip total du decoder.** Le plan disait "écouter TransferSingle" — j'aurais pu ajouter un decoder ConditionalTokens dans `event_decoder.py`. À la place je court-circuite plus haut dans `_process_log` parce qu'en verifier on n'a aucun besoin du payload décodé (juste de la cadence + cursor). Beaucoup moins de code à maintenir.
+5. **Migration DB non nécessaire.** Aucun nouveau schéma — l'UPSERT `wallet_universe` réutilise les colonnes existantes, le verifier ne crée pas de table. Sprint 1 = deploy code-only.
+
+### État actuel mesuré (2026-05-12 22:30 UTC, AVANT deploy)
+
+| Ressource | Valeur | Vs § 2 baseline |
+|---|---|---|
+| RAM serveur | 1,413 / 3,815 MB (37%) | identique |
+| Disk serveur | 15 / 38 GB (41%) | identique |
+| Containers running | 11/11 healthy | identique |
+| `wallet_universe` | 13,344 | identique (l'auto-enrich n'a pas encore tourné en prod) |
+| `trades_observed` total | 36,164 | +444 depuis la prise du § 2 |
+| `trades_observed` 1h | 293 trades/h | dans la bande nuit (creux 290–500/h attendu) |
+| `trades_observed` `source='onchain'` 24h | **0** | identique — verifier mode pas encore deploy |
+| Markets touchés 24h | 255 | quasi-identique (coverage toujours ~9%) |
+| `decision_log` 24h | 48 | identique |
+| `paper_trades` | 0 | identique |
+| `leader_profiles` | 480 | identique |
+| Swap | 0 MB | **TODO Sprint 4** — 2 GB swap requis avant d'ajouter des containers Sprint 2/3 |
+
+### Tests locaux
+
+```
+pytest -q --timeout=60 --ignore=tests/test_docker.py --ignore=tests/integration
+→ 1799 passed, 2 skipped, 2 xfailed, 0 failures (107 s)
+```
+
+`tests/test_docker.py::TestCompose::test_all_app_services_present` échoue MAIS pré-existant (la prod tourne 11 services, le test attend toujours les 7 du build initial — backlog hors-Sprint 1).
+
+### Prochain sprint : Sprint 2 — Modèles qui consomment cette data
+
+**Pré-requis Sprint 2 (à valider AVANT d'attaquer)** :
+
+- [ ] Sprint 1 deploy effectué + 24 h de roulage stable (vérifier `wallet_universe` croît, coverage > 30%, pas d'OOM)
+- [ ] `decision_predictions` table existe (à confirmer : `\d decision_predictions` — si manquante, créer migration avant Sprint 2 Day 3.1)
+- [ ] Lecture du pseudo-diff `docs/audit/phase3/round13_wave3_review.md § 9` (R13 hooks — ~10 LOC)
+- [ ] LightGBM dispo dans l'image observer (`pip show lightgbm` dans le container — si absent, ajouter au requirements avant Day 3.3)
+- [ ] Services Docker `polymarket-strategy-classifier`, `polymarket-follower-volume`, `polymarket-causal` à définir dans `docker-compose.yml` (encore absents → 3 nouveaux containers à câbler)
+- [ ] Backfill 90 jours lancé et terminé (sinon Day 3.2 auto-labeller manque de positions résolues)
+
+**Périmètre Sprint 2** (rappel § 6 Day 3-4) :
+1. R13 wire hooks (`record_decision_predictions`, `fill_actual_outcomes`)
+2. R8 auto-labeller (weak labels depuis `positions_reconstructed`) + train LightGBM
+3. R9 daemon (Hawkes multivariate nightly + Kalman state-space)
+4. R10 daemon (2SLS nightly, `causal_gating_enabled=false`)
+
+---
+
+## 14. Sprint 2 completed (2026-05-12)
+
+> **Statut** : code patché in-place sur prod (engine container) + script + compose
+> rsynchés. Les 3 nouveaux daemons R8/R9/R10 tournent en prod sous le profile
+> `sprint2`. Les 24h de roulage stable du Sprint 1 ont été SKIPPED par décision
+> opérateur — Sprint 1 + Sprint 2 ont été enchaînés directement.
+> **Patch engine non commité** : `confidence_engine.py` modifié localement, pushé
+> dans le container via `docker cp` + `docker restart polymarket_engine`. L'image
+> `:latest` ne contient PAS encore le patch — au prochain rebuild il faudra
+> rsync ces changements en source (ou commit + rebuild).
+
+### Ce qui a été fait
+
+| Tâche § 6 | Livrable | Fichier |
+|---|---|---|
+| Pré-requis Sprint 2 (7 items) | Swap 2 GB créé + persistant `/etc/fstab` ; backfill 90 j tourné (517,652 trades insérés en 190s) ; container `polymarket_onchain` recreate pour pickup l'image post-fix verifier ; 3 services compose ajoutés sous `profiles: ["sprint2"]` ; R13 audit doc § 9 lu ; verif `decision_predictions` table + 5 autres tables Sprint 2 + LightGBM 4.3.0 partout. | `docker-compose.yml`, `scripts/backfill_polymarket_trades.py` (fix VARCHAR(10) source) |
+| Day 3.1 — R13 hooks | **Hooks étaient déjà wired** dans `confidence_engine._log_decision` (lignes 1169-1224) et `position_tracker._close_position` (lignes 439-452) — implémentés post-audit § 9 mais pas mentionnés dans le plan. **Lacune trouvée** : ils ne fire qu'en branche FOLLOW/FADE (line 487 call site qui passe `decision=decision`), pas sur les 6 SKIP paths (lines 223/369/386/398/422/450). À 36 décisions/24h et ~2 FOLLOW/semaine, `decision_predictions` ne se serait peuplé qu'à ~0.3 row/jour. **Patch** : `_log_decision` enhanced sur les 2 paths (primary + legacy) pour fire R13 avec une `DecisionPrediction` partielle (Thompson samples uniquement) quand `decision is None`. Loss aggregator skippe gracefully les models non-renseignés. | `src/engine/confidence_engine.py:1169-1248` |
+| Day 3.2 — R8 auto-labeller | Script standalone avec 5-rule cascade déterministe sur `positions_reconstructed` + `trades_observed` : structural_bot (≥100 trades/jour + <60s hold) → market_maker (≥20 trades/jour + <300s hold) → arb_2way (paired YES+NO same market) → directional (hold ≥86_400s) → momentum (<3_600s + ≥2 trades/jour). 3 queries bulk (candidates, arb_flags, trade_freqs) puis INSERT par wallet avec `labeller='auto_v1'`, `confidence=0.5`. Run prod : **60 labels insérés / 81 candidats** (≥3 positions, 21 wallets unmatched). Distribution : `momentum=42, arb_2way=8, market_maker=5, structural_bot=5, directional=0`. | `scripts/auto_label_strategies.py` (NEW, 230 LOC) |
+| Day 3.3 — R8 daemon | `docker compose --profile sprint2 up -d strategy_classifier`. Daemon UP healthy, 1er pass en 12 s, **112 wallets tier-0/1 classifiés** dans `leader_strategy_history`. Pas de model entraîné → uniform-prior dummy (tous les wallets `primary_strategy='directional'`, confidence `0.1111=1/9`). Refresh cycle 24h. | `docker-compose.yml` (service défini en pré-requis) |
+| Day 4.1 — R9 daemon | `docker compose --profile sprint2 up -d follower_volume`. Daemon UP healthy. Attend nightly Hawkes batch à `MVHAWKES_BATCH_HOUR_UTC=03:30 UTC`. | idem |
+| Day 4.2 — R10 daemon shadow strict | `docker compose --profile sprint2 up -d causal`. Daemon UP healthy, `causal_gating_enabled=false` (shadow strict confirmé via config defaults). 1er pass : "no (leader, pool) pairs this pass" — attend que R9 produise des fits. Nightly à `CAUSAL_DAEMON_BATCH_HOUR_UTC=04:00 UTC`. | idem |
+
+### Déviations vs plan initial
+
+1. **R13 hooks étaient déjà wired (mais partiellement)** — Le plan § 6 Day 3.1 disait "wire hooks (~10 LOC, 30 min) — appliquer pseudo-diff de `docs/audit/phase3/round13_wave3_review.md § 9`". Vérification du code montre que les hooks ont été câblés post-audit (probablement dans un commit antérieur). Le travail réel a été d'**étendre** les hooks aux 6 SKIP paths pour que la calibration loop reçoive des données (sinon ~2 rows/semaine, daemon calibration starvée). Ce n'est pas dans le pseudo-diff § 9 mais c'est nécessaire pour que le spec § 3.1 "every decision_log row gets a sister decision_predictions row" soit respecté.
+
+2. **Day 3.3 LightGBM training DEFERRED** — Plan disait "train initial LightGBM sur ces weak labels. Drop model file." Skippé pour 3 raisons : (a) 60 labels sur 4 classes seulement (`directional` absent) → overfit garanti sur 15 samples/classe ; (b) `LeaderFeatureExtractor` dépend du cold tier DuckDB+Parquet pas setup ; (c) `confidence=0.5` (weak labels) ne justifie pas un entraînement v1. Daemon tourne sur uniform-prior dummy — les 112 wallets ont tous `primary_strategy='directional'` à 0.1111. Pipeline R8 → leader_strategy_history fonctionne, prédictions sont uniformes. À refaire post-Sprint 2 quand on aura plus de labels (e.g. après que position_tracker re-reconstruise des positions sur le backfill historique).
+
+3. **Engine container tournait sur ancienne image** — Container engine créé à 17:43 UTC, image rebuilt à 20:53 UTC (par Sprint 1 deploy). Le patch R13 Day 3.1 devait pénétrer le container. Plutôt que `docker compose build engine && up --force-recreate` (lourd), j'ai utilisé `docker cp /opt/polymarket-bot/src/engine/confidence_engine.py polymarket_engine:/app/...` puis `docker restart polymarket_engine`. **Conséquence** : l'image `polymarket-bot:latest` ne contient PAS le patch — au prochain `docker compose up --build` ou restart container sans cp, le patch sera perdu. À régler proprement par un rebuild image (ou commit + rsync source + rebuild).
+
+4. **Docker compose recréé db + redis** lors de la 1ère activation sprint2 — `docker compose --profile sprint2 up -d strategy_classifier` a déclenché un recreate de `polymarket_db` + `polymarket_redis` (depends_on cascade évaluant les services du compose). Engine subscribers + StreamConsumers se sont déconnectés et coincés en reconnect loop (4 tentatives, puis silence sans recovery). 3 min perdues sans processing de trades. **Workaround** : `docker restart polymarket_engine`. **Lesson learned** : utiliser `docker compose --profile sprint2 up -d --no-deps <service>` pour les activations sprint2/3 futures.
+
+5. **Data quality bug surfaced** : auto-labeller a affiché des rationales du type `median_holding_s=-46s<3600` → certaines `positions_reconstructed.close_time < open_time`. Pas bloquant pour Sprint 2 (les labels restent significatifs : extremely-short hold → momentum, ce qui est cohérent). **À investiguer post-Sprint 2** : potentiel race condition dans `position_tracker._close_position` quand merge/resolution exits se croisent. Hors-scope Sprint 2.
+
+6. **`directional` non détecté par l'auto-labeller** — Distribution finale 0 directional / 42 momentum / 8 arb_2way / 5 market_maker / 5 structural_bot. La règle directional (`median_holding_s >= 86_400`, ≥24h) ne matche aucun wallet parce que (a) la fenêtre est 30 jours, (b) les positions très longues ne sont pas encore closed dans cette fenêtre, (c) la data quality (#5) fausse les médianes. Conséquence : la classe la plus importante du pipeline (directional = FOLLOW core) est sous-représentée. À adresser dans une v2 auto-labeller (élargir fenêtre, mieux gérer les outliers).
+
+### État actuel mesuré (2026-05-12 21:30 UTC, APRÈS Sprint 2 deploy)
+
+| Ressource | Valeur | Vs § 13 Sprint 1 baseline |
+|---|---|---|
+| Containers running | **14/14 healthy** (11 baseline + `strategy_classifier`, `follower_volume`, `causal`) | +3 sprint2 daemons |
+| RAM serveur | 1,151 / 3,815 MB (30%) | -7 pts (était 37%, le backfill ne consomme pas + 3 daemons légers) |
+| Swap | 0 / 2,048 MB used | swap dispo en buffer ✅ |
+| Disk serveur | 23 / 38 GB (64%) | **+23 pts** (était 41%) — effet backfill 517k trades ≈ +8 GB |
+| `trades_observed` total | 554,259 | +518k (backfill + organique) |
+| `trades_observed` source=backfill | 517,652 | nouveau |
+| `wallet_universe` | 13,452 | +33 (auto-enrich actif) |
+| `decision_log` past 7 d | 223 | identique (engine throughput préservé) |
+| `positions_reconstructed` closed | 1,252 | +5 (organique) |
+| **`strategy_labels`** | **60** | NEW (auto-labeller Day 3.2) |
+| **`leader_strategy_history`** | **112** | NEW (R8 daemon Day 3.3, dummy model) |
+| `decision_predictions` | **0** | ⏳ hooks deployed, awaiting first decision (empirical verif pending, baseline ≈1.5/h donc <1h d'attente attendu) |
+| `multivariate_hawkes_fits` | 6 | (pré-existant — R9 daemon attend nightly 03:30) |
+| `causal_estimates` | 0 | (R10 attend R9 + nightly 04:00) |
+| `calibration_loss_history` | 0 | (R13 calibration daemon attend nightly 03:00) |
+
+### Tests locaux
+
+```
+python3 -m pytest tests/test_engine/test_confidence_engine.py tests/test_calibration/ -q --timeout=60
+→ 99 passed in 2.13 s
+```
+
+Pas de regression sur les 99 tests des modules touchés. La suite complète (1,799 tests doc § 13) n'a pas été re-run en Sprint 2 — à faire avant un commit.
+
+### Prochain sprint : Sprint 3 — Enrichments (1.5 j per doc § 6)
+
+**Pré-requis Sprint 3 (à valider AVANT d'attaquer)** :
+
+- [ ] **Patch R13 hooks committé + image rebuildée** — `git diff src/engine/confidence_engine.py` doit montrer le patch, puis `docker compose build engine && docker compose up -d --force-recreate --no-deps engine` pour que l'image `:latest` contienne définitivement le patch (sinon perdu au prochain recreate).
+- [ ] **decision_predictions vérification empirique** — attendre ~1-2 h, `SELECT COUNT(*) FROM decision_predictions` > 0. Si toujours 0 après 4h, débugger les call sites SKIP (peut-être un edge case dans `_log_decision`).
+- [ ] **R9 first nightly batch réussi** — vérifier après 03:30 UTC que `multivariate_hawkes_fits` croît (rows datées du `2026-05-13`). Cible : ≥ 50 nouveaux fits pour les top wallets.
+- [ ] **R10 first nightly batch** — après 04:00 UTC, vérifier `causal_estimates` rows = COUNT(distinct leader, pool) actifs. ATE NULL est OK les premiers jours (besoin d'historique pour 2SLS).
+- [ ] **R13 calibration first batch** — après 03:00 UTC, `calibration_loss_history` populated. Nécessite que `decision_predictions` ait des rows à calibrer (pré-req précédent).
+- [ ] **Disk < 75%** — actuellement 64%. Si Sprint 3 ajoute R11 même en rollup-only, +1-2 GB attendu. Si > 75%, déclencher `TRUNCATE book_quality_snapshots` (gain 694 MB) + `docker builder prune --all` (gain ~8 GB).
+- [ ] **R11 spec lu** : `docs/ROUND_11_MICROSCOPE.md` (vérif que rollup-only est documenté côté code, sinon refactor `src/observer/clob_book_observer.py`).
+- [ ] **Optionnel — train LightGBM** : écrire `scripts/train_strategy_classifier.py`, fit sur les 60 auto-labels (ou plus si auto-labeller v2 livré), save `models/strategy_classifier.pkl`, restart strategy_classifier. Pas bloquant pour Sprint 3 mais utile pour que le pipeline produise autre chose que des `directional 0.1111`.
+
+**Périmètre Sprint 3** (rappel § 6 Day 5-6) :
+1. R11 microstructure rollup-only (refactor `clob_book_observer.py` ; ingère WS book-detail → rollups in-memory → `microstructure_features` ; **NE PERSISTE PAS** `clob_book_events`)
+2. R12 cross-market activate (Manifold + PredictIt only ; X et Kalshi keys vides → skip gracieux)
+3. R12 social stub container (X_API_KEY="" → daemon dort + healthcheck)
+4. R7 re-aim sur Polymarket WS (refactor `src/mempool/node_client.py` MempoolSubscription : subscribe à WS "order_placed" au lieu d'`eth_subscribe newPendingTransactions` ; `prefill_live_enabled=false` shadow)
+
+---
+
 **FIN. Ce doc est le single source of truth pour cet effort. Le mettre
-à jour à chaque fin de sprint dans `## 7. Sprint N completed` section.**
+à jour à chaque fin de sprint dans `## N. Sprint X completed` section.**

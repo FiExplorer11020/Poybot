@@ -461,6 +461,13 @@ class TradeObserver:
         self._running = False
         self._stop_event = asyncio.Event()
         self._ws_client: PolymarketWSClient | None = None
+        # Sprint 1 Day 1.1 (WS sharding): when WS_SHARD_COUNT > 1 we fan
+        # out the leader-market set across N WebSocket connections to
+        # stay inside the per-connection token limit. ``_ws_client``
+        # remains as the legacy single-conn handle so tests + the public
+        # API surface keep working; ``_ws_clients`` is the full list
+        # (always at least one entry, equal to _ws_client when present).
+        self._ws_clients: list[PolymarketWSClient] = []
         self._inserted: int = 0
         self._market_meta_cache: _BoundedTTLCache = _BoundedTTLCache(
             maxsize=MARKET_META_CACHE_MAXSIZE,
@@ -661,8 +668,30 @@ class TradeObserver:
         """Dynamically update leader wallets and markets."""
         self._leader_wallets = wallets
         self._leader_markets = markets
-        if self._ws_client:
+        if self._ws_clients:
+            for shard_markets, client in zip(
+                self._shard_markets(markets), self._ws_clients
+            ):
+                client.update_markets(shard_markets)
+        elif self._ws_client:
             self._ws_client.update_markets(markets)
+
+    @staticmethod
+    def _shard_markets(markets: set[str]) -> list[set[str]]:
+        """Split a market-id set into ``WS_SHARD_COUNT`` deterministic
+        shards. Sprint 1 Day 1.1.
+
+        Uses ``hash(market_id) % N`` so a single market always lands on
+        the same shard across restarts (avoids the same token being
+        torn between two reconnect loops on transient hiccups).
+        Returns exactly ``WS_SHARD_COUNT`` lists (some may be empty if
+        the universe is smaller than the shard count).
+        """
+        n = max(1, int(settings.WS_SHARD_COUNT))
+        buckets: list[set[str]] = [set() for _ in range(n)]
+        for mid in markets:
+            buckets[hash(mid) % n].add(mid)
+        return buckets
 
     def _ensure_write_queue(self) -> asyncio.Queue:
         """Lazy-init the bounded write queue. Called from both producer and
@@ -679,25 +708,36 @@ class TradeObserver:
         self._running = True
         self._stop_event.clear()
         self._ensure_write_queue()
-        self._ws_client = PolymarketWSClient(
-            on_message=self._handle_ws_message,
-            markets=self._leader_markets,
-            # Phase 3 Round 1 (Agent A): the WS client uses its own
-            # Redis client for the per-channel freshness watchdog. We
-            # share ours — the watchdog only reads, never writes, so
-            # the contention is negligible.
-            redis_client=self._redis,
-        )
+        # Sprint 1 Day 1.1: spawn one PolymarketWSClient per shard. With
+        # WS_SHARD_COUNT=1 the behaviour is byte-identical to the
+        # pre-sharding single-client path.
+        shard_count = max(1, int(settings.WS_SHARD_COUNT))
+        shard_buckets = self._shard_markets(self._leader_markets)
+        self._ws_clients = [
+            PolymarketWSClient(
+                on_message=self._handle_ws_message,
+                markets=shard_buckets[i],
+                # Phase 3 Round 1 (Agent A): WS client uses Redis for
+                # the per-channel freshness watchdog. Sharing is safe —
+                # watchdog only reads. Note: all shards write the same
+                # `observer:ws:last_msg:<channel>` keys; if one shard is
+                # stale but another is alive the watchdog will not fire
+                # (intended — silence is per-channel-across-shards).
+                redis_client=self._redis,
+            )
+            for i in range(shard_count)
+        ]
+        # Keep `_ws_client` pointing at shard 0 for backwards compat
+        # (tests + diagnostic surfaces reach in via this attribute).
+        self._ws_client = self._ws_clients[0]
         # HP-1 fix #3: dedicated DB writer task drains the queue in batches.
         # Started BEFORE the producers so the very first enqueued record has
         # somewhere to land. `gather` so any one crashing surfaces in the
         # supervisor.
         self._writer_task = asyncio.create_task(self._db_writer_loop())
-        tasks = [
-            self._writer_task,
-            asyncio.create_task(self._ws_client.start()),
-            asyncio.create_task(self._backfill_loop()),
-        ]
+        tasks: list = [self._writer_task]
+        tasks.extend(asyncio.create_task(c.start()) for c in self._ws_clients)
+        tasks.append(asyncio.create_task(self._backfill_loop()))
         try:
             await asyncio.gather(*tasks)
         except asyncio.CancelledError:
@@ -706,7 +746,14 @@ class TradeObserver:
     async def stop(self) -> None:
         self._running = False
         self._stop_event.set()
-        if self._ws_client:
+        for client in self._ws_clients:
+            try:
+                await client.stop()
+            except Exception as exc:
+                logger.warning(f"ws_client.stop raised: {exc}")
+        # Legacy single-client path (no shards spawned, e.g. unit tests
+        # that constructed _ws_client manually).
+        if not self._ws_clients and self._ws_client:
             await self._ws_client.stop()
         # Drain anything left in the queue before tearing down the writer task
         # so we don't lose trades that were enqueued but not yet committed.
@@ -973,6 +1020,61 @@ class TradeObserver:
             "DO NOTHING RETURNING id, wallet_address, market_id, time, side, price, size_usdc"
         )
         returned = await conn.fetch(sql, *params)
+
+        # Sprint 1 Day 2.2 (EXECUTION_PLAN § 6): organically grow the
+        # wallet_universe table from every observed trade so leader
+        # tracking no longer depends on the (broken) R6 onchain crawler
+        # seed. UPSERT increments aggregates on subsequent hits; insert
+        # on first-seen with default tier=2 (the crawler's depth-tier
+        # daemon will re-tier offline based on volume).
+        wallet_rows: dict[str, dict] = {}
+        for rec in batch:
+            w = rec.wallet_address
+            cur = wallet_rows.get(w)
+            if cur is None:
+                wallet_rows[w] = {
+                    "first_seen": rec.trade_time,
+                    "last_active": rec.trade_time,
+                    "trades": 1,
+                    "volume": float(rec.size_usdc or 0),
+                }
+            else:
+                if rec.trade_time < cur["first_seen"]:
+                    cur["first_seen"] = rec.trade_time
+                if rec.trade_time > cur["last_active"]:
+                    cur["last_active"] = rec.trade_time
+                cur["trades"] += 1
+                cur["volume"] += float(rec.size_usdc or 0)
+        if wallet_rows:
+            wu_params: list = []
+            wu_placeholders: list[str] = []
+            for i, (wallet, agg) in enumerate(wallet_rows.items()):
+                base = i * 5
+                wu_placeholders.append(
+                    f"(${base + 1}, ${base + 2}, ${base + 3}, "
+                    f"${base + 4}, ${base + 5})"
+                )
+                wu_params.extend([
+                    wallet,
+                    agg["first_seen"],
+                    agg["last_active"],
+                    agg["trades"],
+                    agg["volume"],
+                ])
+            await conn.execute(
+                "INSERT INTO wallet_universe "
+                "(wallet_address, first_seen, last_active, "
+                "total_trades_ever, total_volume_usdc_ever) VALUES "
+                + ", ".join(wu_placeholders)
+                + " ON CONFLICT (wallet_address) DO UPDATE SET "
+                "last_active = GREATEST(wallet_universe.last_active, "
+                "EXCLUDED.last_active), "
+                "total_trades_ever = wallet_universe.total_trades_ever "
+                "+ EXCLUDED.total_trades_ever, "
+                "total_volume_usdc_ever = wallet_universe.total_volume_usdc_ever "
+                "+ EXCLUDED.total_volume_usdc_ever",
+                *wu_params,
+            )
 
         nk_to_id: dict[tuple, int] = {}
         for row in returned:

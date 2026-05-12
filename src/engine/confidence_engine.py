@@ -1167,21 +1167,35 @@ class ConfidenceEngine:
                     json.dumps(audit_payload),
                 )
                 # R13 — same-transaction prediction snapshot. Spec § 3.1 +
-                # audit § 9.A: every decision_log row gets a sister
+                # audit § 9.A: EVERY decision_log row gets a sister
                 # decision_predictions row so the nightly calibration
-                # batch can score each model's at-decision-time output.
-                # Failures here MUST NOT break the decision write — wrapped
-                # in its own try/except.
-                if decision_id is not None and decision is not None:
+                # batch can score each model's at-decision-time output —
+                # including SKIPs (where only Thompson samples are
+                # available, but those still calibrate follow_confidence
+                # and fade_confidence). Failures here MUST NOT break the
+                # decision write — wrapped in its own try/except.
+                if decision_id is not None:
                     try:
                         from src.calibration import (
                             DecisionPrediction,
                             record_decision_predictions,
                         )
+                        if decision is not None:
+                            predictions = DecisionPrediction.from_decision_context(decision)
+                        else:
+                            # SKIP path: build a minimal prediction from
+                            # the Thompson samples already in hand. Other
+                            # model fields stay NULL → loss aggregator
+                            # silently excludes them for this row.
+                            predictions = DecisionPrediction(
+                                follow_confidence=float(t_follow),
+                                fade_confidence=float(t_fade),
+                                predicted_at=datetime.now(tz=timezone.utc),
+                            )
                         await record_decision_predictions(
                             conn,
                             int(decision_id),
-                            DecisionPrediction.from_decision_context(decision),
+                            predictions,
                         )
                     except Exception as r13_exc:
                         logger.debug(
@@ -1208,17 +1222,26 @@ class ConfidenceEngine:
                         round(confidence, 4),
                         reason,
                     )
-                    # Best-effort R13 snapshot on the legacy path too.
-                    if decision_id is not None and decision is not None:
+                    # Best-effort R13 snapshot on the legacy path too —
+                    # same fire-on-every-row semantics as the primary path.
+                    if decision_id is not None:
                         try:
                             from src.calibration import (
                                 DecisionPrediction,
                                 record_decision_predictions,
                             )
+                            if decision is not None:
+                                predictions = DecisionPrediction.from_decision_context(decision)
+                            else:
+                                predictions = DecisionPrediction(
+                                    follow_confidence=float(t_follow),
+                                    fade_confidence=float(t_fade),
+                                    predicted_at=datetime.now(tz=timezone.utc),
+                                )
                             await record_decision_predictions(
                                 conn,
                                 int(decision_id),
-                                DecisionPrediction.from_decision_context(decision),
+                                predictions,
                             )
                         except Exception:
                             pass

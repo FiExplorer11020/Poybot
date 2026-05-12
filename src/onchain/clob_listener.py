@@ -128,12 +128,39 @@ class CLOBChainListener:
         *,
         stream_producer: StreamProducer | None = None,
         gov_stream_producer: StreamProducer | None = None,
+        mode: str | None = None,
     ) -> None:
         self._rpc = rpc_client
         self._redis_url = redis_url
-        self._contract_address = (
-            contract_address or settings.POLYMARKET_CLOB_CONTRACT_ADDRESS
-        )
+        # Sprint 1 Day 2.1: respect ONCHAIN_MODE. In "verifier" mode we
+        # subscribe to the ConditionalTokens TransferSingle stream and
+        # only emit coverage-gap metrics; in "firehose" mode we keep the
+        # legacy CTF-Exchange OrderFilled listener (kept around in case
+        # Polymarket ever moves matching back on-chain). Explicit kwarg
+        # wins over the settings default — tests pin mode='firehose'
+        # because their event corpus is hand-built OrderFilled logs.
+        self._mode = (
+            mode or getattr(settings, "ONCHAIN_MODE", "verifier") or "verifier"
+        ).strip().lower()
+        if self._mode == "verifier":
+            self._contract_address = (
+                contract_address
+                or settings.POLYMARKET_CONDITIONAL_TOKENS_ADDRESS
+            )
+            self._filter = {
+                "address": self._contract_address,
+                "topics": [
+                    settings.CONDITIONAL_TOKENS_TRANSFER_SINGLE_TOPIC
+                ],
+            }
+        else:
+            self._contract_address = (
+                contract_address or settings.POLYMARKET_CLOB_CONTRACT_ADDRESS
+            )
+            self._filter = {
+                "address": self._contract_address,
+                "topics": [list(TRADE_EVENT_TOPICS)],
+            }
         self._decoder = EventDecoder()
 
         # Stream producers. If the caller injected one we don't own its
@@ -142,13 +169,6 @@ class CLOBChainListener:
         self._owns_trades_stream = stream_producer is None
         self._gov_stream: StreamProducer | None = gov_stream_producer
         self._owns_gov_stream = gov_stream_producer is None
-
-        # Filter for eth_subscribe. Topic-0 list is OR'd so one
-        # subscription captures every fill / match / cancel event.
-        self._filter = {
-            "address": self._contract_address,
-            "topics": [list(TRADE_EVENT_TOPICS)],
-        }
 
         # Cursor + commit cadence state.
         self._last_processed_block: int = 0
@@ -294,6 +314,42 @@ class CLOBChainListener:
     async def _process_log(self, raw_log: dict) -> None:
         """Decode one raw log and route it through the publish path."""
         t0 = time.monotonic()
+        # Sprint 1 Day 2.1: in verifier mode the listener only counts
+        # ConditionalTokens TransferSingle events — it does NOT INSERT
+        # into trades_observed (off-chain CLOB means there is no direct
+        # CLOB↔chain mapping). We emit a coverage-gap metric and advance
+        # the chain cursor so the dashboard can plot expected-vs-observed
+        # settlement volume.
+        if self._mode == "verifier":
+            block_number = 0
+            try:
+                bn_raw = raw_log.get("blockNumber") or raw_log.get(
+                    "block_number"
+                )
+                if isinstance(bn_raw, str) and bn_raw.startswith("0x"):
+                    block_number = int(bn_raw, 16)
+                elif bn_raw is not None:
+                    block_number = int(bn_raw)
+            except (ValueError, TypeError):
+                pass
+            _safe_inc(
+                _metric("chain_events_decoded_total"),
+                event_type="conditional_tokens_transfer_single",
+            )
+            if block_number > self._last_processed_block:
+                self._last_processed_block = block_number
+                _safe_inc(_metric("chain_blocks_processed_total"))
+            # Sprint 1 Day 2.1: verifier mode does NOT need a persistent
+            # cursor — replaying the last few blocks on restart is
+            # harmless (we only emit metrics, no INSERTs). Skip the
+            # cursor commit entirely to avoid log-flooding the (pre-
+            # existing) DB-pool-not-initialized startup race at ~64
+            # warns/sec on ConditionalTokens' ~800k events/h cadence.
+            _safe_observe(
+                _metric("chain_ingestion_latency_seconds"),
+                max(0.0, time.monotonic() - t0),
+            )
+            return
         decoded = self._decoder.decode_any(raw_log)
         if decoded is None:
             return

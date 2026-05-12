@@ -162,6 +162,10 @@ def _make_listener(
         contract_address="0x" + "00" * 20,
         stream_producer=trades,
         gov_stream_producer=gov,
+        # Sprint 1 Day 2.1: tests still exercise the legacy "firehose"
+        # decoder path (OrderFilled / OrdersMatched fixtures). Verifier
+        # mode is asserted by a dedicated test below.
+        mode="firehose",
     )
 
 

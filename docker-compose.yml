@@ -134,6 +134,109 @@ services:
       start_period: 15s
       retries: 3
 
+  # ── R6 The Spine — data sovereignty daemons ────────────────────────────
+  # On-chain CLOB event ingestion via Alchemy Polygon Mainnet WSS.
+  # Requires ALCHEMY_RPC_URL / RPC_PROVIDER_URLS in .env.
+  onchain:
+    <<: *app-base
+    container_name: polymarket_onchain
+    command: ["python", "-m", "src.onchain.main"]
+    healthcheck:
+      test: ["CMD", "python", "/app/scripts/docker_healthcheck.py"]
+      interval: 60s
+      timeout: 5s
+      start_period: 45s
+      retries: 3
+
+  # Wallet universe crawler (2000+ wallets) — depth_tier maintenance.
+  crawler:
+    <<: *app-base
+    container_name: polymarket_crawler
+    command: ["python", "-m", "src.crawler.main"]
+    healthcheck:
+      test: ["CMD", "python", "/app/scripts/docker_healthcheck.py"]
+      interval: 60s
+      timeout: 5s
+      start_period: 30s
+      retries: 3
+
+  # Event-driven Falcon refresher (R6 — replaces fixed cron polling).
+  falcon_refresher:
+    <<: *app-base
+    container_name: polymarket_falcon_refresher
+    command: ["python", "-m", "src.registry.refresher_main"]
+    healthcheck:
+      test: ["CMD", "python", "/app/scripts/docker_healthcheck.py"]
+      interval: 60s
+      timeout: 5s
+      start_period: 30s
+      retries: 3
+
+  # ── R13 The Mirror — calibration daemon ────────────────────────────────
+  # Nightly batch: replays yesterday's decisions, computes per-model loss,
+  # detects drift, auto-disables models exceeding z-threshold for 3+ days.
+  calibration:
+    <<: *app-base
+    container_name: polymarket_calibration
+    command: ["python", "-m", "src.calibration"]
+    healthcheck:
+      test: ["CMD", "python", "/app/scripts/docker_healthcheck.py"]
+      interval: 120s
+      timeout: 5s
+      start_period: 30s
+      retries: 3
+
+  # ── Sprint 2 daemons (R8 / R9 / R10) ───────────────────────────────────
+  # Defined here so `docker compose config` validates them, but gated
+  # behind the `sprint2` profile so a vanilla `docker compose up -d`
+  # does NOT spawn them. Sprint 2 activates them with:
+  #   docker compose --profile sprint2 up -d \
+  #     strategy_classifier follower_volume causal
+  # Each daemon degrades gracefully on empty inputs (R8 falls back to
+  # the uniform-prior dummy when models/strategy_classifier.pkl is
+  # missing; R9 + R10 only run nightly batches and sleep otherwise).
+
+  # R8 — The Lens. Periodic strategy classification of tier-0/1 wallets.
+  # Refreshes every STRATEGY_CLASSIFIER_REFRESH_INTERVAL_H hours.
+  strategy_classifier:
+    <<: *app-base
+    profiles: ["sprint2"]
+    container_name: polymarket_strategy_classifier
+    command: ["python", "-m", "src.strategy_classifier"]
+    healthcheck:
+      test: ["CMD", "python", "/app/scripts/docker_healthcheck.py"]
+      interval: 120s
+      timeout: 5s
+      start_period: 60s
+      retries: 3
+
+  # R9 — The Web. Nightly multivariate Hawkes fit at MVHAWKES_BATCH_HOUR_UTC.
+  follower_volume:
+    <<: *app-base
+    profiles: ["sprint2"]
+    container_name: polymarket_follower_volume
+    command: ["python", "-m", "src.follower_volume"]
+    healthcheck:
+      test: ["CMD", "python", "/app/scripts/docker_healthcheck.py"]
+      interval: 120s
+      timeout: 5s
+      start_period: 60s
+      retries: 3
+
+  # R10 — The Truth Test. Nightly 2SLS fit at CAUSAL_DAEMON_BATCH_HOUR_UTC.
+  # Shadow mode strict: causal_gating_enabled=false in Sprint 2.
+  causal:
+    <<: *app-base
+    profiles: ["sprint2"]
+    container_name: polymarket_causal
+    command: ["python", "-m", "src.causal"]
+    healthcheck:
+      test: ["CMD", "python", "/app/scripts/docker_healthcheck.py"]
+      interval: 120s
+      timeout: 5s
+      start_period: 60s
+      retries: 3
+
   # FastAPI dashboard + health endpoints. Disabled by default in dev —
   # uncomment ports to expose.
   api:

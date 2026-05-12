@@ -24,29 +24,35 @@ services:
     restart: unless-stopped
     environment:
       POSTGRES_INITDB_ARGS: "--encoding=UTF8"
+    # Tuned for the R6-R13 schema (21 new tables, partitioned book events
+    # in R11, JSONB-heavy Hawkes/causal blobs). The previous 300 M cgroup
+    # cap caused systemic OOM-kills under load (postgres consistently at
+    # 99 % of limit). Bumped to 1 G with proportionally larger buffers.
     command: >
       postgres
-      -c shared_buffers=64MB
-      -c work_mem=4MB
-      -c maintenance_work_mem=32MB
-      -c max_connections=20
-      -c effective_cache_size=128MB
+      -c shared_buffers=256MB
+      -c work_mem=8MB
+      -c maintenance_work_mem=64MB
+      -c max_connections=25
+      -c effective_cache_size=512MB
       -c checkpoint_completion_target=0.9
     deploy:
       resources:
         limits:
-          memory: 300M
+          memory: 1024M
     # Don't expose Postgres on the public network — only reachable via
     # the compose bridge.
     ports: !reset []
 
   redis:
     restart: unless-stopped
-    command: redis-server --appendonly yes --maxmemory 64mb --maxmemory-policy allkeys-lru
+    # 128 MB anticipates R7 mempool stream, R11 book:events stream, R12
+    # social streams. Previous 64 MB had Redis at 53 % already.
+    command: redis-server --appendonly yes --maxmemory 128mb --maxmemory-policy allkeys-lru
     deploy:
       resources:
         limits:
-          memory: 64M
+          memory: 160M
     ports: !reset []
 
   observer:
@@ -54,7 +60,7 @@ services:
     deploy:
       resources:
         limits:
-          memory: 300M
+          memory: 350M
     logging:
       driver: json-file
       options:
@@ -66,7 +72,9 @@ services:
     deploy:
       resources:
         limits:
-          memory: 600M
+          # +100 M headroom for R8 strategy classifier load + R9 mvHawkes
+          # nightly fit (peak transient).
+          memory: 700M
     logging:
       driver: json-file
       options:
@@ -90,7 +98,8 @@ services:
     deploy:
       resources:
         limits:
-          memory: 200M
+          # +100 M for the R6-R13 endpoint surface + v2 dashboard SQL.
+          memory: 300M
     logging:
       driver: json-file
       options:
@@ -105,6 +114,58 @@ services:
           # 200M is plenty: pg_dump streams ~50 MB compressed, boto3
           # buffers an 8 MB part. Spike room for 2× during upload.
           memory: 200M
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+
+  # ── R6 Spine daemons ────────────────────────────────────────────────
+  onchain:
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 250M
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+
+  crawler:
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 200M
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+
+  falcon_refresher:
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 200M
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+
+  # ── R13 Calibration daemon ──────────────────────────────────────────
+  calibration:
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          # Nightly batch only — 300M handles the bootstrap historical
+          # backfill across 4 models. Steady-state usage is ~80M.
+          memory: 300M
     logging:
       driver: json-file
       options:

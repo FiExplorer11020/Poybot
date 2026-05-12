@@ -39,20 +39,67 @@ async def _build_rpc_client():
             "before the onchain listener can boot"
         ) from exc
 
-    # The provider list comes from settings; the actual pool builder is
-    # owned by src.rpc (Wave-2 Agent A). We try the canonical builder
-    # first and fall back to a constructor-with-empty-list which the
-    # RPCClient should reject defensively.
-    try:
-        from src.rpc.providers import ProviderPool  # type: ignore[attr-defined]
+    # Build the provider list directly from settings — there is no
+    # `ProviderPool.from_settings()` classmethod in the codebase. The
+    # priorities string in `RPC_PROVIDER_PRIORITIES` decides the order.
+    from src.rpc.providers import RPCProvider
 
-        providers = ProviderPool.from_settings().providers  # type: ignore[attr-defined]
-    except Exception as exc:
+    providers: list[RPCProvider] = []
+    priority_order = [
+        p.strip() for p in (settings.RPC_PROVIDER_PRIORITIES or "").split(",") if p.strip()
+    ]
+
+    def _ws_from_https(url: str) -> str | None:
+        """Derive WSS URL from an HTTPS RPC URL (Alchemy/QuickNode pattern).
+
+        Both providers expose the same path under wss:// — we just need
+        the scheme swap. Returns None for non-https inputs so we don't
+        invent broken URLs.
+        """
+        if not url:
+            return None
+        if url.startswith("https://"):
+            return "wss://" + url[len("https://"):]
+        if url.startswith("http://"):
+            return "ws://" + url[len("http://"):]
+        return None
+
+    for i, name in enumerate(priority_order):
+        if name == "local_erigon" and settings.LOCAL_ERIGON_RPC_URL:
+            providers.append(
+                RPCProvider(
+                    name="local_erigon",
+                    url=settings.LOCAL_ERIGON_RPC_URL,
+                    ws_url=settings.LOCAL_ERIGON_WS_URL or _ws_from_https(settings.LOCAL_ERIGON_RPC_URL),
+                    priority=i,
+                )
+            )
+        elif name == "alchemy" and settings.ALCHEMY_RPC_URL:
+            providers.append(
+                RPCProvider(
+                    name="alchemy",
+                    url=settings.ALCHEMY_RPC_URL,
+                    ws_url=_ws_from_https(settings.ALCHEMY_RPC_URL),
+                    api_key=settings.ALCHEMY_RPC_API_KEY,
+                    priority=i,
+                )
+            )
+        elif name == "quicknode" and settings.QUICKNODE_RPC_URL:
+            providers.append(
+                RPCProvider(
+                    name="quicknode",
+                    url=settings.QUICKNODE_RPC_URL,
+                    ws_url=_ws_from_https(settings.QUICKNODE_RPC_URL),
+                    api_key=settings.QUICKNODE_RPC_API_KEY,
+                    priority=i,
+                )
+            )
+
+    if not providers:
         logger.warning(
-            f"ProviderPool.from_settings() failed ({exc!r}); attempting "
-            "bare RPCClient construction — this will likely raise"
+            "polymarket-onchain: no RPC providers configured in .env. "
+            "Set ALCHEMY_RPC_URL or LOCAL_ERIGON_RPC_URL. Listener will idle."
         )
-        providers = []
 
     return RPCClient(providers)
 

@@ -102,11 +102,19 @@ class Settings(BaseSettings):
     # Trade Observer (CLAUDE.md § 9)                                      #
     # ------------------------------------------------------------------ #
     POLYMARKET_WS_URL: str = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
-    # Increased from 50 → 200 to capture more market depth. Polymarket has
-    # ~1900 active markets at any time; 50 was way too narrow. With 200 we
-    # cover the top tier by 24h volume + leader-active markets, which is
-    # where 90%+ of leader signal lives.
-    TOP_MARKETS_COUNT: int = 200
+    # Sprint 1 (2026-05-12, EXECUTION_PLAN § 6 Day 1.1): bumped 200 → 500.
+    # Coverage was stuck at ~9% (254 markets/24h vs ~2800 active). Goal:
+    # ≥50% coverage. Polymarket has ~2800 active markets at any time; the
+    # top 500 by 24h volume cover ~85% of all trade flow. With 2 tokens
+    # per market that's 1000 token IDs to subscribe, which exceeds the
+    # ~200/conn safe limit → see WS_SHARD_COUNT for the shard fan-out.
+    TOP_MARKETS_COUNT: int = 500
+    # Sprint 1 Day 1.1: number of parallel PolymarketWSClient connections.
+    # Each shard subscribes to ``ceil(2 * TOP_MARKETS_COUNT / shard)``
+    # token IDs. At 500 markets × 2 tokens / 4 shards = 250 tokens/conn,
+    # comfortably inside the ~300 ceiling observed in production. Bump
+    # to 5–8 if Polymarket tightens the per-connection limit further.
+    WS_SHARD_COUNT: int = 4
     # HP-1 fix #1 (audit docs/audit/04_perf_hotpaths.md): cut from 30 s → 5 s.
     # The CLOB market WS channel carries no wallet attribution, so every
     # leader-attributed trade is gated by this REST poll. At 30 s the median
@@ -566,6 +574,25 @@ class Settings(BaseSettings):
     POLYMARKET_CLOB_CONTRACT_ADDRESS: str = (
         "0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E"
     )
+    # Sprint 1 Day 2.1 (EXECUTION_PLAN § 4 Décision #1): Polymarket CLOB
+    # matching is OFF-CHAIN, so the CTF Exchange contract above emits no
+    # ``OrderFilled`` events for the bulk of trading. Pivot the on-chain
+    # listener to act as a **settlement verifier** against the
+    # ConditionalTokens ERC-1155 ``TransferSingle`` stream (~800k/h, very
+    # noisy — we don't INSERT, only emit coverage-gap metrics so we can
+    # detect divergence vs the WS+REST primary firehose).
+    POLYMARKET_CONDITIONAL_TOKENS_ADDRESS: str = (
+        "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045"
+    )
+    # ERC-1155 TransferSingle(address,address,address,uint256,uint256).
+    CONDITIONAL_TOKENS_TRANSFER_SINGLE_TOPIC: str = (
+        "0xc3d58168c5ae7397731d063d5bbf3d657854427343f4c083240f7aacaa2d0f62"
+    )
+    # Default mode is "verifier" — keeps the listener honest about the
+    # off-chain truth. Operator can flip to "firehose" to restore the
+    # legacy CLOB-Exchange listening path (still required if Polymarket
+    # ever flips matching back on-chain — unlikely but cheap to keep).
+    ONCHAIN_MODE: str = "verifier"
     # Alert threshold for the polybot_chain_blocks_behind gauge. Polygon
     # produces a block every ~2s, so 30 blocks = ~1 min behind. Default
     # to 30 — the operator gets pinged before the lag crosses the
