@@ -922,3 +922,301 @@ const TABS = [
 Same length array. Same icon vocabulary. The component file list
 roughly mirrors today's structure (component-per-tab + sub-component-
 per-sub-tab) under `static/dashboard/tabs/`.
+
+---
+
+## 12. v2 — Post-skill audit (self-critique iteration)
+
+This section was added after running the `ui-ux-pro-max` design-
+intelligence skill against the v1 proposal above. The skill validated
+80 % of the v1 design but surfaced **14 concrete gaps** that the v1
+doc missed, plus **3 stance revisions** on previously open questions.
+
+### 12.1 What the skill validated (confidence-building)
+
+| v1 decision | Skill style match | Verdict |
+|---|---|---|
+| Dark terminal aesthetic | "Dark Mode (OLED)" — WCAG AAA, Excellent perf | ✓ keep |
+| KPI strips + dense tables + 8 px grid gap | "Data-Dense Dashboard" — exact match incl. design tokens | ✓ keep + adopt skill's specific tokens |
+| Real-time live feeds (Mempool, Microscope, Periphery) | "Real-Time Monitoring" style | ✓ keep |
+| Drill-down on wallet profile | "Drill-Down Analytics" style | ✓ keep |
+| α-matrix heatmap, IV-vs-Hawkes scatter, calibration line charts | Chart-type matches exactly (Heat Map / Scatter / Line) | ✓ keep |
+| Volume forecast = "Line with Confidence Band" | Exact chart-type match | ✓ keep + adopt specific color guidance |
+
+### 12.2 v1 gaps surfaced by the skill (14 items)
+
+#### A. Accessibility gaps — CRITICAL severity
+
+| # | Gap | Fix |
+|---|---|---|
+| A1 | **Color-only status indicators** ("Color Only — HIGH severity" UX rule) — v1 still uses ONLY green/red/yellow for RUNNING / STOPPED / DEGRADED. | Add icons/symbols: `●` running, `○` stopped, `⚠` degraded, `▲` rising, `▼` falling. Keep color but never as the sole signal. |
+| A2 | **Heatmap pattern overlays for colorblind** — skill flagged heatmaps ⚠ colorblind-limited. v1 α-matrix + drift heatmap rely on color gradient alone. | Add subtle pattern overlay (diagonal hatching at 25/50/75 % bins). Provide a "show as table" toggle on every heatmap. |
+| A3 | **Scatter data-table alternative** — IV-vs-Hawkes scatter is the keystone plot but unreadable for screen-reader users. | "show as table" toggle next to the scatter; opens a sortable list of (leader, pool, hawkes_α/μ, IV_ATE, CI_low, CI_high, Wu-Hausman p, F-stat). |
+| A4 | **Pause button on streaming feeds** — "⚠ Flashing elements — provide pause button" was explicit. | Add a pause/play toggle to every live feed (Mempool live, Microscope firehose, Social feed). When paused, freeze the view and queue incoming events with a `+N new` button to release. |
+| A5 | **ARIA live regions for dynamic content** — KPI counters update silently for screen readers. | Wrap every auto-updating KPI value in `<span aria-live="polite">`. The "intent feed" + "decision log" lists get `aria-live="polite"` on the container, NOT on each child. |
+| A6 | **Reduced motion preference** — v1 didn't pin the `@media (prefers-reduced-motion: reduce)` query. | Single shared utility class `.motion-safe-only { transition: …; @media (prefers-reduced-motion: reduce) { transition: none; } }`. Apply to ALL transitions globally. |
+
+#### B. Information design gaps
+
+| # | Gap | Fix |
+|---|---|---|
+| B1 | **Skeleton screens for async data** — v1 mentions spinners but not skeletons. | Each tab declares its skeleton shape — KPI strip + 1–3 panel placeholders. Render skeletons within 100 ms of mount; never show a blank state. |
+| B2 | **Loading state contract per data fetch** — `<KpiCard loading />` and `<DataTable loading />` props standardised. | Add `loading: boolean` prop to every component in the catalogue. Component renders its own skeleton when `loading={true}`. |
+| B3 | **Bulk actions in labelling workspace** — v1 shows one-row-at-a-time labelling. | Multi-select checkbox column + "label N wallets as ___" action bar. Operator can label a cluster of similar wallets in one go. |
+| B4 | **"What changed" timeline on Overview** — common operator-dashboard pattern (Sentry, Datadog) — surfaces recent state changes. | Top-of-Overview component: last 5 events of type {decision, intent, gate-toggle, model-disable, drift-alert}, with timestamp + click-to-tab deep link. |
+
+#### C. Visual design tokens (missing in v1)
+
+The skill returned exact Data-Dense Dashboard design-system variables.
+v1 left these implicit. v2 pins them:
+
+```css
+:root {
+  /* Layout (skill-recommended Data-Dense Dashboard variables) */
+  --grid-gap: 8px;
+  --card-padding: 12px;
+  --section-padding: 16px;
+  --tab-header-height: 56px;
+  --kpi-strip-height: 88px;
+  --sidebar-width: 240px;
+  --table-row-height: 36px;
+
+  /* Typography (Fira Code + Fira Sans — skill-recommended "Dashboard Data" pairing) */
+  --font-mono: 'Fira Code', ui-monospace, 'SF Mono', Menlo, monospace;
+  --font-sans: 'Fira Sans', system-ui, sans-serif;
+  --font-size-xs: 11px;     /* KPI labels, timestamps */
+  --font-size-sm: 12px;     /* Table cells, body */
+  --font-size-md: 14px;     /* Sub-tab labels */
+  --font-size-lg: 18px;     /* KPI values */
+  --font-size-xl: 24px;     /* Tab headers */
+  --line-height-body: 1.5;
+  --line-height-tight: 1.2; /* KPI values, table cells */
+
+  /* Color palette — skill-recommended Fintech/Crypto (Gold trust + purple tech) */
+  --bg-page: #0F172A;            /* slate-900 — page background */
+  --bg-panel: #131A2D;           /* slate-850 — card background */
+  --bg-panel-elevated: #1B243D;  /* slate-800 — hover/active card */
+  --border-subtle: #1E293B;      /* slate-800 borders */
+  --border-strong: #334155;      /* slate-700 borders */
+  --text-primary: #F8FAFC;       /* slate-50 — body text */
+  --text-secondary: #94A3B8;     /* slate-400 — labels/captions */
+  --text-tertiary: #64748B;      /* slate-500 — disabled/inactive */
+  --accent-primary: #F59E0B;     /* amber-500 — warnings, attention */
+  --accent-cta: #8B5CF6;         /* violet-500 — wallet purple, CTAs */
+  --status-ok: #22C55E;          /* green-500 — RUNNING/HEALTHY */
+  --status-warn: #F59E0B;        /* amber-500 — DEGRADED/PENDING */
+  --status-err: #EF4444;         /* red-500 — STOPPED/FAILED/SELL */
+  --status-info: #3B82F6;        /* blue-500 — BUY/INFO/LATENCY */
+  --gate-off: #64748B;           /* slate-500 — gated/inactive */
+
+  /* Motion (skill-recommended 150–300 ms for micro-interactions) */
+  --duration-fast: 150ms;
+  --duration-base: 200ms;
+  --duration-slow: 300ms;
+  --easing-enter: cubic-bezier(0.0, 0.0, 0.2, 1);  /* ease-out */
+  --easing-exit:  cubic-bezier(0.4, 0.0, 1, 1);    /* ease-in */
+  --easing-move:  cubic-bezier(0.4, 0.0, 0.2, 1);  /* ease-in-out */
+
+  /* Elevation */
+  --shadow-card: 0 1px 2px rgba(0,0,0,0.4);
+  --shadow-panel: 0 4px 12px rgba(0,0,0,0.5);
+  --shadow-modal: 0 16px 48px rgba(0,0,0,0.65);
+
+  /* Z-index scale (skill-recommended) */
+  --z-base: 1;
+  --z-sticky: 10;
+  --z-overlay: 20;
+  --z-modal: 30;
+  --z-tooltip: 50;
+}
+```
+
+#### D. Chart-specific color guidance (v1 was vague)
+
+| Chart | v1 said | v2 (skill-pinned) |
+|---|---|---|
+| R10 IV vs Hawkes scatter | "scatter" | Color axis gradient blue→red; opacity 0.6–0.8 to show density; provide data-table toggle |
+| R8 drift heatmap | "heatmap" | Diverging palette for ±drift; pattern overlay 25/50/75 bins; numerical legend |
+| R9 α-matrix | "heatmap" | Cool-to-hot gradient; legend with α scale ticks |
+| R9 volume forecast | "forecast" | Actual solid `#0080FF`; forecast dashed `#FF9500`; CI band light shading; legend mandatory |
+| Calibration loss trajectories | "line chart" | Single-color per model, distinct colors per model — colorblind-safe palette; pattern overlay on lines |
+| Mempool live feed | "streaming" | Bright pulse `#22C55E` on incoming; fading opacity for historical entries (1.0 → 0.6 over 30 s) |
+
+#### E. Specific anti-patterns to avoid (skill flagged)
+
+- **No emoji icons** — v1 wireframes show characters like `◈ ◍ ⬢ ⧉` for sidebar icons. Replace with **Lucide** or **Heroicons** SVG icons (24×24 viewBox, `w-5 h-5` Tailwind sizing).
+- **No `bg-white/10` glass cards** — won't read in our dark mode. Use `bg-[--bg-panel]` solid backgrounds with `border border-[--border-subtle]`.
+- **No `scale-105` hover transforms** — they shift surrounding layout in dense tables. Use `bg-[--bg-panel-elevated]` on hover instead.
+- **No `bg-bounce` / `animate-bounce`** — continuous animations on decorative elements are distracting per UX rule. Reserve `animate-pulse` for skeleton screens only; reserve `animate-spin` for loaders only.
+
+### 12.3 Stance revisions on v1 open questions
+
+| Q from v1 § 10 | v1 default | v2 stance (after skill) | Why changed |
+|---|---|---|---|
+| Q1: EXECUTION sub-tabs vs three top-level | sub-tabs | **sub-tabs** (confirmed) | Drill-Down Analytics style validates the breadcrumb + sub-tab pattern |
+| Q2: Labelling workspace in-app vs Jupyter | in-app | **in-app** (confirmed) + **multi-select bulk action** | Bulk Actions UX rule explicitly applies; in-app iteration is faster |
+| Q3: Counterfactual UI vs notebook | UI for presets, notebook for freedom | **same — both** (no change) | Skill validated drill-down + research-tier separation |
+| Q4: Drift gauges — all 4 vs only non-trivial | all 4 | **all 4 always visible** (confirmed) + add icon legend (●/○/⚠) per A1 | Color-only rule reinforces |
+| Q5: Cross-market resolution — auto vs pending-review | pending-review | **pending-review always** (confirmed) | Bulk action available for the operator to confirm batches |
+| Q6: Mempool feed — paginated vs streaming | streaming with pause-on-hover | **streaming with explicit pause button** + `+N new` badge | A4 explicit pause requirement from skill |
+
+### 12.4 OVERVIEW layout revision — adopt Bento Grid
+
+The skill explicitly recommends the "Bento Grid Showcase" pattern for
+modular dashboard layouts ("scannable value props, high information
+density without clutter"). v1 showed the brain/eyes/hands/mirror as a
+3-card row + 1 wide card. v2 adopts a 2×2 bento grid:
+
+```
+┌─ KPI STRIP (8 KPIs across the top) ────────────────────────────────────┐
+
+┌─ Brain ─────────────────┐  ┌─ Eyes ─────────────────────┐
+│ Phase + maturity + 4    │  │ R6 ingestion ✓             │
+│ model status pills      │  │ R6 cold tier  ✓            │
+│  (●protected / ○off /   │  │ R11 L3 book   ✓            │
+│   ⚠pending)             │  │ R12 social    idle (◯)     │
+│ [click → INTELLIGENCE]  │  │ Coverage  89.4 % ●         │
+└─────────────────────────┘  └────────────────────────────┘
+
+┌─ Hands ─────────────────┐  ┌─ Mirror ───────────────────┐
+│ R7 mempool      ●       │  │ follow_conf  Brier 0.043   │
+│ Prefill pool   38/40    │  │ vol_forecast pending —     │
+│ Last fire      — (●OK)  │  │ causal_ate   gated (◯)     │
+│ Shadow firing  0        │  │ strategy_cls log 0.51 ●    │
+│ Live firing    ○ off    │  │ Auto-disabled 0 / Manual 0 │
+│ Killswitch     ● armed  │  │ Next batch   04:30 UTC     │
+│ [click → MEMPOOL]       │  │ [click → OPERATIONS/Calib] │
+└─────────────────────────┘  └────────────────────────────┘
+
+┌─ "What Changed" Timeline (last 5 events) ─────────────────┐
+│ 11:14:03  ○→●  causal_gate enabled by operator            │
+│ 11:08:54  4 intents detected (mempool)                    │
+│ 10:42:17  0 R8 drift alerts in last hour                   │
+│ 04:30:00  calibration batch — 14 predictions logged       │
+│ 00:33:00  bot started (10h 43m uptime)                    │
+└────────────────────────────────────────────────────────────┘
+```
+
+Each Bento card is **clickable** (cursor-pointer + `bg-panel-elevated`
+on hover) and deep-links to its owning tab — operator's primary entry
+point post-login.
+
+### 12.5 Implementation prerequisites (NEW — was implicit in v1)
+
+Before the first MVP PR ships, these need to land:
+
+| # | Prerequisite | Owner | Effort |
+|---|---|---|---|
+| P1 | Inject Fira Code + Fira Sans via Google Fonts CSS in `templates/dashboard.html` | frontend | 15 min |
+| P2 | Replace existing character icons (◈ ◍ ⬢ etc.) with Lucide SVG bundle (CDN or vendored) | frontend | 1 h |
+| P3 | Add `:root { --* }` design tokens block to a new `static/dashboard/dashboard-tokens.css` | frontend | 30 min |
+| P4 | Extract the v1 shared components (KpiStrip, StatusPill, BreadcrumbHeader, AuditLogTable, WalletCell, MarketCell, SparklineCell) into `dashboard-components.jsx` | frontend | 4 h |
+| P5 | Add reduced-motion media query to `dashboard-tokens.css` | frontend | 5 min |
+| P6 | Replace `transition: …` ad-hoc with the `.motion-safe-only` utility class | frontend | 1 h |
+| P7 | Wire `aria-live="polite"` on all KPI value spans + the live-feed list containers | frontend | 1 h |
+| P8 | Skeleton component library (one per data shape: KpiStripSkeleton, TableSkeleton, ChartSkeleton) | frontend | 2 h |
+
+Total prerequisite effort: ~10 h. Ships in a single dedicated PR
+before P1 (Overview refonde) begins.
+
+### 12.6 Updated implementation roadmap (v2)
+
+```
+PR-0: PREREQUISITES (10 h) — fonts, icons, tokens, motion, skeletons
+   ↓
+PR-1: OVERVIEW refonde with bento grid + What-Changed timeline
+   ↓
+PR-2: OPERATIONS / Calibration (R13 surface)
+   ↓
+PR-3: OPERATIONS / Risk extension (4 gate toggles with banners)
+   ↓
+PR-4: MEMPOOL tab (with explicit pause button on live feed)
+   ↓
+PR-5: INTELLIGENCE / Lens (R8 + bulk-action labelling)
+   ↓ (MVP cut shipped)
+PR-6: INTELLIGENCE / Web (R9 — α-matrix with pattern overlay)
+   ↓
+PR-7: INTELLIGENCE / Causal (R10 — scatter with data-table toggle)
+   ↓
+PR-8: WALLET LAB refonde
+   ↓
+PR-9: MICROSCOPE tab
+   ↓
+PR-10: PERIPHERY tab
+   ↓
+PR-11: OPERATIONS / Health + Research notebooks
+   ↓ (P2 cut shipped)
+PR-12: Polish — drift heatmap, cluster explorer, instrument timeline
+PR-13: Operator-onboarding — in-app tour + What's New badges
+```
+
+### 12.7 Pre-delivery accessibility checklist (NEW)
+
+Every component PR must satisfy:
+
+- [ ] **Color contrast ≥ 4.5:1** for text on backgrounds (tested via DevTools or `contrast.js`)
+- [ ] **No color-only signals** — status always has icon + text label alongside color
+- [ ] **Pattern overlay on all heatmaps + scatter color-axis** (for colorblind users)
+- [ ] **Data-table toggle on every chart** (scatter, heatmap, line) — for screen-reader users
+- [ ] **`aria-live="polite"`** on dynamic content containers
+- [ ] **Visible focus rings** on every interactive element (`focus-visible:ring-2 ring-[--accent-cta]`)
+- [ ] **Keyboard navigation** — tab order matches visual order, no keyboard traps
+- [ ] **`prefers-reduced-motion`** honored — transitions disabled when set
+- [ ] **Skeleton screens** show within 100 ms of mount, never blank
+- [ ] **Pause button** on every streaming feed
+- [ ] **Touch targets ≥ 44×44 px** (sidebar items, toggles, buttons)
+- [ ] **Alt text** on all meaningful images (graphs SHOULD have aria-label describing their content)
+
+### 12.8 The single sentence (revised)
+
+> **The Phase-3 dashboard surfaces every R6→R13 capability as 8
+> coherent tabs built on the skill-validated Data-Dense Dashboard +
+> Dark-Mode-OLED + Real-Time Monitoring style triplet, with
+> explicit design tokens (Fira Code/Sans, fintech gold + violet
+> accents on slate-900), Bento Grid Overview, pause-able streaming
+> feeds, pattern-overlaid heatmaps, data-table toggles on every
+> chart, and a reduced-motion-respecting + ARIA-live-announcing +
+> skeleton-first interaction model — preserving operator muscle
+> memory while removing the 14 accessibility / information-design
+> gaps the v1 proposal missed.**
+
+---
+
+## 13. Skill query log (audit trail)
+
+These commands were run to validate / iterate the v1 proposal. Re-run
+any of them on a future iteration:
+
+```bash
+# Design system (top-level)
+python3 ~/.claude/skills/ui-ux-pro-max/scripts/search.py \
+  "fintech trading dashboard dark terminal real-time monitoring data-dense" \
+  --design-system -p "Polymarket Bot Phase 3" -f markdown
+
+# Style domain
+python3 ~/.claude/skills/ui-ux-pro-max/scripts/search.py \
+  "dashboard data-dense terminal monospace operator" --domain style -n 5
+
+# Chart domain
+python3 ~/.claude/skills/ui-ux-pro-max/scripts/search.py \
+  "real-time time-series multi-panel dashboard heatmap scatter" --domain chart -n 6
+
+# UX domain
+python3 ~/.claude/skills/ui-ux-pro-max/scripts/search.py \
+  "dashboard accessibility data-density information-architecture animation" \
+  --domain ux -n 8
+
+# Typography
+python3 ~/.claude/skills/ui-ux-pro-max/scripts/search.py \
+  "monospace technical dashboard analytics" --domain typography -n 4
+
+# Color
+python3 ~/.claude/skills/ui-ux-pro-max/scripts/search.py \
+  "fintech crypto trading dark professional" --domain color -n 4
+
+# React stack
+python3 ~/.claude/skills/ui-ux-pro-max/scripts/search.py \
+  "dashboard live updates websocket polling memoization" --stack react -n 6
+```
+
+Findings synthesised into § 12 above.
