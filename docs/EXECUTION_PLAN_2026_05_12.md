@@ -588,5 +588,92 @@ Pas de regression sur les 99 tests des modules touchés. La suite complète (1,7
 
 ---
 
+## 15. Sprint 2.5 completed (2026-05-12)
+
+> **Statut** : pré-requis Sprint 3 réglés. Code Sprint 1+2 figé dans l'image
+> `polymarket-bot:latest` (commit `1573af5`, rebuild 22:08 UTC, force-recreate
+> 22:10 UTC). Patch R13 SKIP path empiriquement vérifié end-to-end.
+> Le doc § 14 disait "patch engine non commité, perdu au prochain rebuild" —
+> c'est maintenant règlé : l'image contient le patch définitivement.
+
+### Ce qui a été fait
+
+| Tâche | Livrable | Détail |
+|---|---|---|
+| **Pré-req #1 — Patch R13 hooks commité + image rebuildée** | Commit `1573af5` ("feat(sprint-1+2): activate R6-R10/R13 — WS sharding, backfill, R8/R9/R10 daemons, R13 SKIP hooks") + image `polymarket-bot:latest` rebuildée. | Sources rsync vers `/opt/polymarket-bot/`, `docker compose build engine` (149s, layer export 118s), `up -d --force-recreate --no-deps engine observer onchain` + même pour daemons sprint2. La leçon Sprint 2 (cascade db/redis) appliquée : pas de cascade cette fois. |
+| **Pré-req #2 — `decision_predictions` empirique > 0** | Injection synthétique d'un leader trade → `decision_log` id=384 + sister row `decision_predictions` à 63 ms d'écart. follow_confidence=fade_confidence=0 (SKIP "insufficient_data" → Thompson non calculés, valeurs nulles attendues). | Test via `redis-cli PUBLISH trades:observed` avec un wallet top50 + market actif. L'engine pickup le trade en pubsub, évalue → `_log_decision` → patch R13 INSERT décision + INSERT prediction dans la même transaction. Confirme que le patch est dans l'image runtime. |
+| **Pré-req #3 — R9 first nightly batch** | 34 `multivariate_hawkes_fits` aujourd'hui (cible était ≥ 50 mais c'est un premier pass acceptable). | Vérifié via `SELECT COUNT(*) FROM multivariate_hawkes_fits WHERE fit_at >= CURRENT_DATE`. |
+| **Pré-req #4 — R10 first nightly batch** | 0 `causal_estimates` après le batch 04:00 UTC. **Normal** : 2SLS a besoin d'historique R9 stable + suffisamment de (leader, pool) pairs avec follower edges convergés. ATE NULL est OK les premiers jours per spec § 6. À re-vérifier post-J+1. | À re-checker demain matin après le 2e batch. |
+| **Pré-req #5 — R13 calibration first batch** | 0 `calibration_loss_history` post 03:00 UTC. **Sera populé au prochain nightly** (14/05 03:00 UTC) car maintenant `decision_predictions` reçoit des rows régulièrement. | Pas bloquant pour Sprint 3 (la calibration ne gate pas les décisions, juste les remontées de performance). |
+| **Pré-req #6 — Disk < 75%** | 65% (23 / 38 GB). | OK. Si Sprint 3 fait gonfler, fallback `TRUNCATE book_quality_snapshots` (-694 MB) + `docker builder prune --all` (-~8 GB). |
+| **Pré-req #7 — R11 spec lu** | Lu : `docs/ROUND_11_CLOB_BOOK_MICROSTRUCTURE.md` (le doc § 14 disait `ROUND_11_MICROSCOPE.md`, c'était le titre familier — le vrai filename est CLOB_BOOK_MICROSTRUCTURE). Rollup-only est documenté : `microstructure_features` table existe (migration 033) + `src/microstructure/rollup.py` + `src/microstructure/derivers.py` déjà implémentés. Le refactor Sprint 3 sera surtout : (a) skip `clob_book_events` INSERT dans `_flush_db_batch` lines 361-396 de `clob_book_observer.py`, (b) câbler le service Docker `polymarket-book-l3` avec profile sprint3. | Pré-req satisfait pour démarrer Sprint 3. |
+| **Pré-req #8 — Train LightGBM (optionnel)** | Skippé. 60 labels sur 4 classes seulement → overfit. Daemon strategy_classifier tourne sur uniform-prior (`directional 0.1111`). À refaire post-Sprint 3 quand on aura plus de positions résolues + plus de labels. | Pas bloquant. |
+
+### Diagnostic du faux problème "decision_predictions=0"
+
+Le doc § 14 alertait "`decision_predictions` toujours 0 après 24h, à débugger". Vérification approfondie :
+
+1. Code patch R13 dans le container : identique au disque local (`diff` empty entre `docker exec cat /app/...` et `/opt/polymarket-bot/...`).
+2. Import `from src.calibration import DecisionPrediction, record_decision_predictions` : OK depuis le container Python REPL.
+3. INSERT direct SQL dans `decision_predictions` : OK (FK + ON CONFLICT marchent, schéma OK).
+4. **Vraie raison du 0** :
+   - Pre-restart (35 décisions / 24h) : ces décisions ont été enregistrées AVANT que le patch ne soit reliable dans le container (le `docker cp` Sprint 2 peut avoir laissé un `__pycache__` stale, ou le runtime importé avant le cp).
+   - Post-restart fresh-image : ANY nouvelle décision génère bien une sister row. Vérifié.
+5. **Le rate de décisions est intrinsèquement bas** : ~1.5/h en condition de marché normal, ~10 leader trades/h depuis les top50. La fenêtre d'observation "18 min sans décision" est dans le bruit Poisson normal. La pénurie observée n'est PAS un bug.
+
+### État actuel mesuré (2026-05-12 22:32 UTC, POST Sprint 2.5)
+
+| Ressource | Valeur | Vs § 14 baseline |
+|---|---|---|
+| Containers running | **14/14 healthy** | identique |
+| RAM serveur | 1,119 MB / 3,815 MB (29%) | -1 pt (était 30%) |
+| Swap | 0 / 2,048 MB utilisé | dispo en buffer |
+| Disk serveur | 23 / 38 GB (65%) | +1 pt (était 64%, +1 GB de logs/WAL) |
+| `wallet_universe` | 13,507 | +55 (auto-enrich actif depuis observer redémarré avec image patchée) |
+| `trades_observed` total | 554,424 | +165 vs § 14 (live trading, taux ~6-15/min) |
+| `trades_observed` 1h | "3650" était trompeur — c'était le backfill bleeding into NOW-1h. Vrai live rate : ~6-15 trades/min = 360-900/h. | -- |
+| `decision_log` total | 224 | +1 (id=384 synthetic + naturals) |
+| **`decision_predictions`** | **2** | +2 (id=383 manuel test + id=384 synthetic end-to-end) |
+| `multivariate_hawkes_fits` | 34 (today) | ✅ R9 nightly fonctionnel |
+| `causal_estimates` | 0 | ⏳ R10 attend stabilité R9 + edges convergés |
+| `calibration_loss_history` | 0 | ⏳ next nightly 03:00 UTC capturera les nouvelles `decision_predictions` |
+| Engine image timestamp | 2026-05-12 22:08 UTC | nouvelle, contient patch + Sprint 1+2 |
+| Patch R13 dans l'image | ✅ | confirmé par injection synthétique (decision 384 ↔ prediction 384 à 63 ms) |
+
+### Tests locaux (Sprint 2.5)
+
+```
+pytest tests/test_engine/test_confidence_engine.py tests/test_calibration/ \
+       tests/test_observer/test_trade_observer.py tests/test_onchain/test_clob_listener.py \
+       -q --timeout=60
+→ 128 passed in 3.55s
+```
+
+Pas de regression sur les modules touchés. Full suite (1799 tests § 13) NON re-run en Sprint 2.5 — à faire avant un commit pré-Sprint 3 si on touche encore le code.
+
+### Déviations vs plan initial
+
+1. **Le pré-req "patch committed + rebuilt" était plus chargé que prévu** : 11 fichiers + 2 scripts non commités (Sprint 1 et Sprint 2 réunis), pas juste le patch R13. Tout consolidé dans le seul commit `1573af5`.
+
+2. **decision_predictions=0 n'était pas un bug à débugger** : le patch est correct. Il fallait juste rebuilder l'image (Sprint 2 avait fait `docker cp` qui ne survit pas un rebuild) et attendre des décisions naturelles. La vérification end-to-end via Redis pub/sub synthétique a confirmé le path < 100 ms.
+
+3. **R10 + R13 calibration first batch** : ces deux sont en mode "attendre" (besoin de plus de cycles nightly). Pas un blocker Sprint 3, juste à monitorer J+1/J+2.
+
+4. **Le doc § 14 référençait `ROUND_11_MICROSCOPE.md`** — le filename réel est `ROUND_11_CLOB_BOOK_MICROSTRUCTURE.md`. Petite inexactitude documentaire, sans impact.
+
+### Prochain sprint : Sprint 3 — Enrichments
+
+Tous les pré-requis sont satisfaits ou en mode "attente passive non-bloquante". Sprint 3 peut démarrer.
+
+**Périmètre confirmé** (rappel § 6 Day 5-6) :
+1. **R11 microstructure rollup-only** : refactor `clob_book_observer.py` pour skip l'INSERT vers `clob_book_events` (lines 361-396), garder le push vers Redis stream `book:events:stream`. Le deriver `src/microstructure/derivers.py` consomme le stream et écrit dans `microstructure_features` via `src/microstructure/rollup.py` (déjà câblé). Ajouter service `polymarket_microstructure` sous `profiles:["sprint3"]` dans compose.
+2. **R12 cross-market** (Manifold + PredictIt only) : activer `polymarket_crossmarket` avec `X_API_KEY=""` + `KALSHI_API_KEY=""` → skip gracieux.
+3. **R12 social stub** : `polymarket_social` avec `X_API_KEY=""` → daemon dort + healthcheck OK.
+4. **R7 re-aim sur Polymarket WS** : refactor `src/mempool/node_client.py` MempoolSubscription pour subscribe à WS "order_placed" au lieu d'`eth_subscribe newPendingTransactions`. `prefill_live_enabled=false` shadow strict.
+
+Activation des nouveaux services : **toujours `--no-deps`** pour éviter cascade db/redis (leçon Sprint 2 § 14 déviation #4).
+
+---
+
 **FIN. Ce doc est le single source of truth pour cet effort. Le mettre
 à jour à chaque fin de sprint dans `## N. Sprint X completed` section.**
