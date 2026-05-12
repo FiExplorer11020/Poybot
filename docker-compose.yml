@@ -325,13 +325,27 @@ services:
       start_period: 60s
       retries: 3
 
-  # R7 — DEFERRED to Sprint 3.5. The current `src/mempool/node_client.py`
-  # targets Erigon `eth_subscribe('newPendingTransactions')` which
-  # doesn't carry off-chain CLOB trades (EXECUTION_PLAN § 4 Décision
-  # #5). Re-aiming onto Polymarket WS requires an architectural choice
-  # — direct WS connection vs proxying through the observer's existing
-  # `trades:observed` pub/sub — that hasn't been pinned yet. Ship the
-  # rest of Sprint 3 first, then refactor.
+  # R7 — Sprint 3.5 mempool watcher (EXECUTION_PLAN § 4 Décision #5).
+  # Re-aimed at the observer's `trades:observed` pub/sub channel via
+  # `LeaderTradeSubscription`. Stays in shadow mode
+  # (PREFILL_LIVE_ENABLED=false) — paper trades only — until the soak
+  # proves the synthetic-intent path is stable.
+  mempool:
+    <<: *app-base
+    profiles: ["sprint3"]
+    container_name: polymarket_mempool
+    command: ["python", "-m", "src.mempool"]
+    environment:
+      DATABASE_URL: postgresql://polymarket:polymarket_dev_password@postgres:5432/polymarket
+      REDIS_URL: redis://redis:6379/0
+      PREFILL_LIVE_ENABLED: "false"
+      MEMPOOL_SUBSCRIPTION_MODE: "polymarket_ws_proxy"
+    healthcheck:
+      test: ["CMD", "python", "/app/scripts/docker_healthcheck.py"]
+      interval: 60s
+      timeout: 5s
+      start_period: 60s
+      retries: 3
 
   # FastAPI dashboard + health endpoints. Disabled by default in dev —
   # uncomment ports to expose.

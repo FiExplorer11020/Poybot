@@ -1,19 +1,24 @@
 """Pure-Python decoder for Polymarket L3 WebSocket messages — Round 11.
 
-Lives in its own module so the :mod:`clob_book_observer` daemon stays
-small enough to fit under the project's 500-line ceiling. Pure
-function + dataclass; no I/O, no asyncio. Tested directly via
-:mod:`tests.test_observer.test_clob_book_observer`.
+Tested directly via :mod:`tests.test_observer.test_clob_book_decoder`
+and :mod:`tests.test_observer.test_clob_book_observer`.
 
-The five canonical event types in :data:`_VALID_EVENT_TYPES` map onto
-the same vocabulary the DB column ``clob_book_events.event_type``
-(migration 032) accepts.
+Two entry points coexist:
 
-Wallet attribution caveat (spec § 3.1): Polymarket's WS does NOT ship
-wallet_address on placement / modification / cancellation events — only
-on fills. The decoder preserves NULL on the non-fill events and reads
-the wallet from any of the {wallet_address, wallet, owner, maker}
-fields when present.
+  * :func:`decode_ws_message`  — legacy single-event shapes
+    (``order_placed`` / ``order_filled`` / etc.). Returns
+    ``BookEvent | None``.
+  * :func:`decode_ws_messages` — real Polymarket Market channel
+    fan-out. Returns ``list[BookEvent]``. Handles ``price_change``
+    (N changes per frame), ``last_trade_price`` (a fill), and
+    snapshot frames (``book`` etc., which emit nothing). Use
+    :func:`is_known_non_event_message` to distinguish valid-no-event
+    frames from malformed payloads.
+
+Wallet attribution caveat (spec § 3.1): the Market channel does NOT
+ship wallets on placements / modifications / cancellations / fills —
+NULL is preserved. The on-chain reconciler joins with
+``trades_observed`` later.
 """
 
 from __future__ import annotations
@@ -264,3 +269,229 @@ def decode_ws_message(msg: dict[str, Any], *, now_s: float | None = None) -> Boo
         raw_payload=msg,
         received_at=float(now_s) if now_s is not None else time.time(),
     )
+
+
+# --------------------------------------------------------------------------- #
+# Sprint 3 — Polymarket Market channel real wire format                        #
+# --------------------------------------------------------------------------- #
+
+# Valid event_types that carry no BookEvent delta (snapshot / ticker /
+# control plane). The observer treats them as "valid but no event" so
+# they don't bump the ``invalid`` drop counter.
+_NON_EVENT_MESSAGE_TYPES: frozenset[str] = frozenset({
+    "book", "best_bid_ask", "new_market", "tick_size_change", "market_resolved",
+})
+
+# WS-feed side normalisation. The Market channel ships BUY/SELL; the
+# legacy decoder also accepts BID/ASK — same table.
+_SIDE_NORMALISATION: dict[str, str] = {
+    "buy": "buy", "bid": "buy", "sell": "sell", "ask": "sell",
+}
+
+
+def _normalise_side(raw: Any) -> str | None:
+    if not isinstance(raw, str):
+        return None
+    return _SIDE_NORMALISATION.get(raw.strip().lower())
+
+
+def is_known_non_event_message(msg: dict[str, Any]) -> bool:
+    """True when ``msg`` is a valid Polymarket WS frame that carries no
+    book-event delta (snapshot / ticker / control plane). The observer
+    uses this to avoid double-counting them under ``invalid``.
+    """
+    if not isinstance(msg, dict):
+        return False
+    raw_type = msg.get("event_type") or msg.get("type") or msg.get("kind")
+    if not isinstance(raw_type, str):
+        return False
+    return raw_type.strip().lower() in _NON_EVENT_MESSAGE_TYPES
+
+
+def _decode_last_trade_price(
+    msg: dict[str, Any], *, now_s: float | None
+) -> BookEvent | None:
+    """Map a ``last_trade_price`` frame (a real fill) to a ``filled``
+    :class:`BookEvent`. The Polymarket Market channel does NOT ship the
+    maker/taker wallets on this frame — the wallet stays NULL just like
+    on placements. Downstream readers join with ``trades_observed`` for
+    attribution.
+    """
+    market_id = str(msg.get("market") or msg.get("market_id") or "").strip()
+    token_id = str(
+        msg.get("asset_id") or msg.get("token_id") or msg.get("asset") or ""
+    ).strip()
+    if not market_id or not token_id:
+        return None
+
+    side = _normalise_side(msg.get("side"))
+    if side is None:
+        return None
+
+    price = _to_decimal(msg.get("price"))
+    size_delta = _to_decimal(msg.get("size"))
+    if price is None or size_delta is None:
+        return None
+
+    event_time = _parse_timestamp(
+        msg.get("event_time") or msg.get("timestamp") or msg.get("time") or msg.get("ts")
+    ) or datetime.now(tz=timezone.utc)
+
+    # ``transaction_hash`` is the on-chain settlement hash — use it as the
+    # order_hash so downstream joins with the on-chain reconciler line up.
+    tx_hash = msg.get("transaction_hash") or msg.get("hash") or msg.get("order_hash")
+    order_hash = str(tx_hash).strip() if tx_hash else None
+    if order_hash == "":
+        order_hash = None
+
+    return BookEvent(
+        event_time=event_time,
+        market_id=market_id,
+        token_id=token_id,
+        event_type=EVENT_FILLED,
+        side=side,
+        price=price,
+        size_delta=size_delta,
+        order_hash=order_hash,
+        wallet_address=None,  # spec § 3.1: WS Market channel doesn't ship wallets
+        source="ws",
+        raw_payload=msg,
+        received_at=float(now_s) if now_s is not None else time.time(),
+    )
+
+
+def _decode_price_change(
+    msg: dict[str, Any],
+    *,
+    now_s: float | None,
+    level_state: dict[tuple[str, str, str], Decimal] | None,
+) -> list[BookEvent]:
+    """Fan out a ``price_change`` frame into N :class:`BookEvent` rows.
+
+    Polymarket packs every level update for a market into one WS frame
+    under ``price_changes``. Each entry carries the NEW resting size at
+    ``(asset_id, price, side)`` — NOT a delta. With ``level_state`` the
+    decoder synthesises signed deltas: positive → ``placed``, negative
+    or zero-clear → ``cancelled``. Without cache, treats wire size as
+    positive delta and ``size==0`` as a clear.
+    """
+    market_id = str(msg.get("market") or msg.get("market_id") or "").strip()
+    if not market_id:
+        return []
+
+    changes = msg.get("price_changes") or msg.get("changes") or []
+    if not isinstance(changes, list) or not changes:
+        return []
+
+    base_ts = _parse_timestamp(
+        msg.get("timestamp") or msg.get("event_time") or msg.get("time") or msg.get("ts")
+    ) or datetime.now(tz=timezone.utc)
+
+    out: list[BookEvent] = []
+    for entry in changes:
+        if not isinstance(entry, dict):
+            continue
+        token_id = str(
+            entry.get("asset_id") or entry.get("token_id") or entry.get("asset") or ""
+        ).strip()
+        if not token_id:
+            continue
+        side = _normalise_side(entry.get("side"))
+        if side is None:
+            continue
+        price = _to_decimal(entry.get("price"))
+        new_size = _to_decimal(entry.get("size"))
+        if price is None or new_size is None:
+            continue
+
+        cache_key = (token_id, str(price), side)
+        if level_state is not None:
+            prev_size = level_state.get(cache_key, Decimal("0"))
+            delta = new_size - prev_size
+            level_state[cache_key] = new_size
+        else:
+            # No cache → treat the wire size as the (positive) magnitude;
+            # use ``new_size == 0`` as the unambiguous "level cleared"
+            # marker.
+            prev_size = Decimal("0")
+            delta = -prev_size if new_size == 0 else new_size
+
+        if delta == 0:
+            # No-op event (size unchanged or both zero). Skip rather than
+            # emit a noisy zero-delta row.
+            continue
+        if delta > 0:
+            event_type = EVENT_PLACED
+            size_delta = delta
+        else:
+            event_type = EVENT_CANCELLED
+            size_delta = delta  # already negative — matches legacy convention
+
+        order_hash_raw = entry.get("hash") or entry.get("order_hash") or entry.get("order_id")
+        order_hash = str(order_hash_raw).strip() if order_hash_raw else None
+        if order_hash == "":
+            order_hash = None
+
+        out.append(
+            BookEvent(
+                event_time=base_ts,
+                market_id=market_id,
+                token_id=token_id,
+                event_type=event_type,
+                side=side,
+                price=price,
+                size_delta=size_delta,
+                order_hash=order_hash,
+                wallet_address=None,  # spec § 3.1: no wallet on non-fill
+                source="ws",
+                raw_payload=msg,
+                received_at=float(now_s) if now_s is not None else time.time(),
+            )
+        )
+    return out
+
+
+def decode_ws_messages(
+    msg: dict[str, Any],
+    *,
+    now_s: float | None = None,
+    level_state: dict[tuple[str, str, str], Decimal] | None = None,
+) -> list[BookEvent]:
+    """Fan-out decoder for the real Polymarket Market channel.
+
+    Returns ``list[BookEvent]`` (possibly empty). Callers MUST use
+    :func:`is_known_non_event_message` to distinguish valid-no-event
+    frames (snapshot / ticker / control plane) from malformed
+    payloads — both return ``[]``, but only the former should NOT
+    bump the ``invalid`` drop counter.
+
+    Pure modulo optional ``level_state`` mutation: reads previous
+    resting size at ``(token_id, price, side)`` and writes the new one.
+    Legacy single-event shapes are delegated to :func:`decode_ws_message`
+    so existing consumers don't break.
+    """
+    if not isinstance(msg, dict):
+        return []
+
+    raw_type = msg.get("event_type") or msg.get("type") or msg.get("kind")
+    raw_key = raw_type.strip().lower() if isinstance(raw_type, str) else ""
+
+    if raw_key == "price_change":
+        return _decode_price_change(msg, now_s=now_s, level_state=level_state)
+
+    if raw_key == "last_trade_price":
+        evt = _decode_last_trade_price(msg, now_s=now_s)
+        return [evt] if evt is not None else []
+
+    if raw_key in _NON_EVENT_MESSAGE_TYPES:
+        # ``book`` snapshot, best_bid_ask ticker, etc. — valid but no
+        # deltas to emit. The caller knows via
+        # ``is_known_non_event_message`` to skip the invalid-drop count.
+        return []
+
+    # Legacy per-order shapes (or any other shape the original decoder
+    # understands) — delegate. Keeps backward compat with tests that
+    # drive the observer with synthetic ``order_placed``/``order_filled``
+    # payloads.
+    evt = decode_ws_message(msg, now_s=now_s)
+    return [evt] if evt is not None else []

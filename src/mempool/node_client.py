@@ -32,10 +32,13 @@ See ``docs/ROUND_7_MEMPOOL_AND_PREFILL.md`` § 3.1 for the spec.
 
 from __future__ import annotations
 
+import asyncio
+import hashlib
+import json
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import TYPE_CHECKING, AsyncIterator, Optional
+from typing import TYPE_CHECKING, Any, AsyncIterator, Optional
 
 from loguru import logger
 
@@ -88,6 +91,17 @@ class MempoolTx:
 
     See module docstring for the field contract; the Wave-1 architect
     docstring captures the per-field rationale.
+
+    Sprint 3.5 proxy-path note
+    --------------------------
+    When the daemon runs in ``polymarket_ws_proxy`` mode
+    (:class:`LeaderTradeSubscription`), the tx is SYNTHETIC: there is
+    no on-chain transaction behind it, ``calldata`` is empty and
+    gas/nonce fields are zero. The original trade payload from the
+    observer's ``trades:observed`` channel is stashed on
+    ``source_payload`` so the daemon can short-circuit the
+    :class:`src.mempool.tx_decoder.CLOBTxDecoder` step (which requires
+    real CLOB calldata) and build the :class:`LeaderIntent` directly.
     """
 
     tx_hash: str
@@ -99,6 +113,12 @@ class MempoolTx:
     calldata: bytes
     received_at: datetime
     replaces: Optional[str] = None
+    # Proxy-mode payload (None for the legacy Erigon path). Holds the
+    # JSON-decoded ``trades:observed`` event so downstream code can
+    # build a :class:`LeaderIntent` without going through the ABI
+    # decoder. Backwards-compatible default — existing call sites
+    # (Erigon path, tx_decoder, tests) don't have to change.
+    source_payload: Optional[dict] = None
 
 
 def _hex_to_int(value: object) -> int:
@@ -417,3 +437,306 @@ class NonceTracker:
                 to_drop.append(key)
         for key in to_drop:
             self._chains.pop(key, None)
+
+
+# ---------------------------------------------------------------------------
+# Sprint 3.5 — Polymarket WS proxy subscription
+# ---------------------------------------------------------------------------
+#
+# Decision rationale (recorded in docs/EXECUTION_PLAN_2026_05_12.md § 4
+# Décision #5): Polymarket CLOB matching is OFF-CHAIN, so the Polygon
+# mempool carries NO trade-intent transactions for us to subscribe to.
+# Erigon's ``eth_subscribe('newPendingTransactions')`` (the
+# :class:`MempoolSubscription` path above) is therefore moot in
+# production. We don't even run Erigon on Hetzner.
+#
+# We re-aim the mempool daemon at the observer's existing
+# ``trades:observed`` Redis pub/sub channel: every CONFIRMED trade
+# observed via the WS+REST path is already published there with the
+# ``is_leader`` flag pre-attributed. The mempool daemon becomes a
+# downstream filter (leader-only, watched-wallet-only) that re-emits
+# the trade as a synthetic :class:`MempoolTx` so the rest of the
+# pipeline (decoder bypass + LeaderIntent publisher + IntentRouter)
+# can stay unchanged.
+#
+# Trade-off: we lose the pre-confirmation latency edge (we now see
+# trades AFTER they confirm, not before). This is acceptable because
+# off-chain CLOB matching means the "pre-confirmation" alpha was
+# illusory anyway — the trade is matched and final the moment the
+# observer sees it on the WS firehose.
+
+# Channel name MUST match the observer's :mod:`src.observer.trade_observer`
+# publisher. Hardcoded as part of the public contract.
+_TRADES_OBSERVED_CHANNEL: str = "trades:observed"
+
+# Backoff schedule on Redis disconnects. Mirrors the schedule in
+# :mod:`src.control.redis_pubsub` but kept local so this module doesn't
+# import the Subscriber class (which carries handler-registration
+# machinery we don't need here — we want an async iterator, not a
+# callback dispatcher).
+_PROXY_BACKOFF_SCHEDULE_S: tuple[float, ...] = (1.0, 2.0, 4.0, 8.0, 16.0, 30.0)
+
+# Polling timeout on ``get_message``. Short enough to wake on close,
+# long enough to avoid busy-looping a quiet channel.
+_PROXY_GET_MESSAGE_TIMEOUT_S: float = 1.0
+
+
+def _stable_synthetic_hash(payload: dict) -> str:
+    """Compute a stable hex hash for a ``trades:observed`` payload.
+
+    Prefers an explicit ``dedup_key`` if the observer attached one
+    (we don't depend on it being present; not all observer code paths
+    set it). Falls back to an md5 of the canonical field tuple. The
+    ``ws:`` prefix is added by the caller so the synthetic hash is
+    distinguishable from a real 0x32-byte tx hash on the downstream
+    stream.
+    """
+    dedup = payload.get("dedup_key")
+    if isinstance(dedup, str) and dedup:
+        return hashlib.md5(dedup.encode("utf-8")).hexdigest()
+    # Canonical-tuple fallback: the same fields the observer uses to
+    # dedup at insert time. ``time`` is included for stability across
+    # close-in-time same-wallet trades.
+    canonical = "|".join(
+        str(payload.get(field_name, ""))
+        for field_name in (
+            "time",
+            "wallet_address",
+            "market_id",
+            "token_id",
+            "side",
+            "price",
+            "size_usdc",
+        )
+    )
+    return hashlib.md5(canonical.encode("utf-8")).hexdigest()
+
+
+def _trade_payload_to_mempool_tx(
+    payload: dict,
+    *,
+    clob_contract: str,
+) -> Optional[MempoolTx]:
+    """Build a synthetic :class:`MempoolTx` from a ``trades:observed``
+    payload.
+
+    Returns ``None`` if the payload is missing the wallet address
+    (without which there's no leader to attribute to).
+    """
+    wallet = payload.get("wallet_address")
+    if not isinstance(wallet, str) or not wallet:
+        return None
+    from_wallet = _normalize_address(wallet)
+    if not from_wallet:
+        return None
+    synthetic_hash = "ws:" + _stable_synthetic_hash(payload)
+    return MempoolTx(
+        tx_hash=synthetic_hash,
+        from_wallet=from_wallet,
+        to_contract=_normalize_address(clob_contract),
+        gas_price=0,
+        gas_limit=0,
+        nonce=0,
+        calldata=b"",
+        received_at=datetime.now(timezone.utc),
+        replaces=None,
+        source_payload=payload,
+    )
+
+
+class LeaderTradeSubscription:
+    """Redis pub/sub subscriber that masquerades as a mempool source.
+
+    Wraps a dedicated ``redis.asyncio.Redis`` instance + a
+    ``pubsub()`` session against ``trades:observed`` and yields
+    synthetic :class:`MempoolTx` objects for every leader trade
+    whose wallet sits in ``wallet_index``.
+
+    The class deliberately mirrors :class:`MempoolSubscription`'s
+    public contract — one ``async for`` over :meth:`stream` and a
+    :meth:`close` method — so the daemon's stream loop in
+    :mod:`src.mempool.main` can swap one for the other without
+    branching on the subscription type.
+
+    Reconnect strategy
+    ------------------
+    Reuses the exponential-backoff schedule from
+    :class:`src.control.redis_pubsub.Subscriber`. On Redis disconnect
+    we log, sleep, and rebuild the pubsub object — the dedicated
+    Redis client is rebuilt too so a half-open socket doesn't survive
+    the restart. Messages published during the reconnect window ARE
+    LOST (the observer's pub/sub layer has no replay semantics);
+    Phase-3 Redis Streams would close that gap but pub/sub is
+    sufficient for the shadow-mode soak.
+    """
+
+    def __init__(
+        self,
+        redis_client: Any,
+        wallet_index: "WatchedWalletIndex",
+        *,
+        clob_contract: Optional[str] = None,
+        channel: str = _TRADES_OBSERVED_CHANNEL,
+    ) -> None:
+        # ``redis_client`` is a ``redis.asyncio.Redis`` instance
+        # (production) or a fakeredis equivalent (tests). The caller
+        # owns its lifetime — we don't close it on :meth:`close`.
+        self._redis = redis_client
+        self._wallet_index = wallet_index
+        self._channel = channel
+        # Lazy import to avoid a hard dependency on src.config at
+        # import time (keeps the unit tests light).
+        if clob_contract is None:
+            try:
+                from src.config import settings as _settings
+
+                clob_contract = _settings.POLYMARKET_CLOB_CONTRACT_ADDRESS
+            except Exception:
+                clob_contract = ""
+        self._clob_contract = clob_contract or ""
+        self._closed = False
+
+    async def stream(self) -> AsyncIterator[MempoolTx]:
+        """Yield synthetic :class:`MempoolTx` for each matching trade.
+
+        Reconnects on Redis errors with exponential backoff. Per-message
+        exceptions (bad JSON, missing fields) are swallowed at DEBUG —
+        one malformed message must not tear down the stream.
+        """
+        attempt = 0
+        while not self._closed:
+            pubsub = None
+            try:
+                pubsub = self._redis.pubsub()
+                await pubsub.subscribe(self._channel)
+                logger.debug(
+                    "LeaderTradeSubscription: SUBSCRIBE ok on {}",
+                    self._channel,
+                )
+                # Successful reconnect — reset the backoff counter.
+                attempt = 0
+                async for tx in self._consume(pubsub):
+                    yield tx
+                    if self._closed:
+                        return
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                # Treat ANY error inside the consume loop as
+                # reconnect-worthy. The pre-fix observer pattern
+                # would die silently here; we surface the reconnect
+                # via WARNING + backoff.
+                if self._closed:
+                    return
+                backoff = _PROXY_BACKOFF_SCHEDULE_S[
+                    min(attempt, len(_PROXY_BACKOFF_SCHEDULE_S) - 1)
+                ]
+                attempt += 1
+                logger.warning(
+                    "LeaderTradeSubscription: reconnect #{} channel={} "
+                    "backoff={:.1f}s err={!r}",
+                    attempt,
+                    self._channel,
+                    backoff,
+                    exc,
+                )
+                try:
+                    await asyncio.sleep(backoff)
+                except asyncio.CancelledError:
+                    raise
+            finally:
+                # Best-effort unsubscribe + close. If the connection
+                # is already broken we don't care — the outer loop
+                # rebuilds on next iteration.
+                if pubsub is not None:
+                    try:
+                        await asyncio.wait_for(
+                            pubsub.unsubscribe(self._channel), timeout=2.0
+                        )
+                    except Exception:
+                        pass
+                    try:
+                        await asyncio.wait_for(pubsub.aclose(), timeout=2.0)
+                    except Exception:
+                        pass
+
+    async def _consume(self, pubsub: Any) -> AsyncIterator[MempoolTx]:
+        """Inner loop. Returns cleanly on ``self._closed``; raises on
+        connection errors so the outer loop classifies + backs off."""
+        while not self._closed:
+            msg = await pubsub.get_message(
+                ignore_subscribe_messages=True,
+                timeout=_PROXY_GET_MESSAGE_TIMEOUT_S,
+            )
+            if msg is None:
+                continue
+            if msg.get("type") != "message":
+                continue
+            tx = self._build_tx_from_message(msg)
+            if tx is None:
+                continue
+            yield tx
+
+    def _build_tx_from_message(self, msg: dict) -> Optional[MempoolTx]:
+        """Decode one pub/sub message + apply the leader / watched-wallet
+        filter. Returns ``None`` when the message must be dropped.
+
+        Errors here are LOGGED at DEBUG and swallowed — one bad
+        message must not stop the stream.
+        """
+        raw = msg.get("data")
+        if isinstance(raw, (bytes, bytearray)):
+            raw = raw.decode("utf-8", errors="replace")
+        if not isinstance(raw, str) or not raw.strip():
+            return None
+        try:
+            payload = json.loads(raw)
+        except (json.JSONDecodeError, TypeError) as exc:
+            logger.debug(
+                "LeaderTradeSubscription: bad JSON on {}: {!r}",
+                self._channel,
+                exc,
+            )
+            return None
+        if not isinstance(payload, dict):
+            return None
+        # Filter #1: is_leader must be truthy. The observer already
+        # stamps this per-trade so we don't have to consult any other
+        # service.
+        if not bool(payload.get("is_leader")):
+            return None
+        # Filter #2: the leader must be in the watched-wallet bloom.
+        wallet = payload.get("wallet_address")
+        if not isinstance(wallet, str) or wallet not in self._wallet_index:
+            return None
+        try:
+            tx = _trade_payload_to_mempool_tx(
+                payload, clob_contract=self._clob_contract
+            )
+        except Exception as exc:
+            logger.debug(
+                "LeaderTradeSubscription: build synthetic tx failed: {!r}",
+                exc,
+            )
+            return None
+        if tx is None:
+            return None
+        try:
+            mempool_tx_received_total.labels(source="ws_proxy").inc()
+        except Exception:
+            pass
+        try:
+            mempool_wallet_matches_total.inc()
+        except Exception:
+            pass
+        return tx
+
+    async def close(self) -> None:
+        """Flip the close flag. Safe to call multiple times.
+
+        We do NOT close the underlying Redis client — the caller owns
+        its lifetime (mirrors the convention in
+        :class:`src.control.redis_pubsub.Subscriber` for the
+        injected-client case).
+        """
+        self._closed = True

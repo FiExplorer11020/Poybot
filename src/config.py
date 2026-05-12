@@ -735,6 +735,29 @@ class Settings(BaseSettings):
     # paper trades on detected intents until the 30-day soak proves
     # the strategy works on paper.
     PREFILL_LIVE_ENABLED: bool = False
+    # Mempool subscription mode — Sprint 3.5 (EXECUTION_PLAN § 4
+    # Décision #5).
+    #
+    # Two valid values:
+    #
+    #   ``erigon`` (legacy)
+    #       Wave-1 R7 path. Opens an Erigon
+    #       ``eth_subscribe('newPendingTransactions')`` filtered
+    #       subscription via :class:`src.mempool.node_client.MempoolSubscription`.
+    #       Requires a local Erigon node — we don't have one on
+    #       Hetzner, and Polymarket CLOB is OFF-CHAIN so the Polygon
+    #       mempool wouldn't carry CLOB trades anyway. Keep available
+    #       for future on-chain matching reversions.
+    #
+    #   ``polymarket_ws_proxy`` (default)
+    #       Sprint 3.5 path. Subscribes to the observer's existing
+    #       ``trades:observed`` Redis pub/sub channel via
+    #       :class:`src.mempool.node_client.LeaderTradeSubscription`
+    #       and re-emits filtered leader trades as synthetic
+    #       :class:`MempoolTx`. Reuses the observer's WS+REST
+    #       firehose + dedup + leader attribution — one source of
+    #       truth, no second WS connection to maintain.
+    MEMPOOL_SUBSCRIPTION_MODE: str = "polymarket_ws_proxy"
 
     @field_validator("PREFILL_POOL_SIZE_BUCKETS_USDC")
     @classmethod
@@ -816,6 +839,19 @@ class Settings(BaseSettings):
         if not 30 <= v <= 3600:
             raise ValueError(
                 f"WATCHED_WALLET_INDEX_REFRESH_S must be in [30, 3600], got {v}."
+            )
+        return v
+
+    @field_validator("MEMPOOL_SUBSCRIPTION_MODE")
+    @classmethod
+    def _validate_mempool_subscription_mode(cls, v: str) -> str:
+        # Two valid modes per Sprint 3.5 EXECUTION_PLAN § 4 Décision #5.
+        # Anything else is a config mistake and should fail loud at
+        # boot instead of falling through to a no-op subscription.
+        allowed = {"erigon", "polymarket_ws_proxy"}
+        if v not in allowed:
+            raise ValueError(
+                f"MEMPOOL_SUBSCRIPTION_MODE must be one of {sorted(allowed)}, got {v!r}."
             )
         return v
 

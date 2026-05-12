@@ -59,6 +59,8 @@ from src.observer.clob_book_decoder import (  # noqa: F401
     EVENT_PLACED,
     BookEvent,
     decode_ws_message,
+    decode_ws_messages,
+    is_known_non_event_message,
 )
 
 # --------------------------------------------------------------------------- #
@@ -146,6 +148,16 @@ class CLOBBookObserver:
         self._stream_queue: deque[BookEvent] = deque(maxlen=self._queue_maxsize)
         self._queue_event = asyncio.Event()
 
+        # Sprint 3: in-memory last-known resting size per
+        # ``(token_id, price, side)``. The WS Market channel ships
+        # absolute level sizes on ``price_change`` events, not deltas —
+        # the decoder needs this cache to synthesise signed deltas.
+        # Bounded implicitly by the active-markets × price-levels space
+        # (~50 markets × ~200 levels × 2 sides ≈ 20k entries at worst).
+        from decimal import Decimal as _Decimal
+
+        self._level_state: dict[tuple[str, str, str], _Decimal] = {}
+
         self._running = False
         self._stop_event = asyncio.Event()
         self._ws_task: asyncio.Task | None = None
@@ -198,29 +210,46 @@ class CLOBBookObserver:
         self._stream_task = None
 
     async def handle_message(self, msg: dict[str, Any]) -> BookEvent | None:
-        """Decode + enqueue a single WS message. Returns the BookEvent on
-        success or None when the message was dropped (invalid or
-        queue-full).
+        """Decode + enqueue a single WS message. Returns the FIRST
+        :class:`BookEvent` produced (for backward compat with the
+        single-event tests) or ``None`` when the message produced no
+        events (book snapshot / control plane / malformed / queue-full).
+
+        A single WS frame can fan out into N BookEvents
+        (``price_change`` packs multiple price-level updates per
+        message). All resulting events are enqueued; the return value
+        is the first one for callers that need any handle to the
+        emitted event. Internal tests inspect the queue directly when
+        they care about the full batch.
 
         Public for the WS callback wiring AND for unit tests that drive
         the observer without a real WebSocket.
         """
         now_s = time.time()
-        event = decode_ws_message(msg, now_s=now_s)
-        if event is None:
-            self.events_dropped_invalid += 1
-            book_events_dropped_total.labels(reason="invalid").inc()
+        events = decode_ws_messages(msg, now_s=now_s, level_state=self._level_state)
+        if not events:
+            # Distinguish "valid but no delta to emit" (snapshot / ticker
+            # / control plane) from "junk we should count under invalid".
+            # The former is normal traffic on the firehose; counting it
+            # as invalid would blow up the dropped-total metric and mask
+            # real malformed payloads.
+            if not is_known_non_event_message(msg):
+                self.events_dropped_invalid += 1
+                book_events_dropped_total.labels(reason="invalid").inc()
             return None
 
-        self.events_received += 1
-        try:
-            book_events_received_total.labels(event_type=event.event_type).inc()
-            book_ws_latency_seconds.observe(max(0.0, now_s - event.received_at))
-        except Exception:  # pragma: no cover — defensive
-            pass
-
-        self._enqueue(event)
-        return event
+        first_event: BookEvent | None = None
+        for event in events:
+            self.events_received += 1
+            try:
+                book_events_received_total.labels(event_type=event.event_type).inc()
+                book_ws_latency_seconds.observe(max(0.0, now_s - event.received_at))
+            except Exception:  # pragma: no cover — defensive
+                pass
+            self._enqueue(event)
+            if first_event is None:
+                first_event = event
+        return first_event
 
     # ------------------------------------------------------------------ #
     # Internal: queueing with oldest-drop semantics                       #
