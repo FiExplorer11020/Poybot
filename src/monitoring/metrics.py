@@ -738,6 +738,133 @@ except Exception:  # pragma: no cover
     pass
 
 
+# === Round 9 (The Web) — Multivariate Hawkes + Follower-Pool Kalman ===
+# Owned by src.graph.hawkes_multivariate, src.follower_volume.*. Same
+# defensive-declaration pattern as the R8 block above — duplicate
+# registration on pytest hot-reload is silently swallowed. See
+# docs/ROUND_9_MULTIVARIATE_HAWKES.md § 5 for the canonical list.
+try:
+    mvhawkes_fits_total = Counter(
+        "polybot_mvhawkes_fits_total",
+        "Multivariate Hawkes fits performed",
+        ["result"],  # converged|fallback|bic_rejected|failed
+    )
+except Exception:  # pragma: no cover
+    pass
+
+try:
+    mvhawkes_fit_duration_seconds = Histogram(
+        "polybot_mvhawkes_fit_duration_seconds",
+        "Wall time per multivariate Hawkes fit. Per spec § 6 the budget "
+        "is ~30 s per leader; the histogram exposes both the head and "
+        "the tail.",
+        buckets=(0.1, 0.5, 1.0, 5.0, 15.0, 30.0, 60.0, 120.0, 300.0),
+    )
+except Exception:  # pragma: no cover
+    pass
+
+try:
+    mvhawkes_alpha_value = Histogram(
+        "polybot_mvhawkes_alpha_value",
+        "Distribution of fitted leader→pool α entries, per pool class. "
+        "Sanity check that the block-sparse mask is hitting meaningful "
+        "tails, not collapsing to 0.",
+        ["pool_class"],
+        buckets=(0.0, 0.01, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5),
+    )
+except Exception:  # pragma: no cover
+    pass
+
+try:
+    mvhawkes_couplings_accepted = Gauge(
+        "polybot_mvhawkes_couplings_accepted",
+        "Per-leader count of accepted α couplings (free entries that "
+        "survived the per-entry BIC test). The Round 9 drift detector "
+        "dec()s this on a converged→bic_rejected transition.",
+        ["leader_wallet"],
+    )
+except Exception:  # pragma: no cover
+    pass
+
+try:
+    mvhawkes_bic_statistic = Histogram(
+        "polybot_mvhawkes_bic_statistic",
+        "Distribution of fitted BIC statistics (2·(NLL_null − NLL_full)) "
+        "across all multivariate fits.",
+        buckets=(0.0, 5.0, 10.0, 25.0, 50.0, 100.0, 250.0, 1000.0),
+    )
+except Exception:  # pragma: no cover
+    pass
+
+try:
+    kalman_updates_total = Counter(
+        "polybot_kalman_updates_total",
+        "FollowerPoolKalman update() calls, partitioned by pool class.",
+        ["pool_class"],
+    )
+except Exception:  # pragma: no cover
+    pass
+
+try:
+    kalman_innovation_magnitude = Histogram(
+        "polybot_kalman_innovation_magnitude",
+        "Absolute Kalman innovation (|y_observed − y_predicted|) per "
+        "update. Large = model wrong; spikes are the leading-indicator "
+        "signal for regime change in the follower pool.",
+        ["pool_class"],
+        # 4 orders of magnitude — innovations span $1..$100k.
+        buckets=(1.0, 10.0, 100.0, 1_000.0, 10_000.0, 100_000.0),
+    )
+except Exception:  # pragma: no cover
+    pass
+
+try:
+    pool_size_estimate = Gauge(
+        "polybot_pool_size_estimate",
+        "Mean follower-pool size estimate (USDC) per pool class across "
+        "all leaders.",
+        ["pool_class"],
+    )
+except Exception:  # pragma: no cover
+    pass
+
+try:
+    volume_forecasts_total = Counter(
+        "polybot_volume_forecasts_total",
+        "FollowerVolumePredictor.forecast() invocations.",
+    )
+except Exception:  # pragma: no cover
+    pass
+
+try:
+    volume_forecast_mape = Gauge(
+        "polybot_volume_forecast_mape",
+        "Rolling mean-absolute-percentage-error of closed volume "
+        "forecasts (60-day window). Acceptance gate (spec § 6): < 30%.",
+    )
+except Exception:  # pragma: no cover
+    pass
+
+try:
+    volume_forecast_ci_coverage = Gauge(
+        "polybot_volume_forecast_ci_coverage",
+        "Fraction of past forecasts whose CI(95%) bracketed the realised "
+        "follower-pool volume. Acceptance gate (spec § 6): 0.95 ± 0.03.",
+    )
+except Exception:  # pragma: no cover
+    pass
+
+try:
+    volume_anticipation_entries_total = Counter(
+        "polybot_volume_anticipation_entries_total",
+        "decision_router volume_anticipation entries that fired "
+        "(i.e. cleared all gates and were routed to paper/live).",
+        ["result"],  # paper|live|both|skipped
+    )
+except Exception:  # pragma: no cover
+    pass
+
+
 # ---------------------------------------------------------------------------
 # Build info — best-effort. Surfaces version + git short-SHA on /metrics so a
 # scrape can correlate metrics with a deploy. Failure here must NEVER break

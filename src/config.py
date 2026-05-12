@@ -841,6 +841,60 @@ class Settings(BaseSettings):
             )
         return v
 
+    # ───── Round 9 (The Web) — Multivariate Hawkes + Kalman ────────────
+    # See docs/ROUND_9_MULTIVARIATE_HAWKES.md for the full spec.
+    #
+    # MVHAWKES_LOOKBACK_DAYS: trailing-window the multivariate fitter
+    # consumes. 30 days matches the R5 bivariate window so the two
+    # fitters operate on the same data slice.
+    MVHAWKES_LOOKBACK_DAYS: int = 30
+    # Initial β seed for the multivariate fitter (sec^-1). 0.01 ≈ 100 s
+    # half-life — slower than R5 (5-min half-life). Population-level
+    # excitation is longer-lasting because many followers stretch the
+    # tail; the optimiser is free to walk away from this seed.
+    MVHAWKES_BETA_INITIAL: float = 0.01
+    # BIC k_penalty for the multivariate fitter. Spec § 2.3 sets it to
+    # the number of free α entries; on the default block-sparse mask
+    # with K=4 pools, k_penalty = 2K = 8. Operator may override for
+    # research.
+    MVHAWKES_BIC_K_PENALTY: int = 8
+    # How often the daemon refits all leaders. 86400 s = once per day;
+    # the systemd-launched daemon does an immediate first pass then
+    # sleeps on this interval.
+    MVHAWKES_REFRESH_INTERVAL_S: int = 86400
+    # KALMAN_OBSERVATION_WINDOW_S: the time window we observe to compute
+    # the actual follower-volume burst that y_observed measures. 1800 s
+    # = 30 min, per spec § 3.2.
+    KALMAN_OBSERVATION_WINDOW_S: int = 1800
+    # VOLUME_ANTICIPATION_THRESHOLD_USDC: minimum predicted
+    # follower-pool volume for the volume_anticipation entry policy to
+    # fire. 5000 USDC is a conservative gate — the goal is to enter on
+    # forecast trades, not on every leader signal.
+    VOLUME_ANTICIPATION_THRESHOLD_USDC: float = 5000.0
+    # Cron hour:minute (UTC) for the nightly multivariate Hawkes refit
+    # job. 03:30 sits after the R5 bivariate window (03:00) so the two
+    # fitters don't fight for DB / CPU.
+    MVHAWKES_BATCH_HOUR_UTC: int = 3
+    MVHAWKES_BATCH_MINUTE_UTC: int = 30
+
+    @field_validator("MVHAWKES_LOOKBACK_DAYS")
+    @classmethod
+    def _validate_mvhawkes_lookback(cls, v: int) -> int:
+        if not 7 <= v <= 365:
+            raise ValueError(
+                f"MVHAWKES_LOOKBACK_DAYS must be in [7, 365], got {v}."
+            )
+        return v
+
+    @field_validator("MVHAWKES_BIC_K_PENALTY")
+    @classmethod
+    def _validate_mvhawkes_k_penalty(cls, v: int) -> int:
+        if not 1 <= v <= 100:
+            raise ValueError(
+                f"MVHAWKES_BIC_K_PENALTY must be in [1, 100], got {v}."
+            )
+        return v
+
 
 settings = Settings()
 

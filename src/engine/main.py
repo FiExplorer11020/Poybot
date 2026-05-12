@@ -284,6 +284,28 @@ async def main() -> None:
         make_refresh_thresholds_job(),
         seconds=300,
     )
+    # Round 9 (The Web) — nightly multivariate Hawkes refit. Lives at
+    # 03:30 UTC, right after the R5 bivariate batch window so the two
+    # fitters don't fight for DB / CPU. The job is gated on the R9
+    # daemon module being importable; if the module is stripped from a
+    # deployment (e.g. test env), we silently skip the registration.
+    try:
+        from src.follower_volume.daemon import FollowerVolumeDaemon  # noqa: F401
+
+        async def _mvhawkes_nightly() -> None:
+            daemon = FollowerVolumeDaemon()
+            await daemon.run_one_pass()
+
+        scheduler.add_cron(
+            "mvhawkes_nightly",
+            _mvhawkes_nightly,
+            hour=getattr(settings, "MVHAWKES_BATCH_HOUR_UTC", 3),
+            minute=getattr(settings, "MVHAWKES_BATCH_MINUTE_UTC", 30),
+        )
+    except Exception as exc:  # pragma: no cover — graceful degrade
+        logger.warning(
+            f"Scheduler: skipping mvhawkes_nightly registration: {exc}"
+        )
     await scheduler.start()
     # ------------------------------------------------------------------- #
 

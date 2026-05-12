@@ -51,6 +51,24 @@ ALLOWED_KEYS: dict[str, str] = {
         "Round 8 gate: apply per-strategy FOLLOW/FADE/SKIP weight multipliers "
         "to the Thompson sample. Boolean, default False (shadow phase)."
     ),
+    # Round 9 (The Web) — volume anticipation entry policy. When False
+    # (default), decision_router behavior is byte-identical to the R8
+    # baseline. When True, the FollowerVolumePredictor is consulted on
+    # every leader trade and a volume_anticipation entry fires when
+    # predicted next-window follower-pool volume exceeds the threshold
+    # below. The drift detector still suppresses entries on leaders
+    # whose Hawkes coupling has decayed even when the flag is True.
+    "volume_anticipation_enabled": (
+        "Round 9 gate: fire volume_anticipation entries when "
+        "FollowerVolumePredictor.total_volume_usdc > "
+        "volume_anticipation_threshold_usdc. Boolean, default False "
+        "(shadow phase)."
+    ),
+    "volume_anticipation_threshold_usdc": (
+        "Round 9 threshold: minimum predicted next-window follower-pool "
+        "volume (USDC) for a volume_anticipation entry to fire. Numeric, "
+        "default 5000."
+    ),
 }
 
 # Inclusive (min, max) bounds for each editable key. Writes outside the
@@ -70,6 +88,11 @@ BOUNDS: dict[str, tuple[float, float]] = {
     # coercion block below where keys ending in '_enabled' use the
     # boolean-coerce path. Stored as 0.0 / 1.0 in the JSON blob.
     "strategy_conditional_confidence_enabled": (0.0, 1.0),
+    # Round 9 — bounds for both new keys.
+    "volume_anticipation_enabled": (0.0, 1.0),
+    # Threshold lower bound = MIN_POSITION_USDC; upper bound is a
+    # reasonable ceiling that catches accidental typos (1M).
+    "volume_anticipation_threshold_usdc": (50.0, 1_000_000.0),
 }
 
 # Keys that store booleans (not floats). set_overrides coerces these
@@ -77,6 +100,8 @@ BOUNDS: dict[str, tuple[float, float]] = {
 # {"...": "true"} and {"...": 1} all land as the same boolean override.
 BOOLEAN_KEYS: frozenset[str] = frozenset({
     "strategy_conditional_confidence_enabled",
+    # Round 9 — volume_anticipation gate.
+    "volume_anticipation_enabled",
 })
 
 REDIS_KEY = "runtime_config:overrides"
@@ -104,6 +129,12 @@ def _defaults_from_settings() -> dict[str, Any]:
         "fade_size_ratio": float(getattr(settings, "FADE_SIZE_RATIO", 0.5)),
         # Round 8 — default OFF until operator flips it after A/B passes.
         "strategy_conditional_confidence_enabled": False,
+        # Round 9 — default OFF until operator flips after 7 nights of
+        # clean shadow fits + MAPE < 30% + Sharpe ≥ 1.3× baseline.
+        "volume_anticipation_enabled": False,
+        "volume_anticipation_threshold_usdc": float(
+            getattr(settings, "VOLUME_ANTICIPATION_THRESHOLD_USDC", 5000.0)
+        ),
     }
 
 

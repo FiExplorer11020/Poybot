@@ -12,6 +12,7 @@ topology (see `docs/ROUND_6_THE_SPINE.md` § 3.5).
 | `polymarket-falcon-refresher.service`      | `src.registry.refresher_main` *(Wave 2)* | 200 MB |
 | `polymarket-mempool.service`               | `src.mempool` *(Round 7)*       | 300 MB        |
 | `polymarket-strategy-classifier.service`   | `src.strategy_classifier` *(Round 8)* | 400 MB  |
+| `polymarket-follower-volume.service`       | `src.follower_volume` *(Round 9)* | 400 MB        |
 | `polymarket-api.service`                   | `src.api.main` (uvicorn)        | 300 MB        |
 
 Total budget: ~2.7 GB (CX23 has 4 GB; leaves headroom for Postgres + Redis).

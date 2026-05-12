@@ -1,0 +1,29 @@
+[Unit]
+Description=Polymarket Bot — Follower-Volume daemon (Round 9 / The Web)
+Documentation=https://github.com/your-org/polymarket-bot/blob/main/docs/ROUND_9_MULTIVARIATE_HAWKES.md
+After=network-online.target redis-server.service polymarket-engine.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=polymarket
+Group=polymarket
+WorkingDirectory=/opt/polymarket-bot/
+EnvironmentFile=/opt/polymarket-bot/.env
+ExecStart=/opt/polymarket-bot/.venv/bin/python -m src.follower_volume
+Restart=always
+RestartSec=5s
+
+# Per Round 9 — memory budget. The N-dim Hawkes fit over 200 leaders
+# × ~5 pools each × scipy.optimize stays under 400 MB. Kalman state is
+# tiny (3-vector + 3x3 cov per pair, persisted in Postgres).
+MemoryMax=400M
+
+StandardOutput=journal
+StandardError=journal
+
+# Logging tag for journalctl filtering.
+SyslogIdentifier=polymarket-follower-volume
+
+[Install]
+WantedBy=multi-user.target

@@ -35,7 +35,7 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 from enum import Enum
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Any, Optional
 
 from loguru import logger
 
@@ -47,6 +47,12 @@ if TYPE_CHECKING:
 
 REDIS_DECISIONS_PAPER_CHANNEL = "decisions"
 REDIS_DECISIONS_LIVE_CHANNEL = "decisions:live"
+
+# Round 9 (The Web) — entry-policy reason tag. The volume_anticipation
+# decision still routes to the same paper/live channels, but the
+# action='volume_anticipation' marker lets PaperTrader/LiveTrader and
+# the dashboard tell it apart from FOLLOW/FADE.
+VOLUME_ANTICIPATION_ACTION = "volume_anticipation"
 
 
 class TradingMode(str, Enum):
@@ -78,10 +84,31 @@ class RoutingResult:
 
 
 class DecisionRouter:
-    """In-memory router. Stateless across calls — each `route` is independent."""
+    """In-memory router. Stateless across calls — each `route` is independent.
 
-    def __init__(self, redis_client) -> None:
+    Round 9 (The Web) optional extension: when constructed with a
+    ``volume_predictor`` + ``drift_detector`` pair, the router can emit
+    an additional ``volume_anticipation`` decision on every leader
+    trade. This path is **gated by the runtime config flag**
+    ``volume_anticipation_enabled`` (default False). When the flag is
+    off, the router's behavior is byte-identical to pre-R9.
+
+    See ``maybe_emit_volume_anticipation`` for the policy entry point.
+    """
+
+    def __init__(
+        self,
+        redis_client,
+        volume_predictor: Any = None,
+        drift_detector: Any = None,
+        runtime_config: Any = None,
+    ) -> None:
         self._redis = redis_client
+        # Round 9 deps — all optional, all defaulting to None for
+        # backward compat with existing call sites.
+        self._volume_predictor = volume_predictor
+        self._drift_detector = drift_detector
+        self._runtime_config = runtime_config
 
     # ------------------------------------------------------------------ #
     # Public entry point                                                  #
@@ -236,3 +263,190 @@ class DecisionRouter:
         except Exception as e:
             logger.warning(f"DecisionRouter: publish to {channel} failed: {e}")
             return False
+
+    # ------------------------------------------------------------------ #
+    # Round 9 (The Web) — volume_anticipation policy                      #
+    # ------------------------------------------------------------------ #
+
+    async def maybe_emit_volume_anticipation(
+        self,
+        signal_decision: "Decision",
+        current_capital: float,
+        market_depth_usdc: float = 0.0,
+    ) -> Optional["RoutingResult"]:
+        """Decide whether to fire a volume_anticipation entry.
+
+        Per spec § 3.4: complementary to FOLLOW. Both can fire on the
+        same leader trade — the bot has two kinds of edge
+        (leader-correctness, follower-flow).
+
+        Args:
+            signal_decision: the upstream Decision (used for leader,
+                market, token context).
+            current_capital: the bot's current bankroll in USDC.
+            market_depth_usdc: optional depth signal; if zero we use a
+                conservative fallback.
+
+        Returns:
+            RoutingResult if a volume_anticipation entry was published,
+            None when the flag is off / predictor missing / drift fired
+            / threshold not exceeded. Callers MUST tolerate None — this
+            is an opt-in path.
+
+        Gating order (short-circuits as soon as a gate trips):
+            1. Runtime flag ``volume_anticipation_enabled`` must be True
+            2. ``volume_predictor`` must be available
+            3. Drift detector must NOT flag the leader (when available)
+            4. Predicted total volume > threshold
+            5. Computed Kelly size > 0 (we never emit zero-size entries)
+        """
+        # Gate 1: flag off → behavior is byte-identical to pre-R9.
+        if not await self._volume_anticipation_enabled():
+            return None
+        # Gate 2: predictor must be wired by the caller.
+        if self._volume_predictor is None:
+            return None
+
+        try:
+            forecast = await self._volume_predictor.forecast(
+                leader_wallet=signal_decision.leader_wallet,
+                trade_size_usdc=float(signal_decision.size_usdc or 0.0),
+            )
+        except Exception as exc:
+            logger.warning(
+                f"DecisionRouter: volume forecast failed for "
+                f"{signal_decision.leader_wallet[:10]}: {exc}"
+            )
+            return None
+
+        # Gate 3: drift detector. If wired AND drift detected → bail.
+        if self._drift_detector is not None:
+            try:
+                drift = await self._drift_detector.evaluate(
+                    signal_decision.leader_wallet
+                )
+                if getattr(drift, "drift_detected", False):
+                    logger.info(
+                        f"DecisionRouter: suppressing volume_anticipation for "
+                        f"{signal_decision.leader_wallet[:10]} (drift)"
+                    )
+                    return None
+            except Exception as exc:
+                logger.debug(
+                    f"DecisionRouter: drift evaluator threw, proceeding: {exc}"
+                )
+
+        # Gate 4: total predicted volume vs threshold.
+        threshold = await self._volume_anticipation_threshold()
+        total_v = float(forecast.get("total_volume_usdc", 0.0) or 0.0)
+        if total_v < threshold:
+            return None
+
+        # Gate 5: size > 0 AND > MIN_POSITION_USDC.
+        kelly = self._kelly_from_volume(
+            expected_volume_usdc=total_v,
+            market_depth_usdc=market_depth_usdc,
+            confidence=float(forecast.get("confidence", 0.0) or 0.0),
+        )
+        max_pos_pct = float(getattr(settings, "MAX_POSITION_PCT", 0.02))
+        min_pos_usdc = float(getattr(settings, "MIN_POSITION_USDC", 50.0))
+        position_size = min(
+            kelly * max(current_capital, 0.0),
+            max_pos_pct * max(current_capital, 0.0),
+        )
+        if position_size < min_pos_usdc:
+            return None
+
+        # Build the synthetic Decision and route.
+        from src.engine.confidence_engine import Decision  # local import for cycles
+
+        va_decision = Decision(
+            action=VOLUME_ANTICIPATION_ACTION,
+            leader_wallet=signal_decision.leader_wallet,
+            market_id=signal_decision.market_id,
+            token_id=signal_decision.token_id,
+            size_usdc=float(position_size),
+            kelly_fraction=float(kelly),
+            thompson_follow=signal_decision.thompson_follow,
+            thompson_fade=signal_decision.thompson_fade,
+            confidence=float(forecast.get("confidence", 0.0) or 0.0),
+            reason=(
+                f"volume_anticipation E[volume]={total_v:.0f}"
+                f" by_pool={','.join(forecast.get('by_pool', {}).keys())}"
+            ),
+            trade_context={
+                **(signal_decision.trade_context or {}),
+                "volume_forecast": forecast,
+                "volume_anticipation": True,
+            },
+            context_penalty=signal_decision.context_penalty,
+            signal_audit=signal_decision.signal_audit,
+            strategy_track=signal_decision.strategy_track,
+            economic_model_version=signal_decision.economic_model_version,
+        )
+        return await self.route(va_decision)
+
+    async def _volume_anticipation_enabled(self) -> bool:
+        """Resolve the runtime config flag. Defaults to False on any
+        failure (safe-by-default: no R9 surface area when in doubt)."""
+        if self._runtime_config is None:
+            return False
+        try:
+            return bool(await self._runtime_config.get("volume_anticipation_enabled"))
+        except Exception:
+            return False
+
+    async def _volume_anticipation_threshold(self) -> float:
+        """Resolve the runtime threshold. Falls back to settings on any
+        failure."""
+        default_thresh = float(
+            getattr(settings, "VOLUME_ANTICIPATION_THRESHOLD_USDC", 5000.0)
+        )
+        if self._runtime_config is None:
+            return default_thresh
+        try:
+            v = await self._runtime_config.get(
+                "volume_anticipation_threshold_usdc"
+            )
+            if v is None:
+                return default_thresh
+            return float(v)
+        except Exception:
+            return default_thresh
+
+    @staticmethod
+    def _kelly_from_volume(
+        expected_volume_usdc: float,
+        market_depth_usdc: float,
+        confidence: float,
+    ) -> float:
+        """Map predicted follower-pool volume to a Kelly-like fraction.
+
+        Heuristic per spec § 3.4: scale Kelly by the (sqrt of) expected
+        flow relative to the market depth, modulated by the predictor's
+        confidence in the forecast. The hard cap MAX_POSITION_PCT is
+        applied upstream in ``maybe_emit_volume_anticipation``.
+
+        Args:
+            expected_volume_usdc: predicted next-window follower-pool
+                volume.
+            market_depth_usdc: rough market liquidity. 0 → fallback to
+                a conservative cap.
+            confidence: predictor's confidence in [0, 1].
+
+        Returns:
+            A non-negative Kelly fraction (typically << 1). The caller
+            multiplies by current capital and applies the hard cap.
+        """
+        import math
+
+        if expected_volume_usdc <= 0.0 or confidence <= 0.0:
+            return 0.0
+        depth = market_depth_usdc if market_depth_usdc > 0 else 100_000.0
+        # Scale: at ratio=1 (volume == depth), un-confidence-adjusted
+        # Kelly ≈ 0.05 (5%). Cap implicitly through MAX_POSITION_PCT
+        # upstream.
+        ratio = max(0.0, expected_volume_usdc / depth)
+        kelly = 0.05 * math.sqrt(ratio) * confidence
+        # Hard ceiling — never recommend > 50% of capital (sanity).
+        return float(min(0.5, max(0.0, kelly)))
