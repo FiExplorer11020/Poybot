@@ -44,7 +44,6 @@ from src.causal.iv_diagnostics import (
     wu_hausman_test,
 )
 
-
 # ---------------------------------------------------------------------------
 # Public dataclass
 # ---------------------------------------------------------------------------
@@ -200,6 +199,21 @@ class TwoStageLeastSquaresEstimator:
             raise ValueError(
                 f"L and X must have same length, got {L.shape[0]} vs {X.shape[0]}"
             )
+
+        # Wave-3 hardening: drop rows with NaN/Inf in any input column.
+        # numpy.linalg.lstsq raises SVD-did-not-converge on NaN; the
+        # production daemon's _load_streams could feed such rows from a
+        # malformed timestamp. Fail-soft to 'failed' convergence instead
+        # of bubbling LinAlgError out of the daemon.
+        finite = np.isfinite(L) & np.isfinite(F) & np.all(np.isfinite(Z), axis=1)
+        if X is not None:
+            finite &= np.all(np.isfinite(X), axis=1)
+        if not finite.all():
+            L, F, Z = L[finite], F[finite], Z[finite]
+            if X is not None:
+                X = X[finite]
+            n = int(finite.sum())
+
         # Need at least: 1 (intercept) + p (X) + 1 (L) + q (Z first stage)
         # rows of data. Tight lower bound is n >= q + p + 3 for any
         # variance estimate to be defined; we use that as the hard floor.
