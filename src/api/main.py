@@ -62,6 +62,7 @@ _live_snapshot_cache: dict = {"data": None, "last_built": 0.0}
 _live_snapshot_lock = asyncio.Lock()
 
 TEMPLATE_PATH = Path(__file__).parent.parent.parent / "templates" / "dashboard.html"
+TEMPLATE_V2_PATH = Path(__file__).parent.parent.parent / "templates" / "dashboard_v2.html"
 STATIC_DIR = Path(__file__).parent.parent.parent / "static"
 STATS_PUSH_INTERVAL_S = 1.0  # how often to push live stats over WebSocket
 HEALTH_CACHE_TTL_S = 5.0
@@ -1233,6 +1234,319 @@ async def api_control_real_execution(payload: _KillswitchFlip):
         actor=payload.actor or "api",
     )
     return state.to_dict()
+
+
+# ---------------------------------------------------------------------------
+# Dashboard v2 — refonded UI (R6-R13 surface)
+#
+# Lives at /v2 alongside the existing dashboard at /. Migration strategy
+# per docs/UI_REDESIGN_PHASE3.md § 9 — both UIs run side-by-side for one
+# release cycle, then v1 is retired. The 22 stub endpoints below return
+# minimal placeholder shapes (empty arrays / null) so the v2 components
+# render their graceful empty states until the underlying data layer is
+# wired by the operator.
+# ---------------------------------------------------------------------------
+
+
+@app.get("/v2", response_class=HTMLResponse)
+async def root_v2():
+    if not TEMPLATE_V2_PATH.exists():
+        raise HTTPException(status_code=404, detail="dashboard_v2.html not found")
+    return HTMLResponse(content=TEMPLATE_V2_PATH.read_text())
+
+
+# --- Overview --------------------------------------------------------------
+
+
+@app.get("/api/overview/timeline")
+async def api_overview_timeline():
+    """Last 5 'what changed' events for the OVERVIEW timeline panel.
+
+    Operator wire-up: the calibration daemon + control endpoints already
+    log these; this endpoint joins them into a single feed. Returns an
+    empty list until that join lands.
+    """
+    return {"events": []}
+
+
+@app.get("/api/calibration/summary")
+async def api_calibration_summary():
+    """R13 high-level rollup for the OVERVIEW Mirror bento card."""
+    return {
+        "disabled_count": 0,
+        "auto_disabled_count": 0,
+        "manual_disabled_count": 0,
+        "drift_alerts_24h": 0,
+        "last_batch_at": None,
+        "predictions_logged_24h": 0,
+        "strategy_class_enabled": False,
+        "volume_forecast_enabled": False,
+        "causal_enabled": False,
+    }
+
+
+# --- Mempool (R7) ----------------------------------------------------------
+
+
+@app.get("/api/mempool/summary")
+async def api_mempool_summary():
+    return {
+        "connected": False,
+        "intents_per_min": 0,
+        "intents_per_hour": 0,
+        "decode_hit_rate": 0.0,
+        "pool_size": 0,
+        "pool_capacity": 40,
+        "pool_freshness_pct": 0.0,
+        "intent_to_fire_p50_ms": None,
+        "shadow_fires_24h": 0,
+        "live_fires_24h": 0,
+        "active_nonce_chains": 0,
+    }
+
+
+@app.get("/api/mempool/live")
+async def api_mempool_live():
+    return {"intents": [], "nonce_chains": []}
+
+
+@app.get("/api/mempool/pool")
+async def api_mempool_pool():
+    return {"entries": [], "miss_reasons_last_hour": {}}
+
+
+@app.get("/api/mempool/decisions")
+async def api_mempool_decisions(filter: str = "all"):  # noqa: A002
+    return {"decisions": [], "filter": filter}
+
+
+# --- Microscope (R11) ------------------------------------------------------
+
+
+@app.get("/api/microscope/summary")
+async def api_microscope_summary():
+    return {
+        "events_per_sec": 0,
+        "queue_depth": 0,
+        "queue_capacity": 50_000,
+        "dropped_24h": 0,
+        "iceberg_per_hour": 0,
+        "spoof_per_hour": 0,
+        "ofi_mean": None,
+        "place_to_fill_p50_ms": None,
+        "storage_gb": None,
+    }
+
+
+@app.get("/api/microscope/firehose")
+async def api_microscope_firehose():
+    return {"events": []}
+
+
+@app.get("/api/microscope/microstructure")
+async def api_microscope_microstructure(limit: int = 50):
+    return {"rows": [], "limit": limit}
+
+
+@app.get("/api/microscope/signatures")
+async def api_microscope_signatures(limit: int = 100):
+    return {"signatures": [], "limit": limit}
+
+
+# --- Periphery (R12 + R10 instruments) -------------------------------------
+
+
+@app.get("/api/periphery/summary")
+async def api_periphery_summary():
+    return {
+        "tweets_24h": 0,
+        "entry_pct": 0.0,
+        "exit_pct": 0.0,
+        "x_quota_pct": 1.0,
+        "operators_resolved": 0,
+        "operators_pending": 0,
+        "instrument_events_24h": 0,
+    }
+
+
+@app.get("/api/periphery/social/feed")
+async def api_periphery_social_feed():
+    return {"signals": []}
+
+
+@app.get("/api/periphery/crossmarket/status")
+async def api_periphery_crossmarket_status():
+    return {
+        "kalshi":    {"reachable": False, "latency_p50_ms": None, "api_calls_24h": 0, "positions_observed": 0},
+        "manifold":  {"reachable": False, "latency_p50_ms": None, "api_calls_24h": 0, "positions_observed": 0},
+        "predictit": {"reachable": False, "latency_p50_ms": None, "api_calls_24h": 0, "positions_observed": 0},
+    }
+
+
+@app.get("/api/periphery/crossmarket/operators")
+async def api_periphery_crossmarket_operators():
+    return {"operators": []}
+
+
+@app.post("/api/periphery/crossmarket/confirm/{op_id}")
+async def api_periphery_crossmarket_confirm(op_id: int):
+    """Operator confirms an auto-suggested cross-market resolution.
+
+    Wires to src.cross_market.wallet_resolver.WalletResolver.confirm_match.
+    Currently a no-op stub.
+    """
+    return {"ok": True, "operator_id": op_id}
+
+
+# --- Intelligence (R8 Lens, R9 Web, R10 Causal) ---------------------------
+
+
+@app.get("/api/intelligence/lens/distribution")
+async def api_intelligence_lens_distribution():
+    return {
+        "total": 0,
+        "trained_classes": None,
+        "cohens_kappa": None,
+        "drift_alerts_24h": 0,
+        "by_class": {},
+        "drift_rows": [],
+        "drift_cols": [],
+        "drift_values": [],
+    }
+
+
+@app.get("/api/intelligence/lens/labels/pending")
+async def api_intelligence_lens_labels_pending():
+    return {"wallets": []}
+
+
+@app.get("/api/intelligence/web/summary")
+async def api_intelligence_web_summary():
+    return {
+        "active_fits": 0,
+        "accepted_couplings": 0,
+        "kalman_updates_24h": 0,
+        "forecasts_24h": 0,
+        "alpha": {"row_labels": [], "col_labels": [], "matrix": []},
+        "kalman": [],
+        "forecast": None,
+    }
+
+
+@app.get("/api/intelligence/causal/scatter")
+async def api_intelligence_causal_scatter():
+    return {
+        "estimates_24h": 0,
+        "wu_hausman_pass_rate": 0.0,
+        "first_stage_pass_rate": 0.0,
+        "disagreement_pct": 0.0,
+        "points": [],
+        "wu_hausman_histogram": [],
+        "first_stage_f_histogram": [],
+    }
+
+
+@app.get("/api/intelligence/causal/instruments")
+async def api_intelligence_causal_instruments():
+    return {"events": []}
+
+
+# --- Wallet Lab (R6 universe + augmented profile) -------------------------
+
+
+@app.get("/api/wallet/universe")
+async def api_wallet_universe(limit: int = 200):
+    """R6 wallet_universe browser. Joins on depth_tier + strategy_class
+    where available."""
+    return {
+        "total": 0,
+        "tier_0": 0,
+        "tier_1": 0,
+        "tier_2": 0,
+        "last_crawl_at": None,
+        "wallets": [],
+        "limit": limit,
+    }
+
+
+@app.get("/api/wallet/{wallet}/strategy")
+async def api_wallet_strategy(wallet: str):
+    """R8 strategy fingerprint per wallet — 9-class probability vector."""
+    return {"wallet": wallet, "probs": {}, "last_trained_at": None, "drift_score": None}
+
+
+@app.get("/api/wallet/{wallet}/microstructure")
+async def api_wallet_microstructure(wallet: str):
+    """R11 per-wallet microstructure signature."""
+    return {
+        "wallet": wallet,
+        "cancel_to_fill_ratio_30d": None,
+        "iceberg_score_30d": None,
+        "spoof_score_30d": None,
+        "place_to_fill_seconds_p50": None,
+        "place_to_fill_seconds_p99": None,
+        "n_orders_30d": None,
+        "n_fills_30d": None,
+    }
+
+
+# --- Execution + Operations rollups ----------------------------------------
+
+
+@app.get("/api/execution/summary")
+async def api_execution_summary():
+    return {
+        "positions_open": 0,
+        "max_positions": 10,
+        "filled_24h": 0,
+        "shadow_24h": 0,
+        "decisions_per_hour": 0,
+        "actionable": 0,
+        "net_pnl": 0.0,
+    }
+
+
+# --- Calibration (R13) ----------------------------------------------------
+
+
+@app.get("/api/calibration/losses")
+async def api_calibration_losses(days: int = 30):
+    """Per-model loss trajectory for the OPERATIONS / Calibration chart."""
+    return {"series": [], "days": days}
+
+
+@app.get("/api/calibration/drift")
+async def api_calibration_drift():
+    """Per-model drift gauges."""
+    return {"models": []}
+
+
+@app.get("/api/calibration/disabled")
+async def api_calibration_disabled():
+    """List of currently disabled models."""
+    return {"rows": []}
+
+
+@app.post("/api/calibration/disable/{model}")
+async def api_calibration_disable(model: str):
+    return {"ok": True, "model": model, "auto_or_manual": "manual"}
+
+
+@app.post("/api/calibration/enable/{model}")
+async def api_calibration_enable(model: str):
+    return {"ok": True, "model": model}
+
+
+# --- Research (R13 § 3.5) -------------------------------------------------
+
+
+@app.post("/api/research/notebook/{notebook_id}/run")
+async def api_research_notebook_run(notebook_id: str):
+    """Kicks a `jupyter nbconvert --execute` for the notebook.
+
+    Currently a no-op stub. Operator must implement the run dispatcher.
+    """
+    return {"ok": True, "notebook_id": notebook_id, "queued": False}
 
 
 @app.websocket("/ws/live")
