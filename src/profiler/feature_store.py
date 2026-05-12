@@ -34,7 +34,7 @@ training code are bugs.
 from __future__ import annotations
 
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from loguru import logger
@@ -579,3 +579,216 @@ async def get_wallet_microstructure_signature_asof(
     except Exception:
         result["signature_age_s"] = None
     return result
+
+
+# --------------------------------------------------------------------------- #
+# Round 12 (The Periphery) — social + cross-market readers                     #
+# --------------------------------------------------------------------------- #
+# Three asof-shaped readers fed into R8's LeaderFeatureExtractor:
+#
+#   * get_social_signals_asof(conn, wallet, asof, lookback_days)
+#       → dict {social_signal_density, tweets_per_active_day,
+#               tweet_to_trade_lag_median_s,
+#               social_signal_strategy_concordance}
+#       or None when there are NO signals in the window.
+#
+#   * get_cross_market_features_asof(conn, polymarket_wallet, asof,
+#                                   lookback_days)
+#       → dict {active_venue_count, cross_venue_correlation,
+#               cross_venue_lag_s}
+#       or None when the wallet has NO resolved operator entry.
+#
+#   * get_cross_market_operator_resolution(conn, polymarket_wallet)
+#       → dict of the latest cross_market_operators row matching
+#       the wallet (manual + profile_link + fingerprint sources), or
+#       None when no row exists.
+#
+# Spec § 3.4 + § 4.4. The R8 features extractor calls these per-wallet at
+# the wallet's asof_ts.
+
+
+async def get_social_signals_asof(
+    conn: Any,
+    wallet: str,
+    asof_ts: datetime,
+    lookback_days: int = 30,
+) -> dict | None:
+    """Per-wallet social-signal aggregate. Returns the 4 H. SOCIAL slot
+    values keyed by their short names, or None when the wallet has no
+    matching signals in the window.
+
+    The function does two SQL reads — one for signals, one for trades —
+    then delegates to :func:`src.social.feature_deriver.derive_features`
+    for the actual math. Keeping the compute as a pure function makes
+    the unit test much simpler than a SQL-side window aggregate would.
+    """
+    if asof_ts.tzinfo is None:
+        asof_ts = asof_ts.replace(tzinfo=timezone.utc)
+    floor = asof_ts - timedelta(days=max(1, int(lookback_days)))
+    try:
+        signal_rows = await conn.fetch(
+            """
+            SELECT posted_at, intent, intent_confidence,
+                   parsed_market, parsed_direction
+            FROM social_signals
+            WHERE resolved_wallet = $1
+              AND posted_at >= $2
+              AND posted_at <= $3
+            ORDER BY posted_at ASC
+            """,
+            wallet,
+            floor,
+            asof_ts,
+        )
+    except Exception as exc:
+        logger.debug(
+            f"feature_store.get_social_signals_asof failed for "
+            f"wallet={wallet}: {exc}"
+        )
+        return None
+    if not signal_rows:
+        return None
+    try:
+        trade_rows = await conn.fetch(
+            """
+            SELECT time, market_id, token_id, side
+            FROM trades_observed
+            WHERE wallet_address = $1
+              AND time >= $2
+              AND time <= $3
+            ORDER BY time ASC
+            """,
+            wallet,
+            floor,
+            asof_ts,
+        )
+    except Exception:
+        trade_rows = []
+    # Late import so the feature_store module stays importable when
+    # src/social isn't installed (e.g., environments that don't run
+    # the social daemon).
+    from src.social.feature_deriver import derive_features as _derive_social
+
+    feats = _derive_social(
+        signals=[dict(r) for r in signal_rows],
+        trades=[dict(r) for r in trade_rows],
+        asof_ts=asof_ts,
+        lookback_days=lookback_days,
+    )
+    return feats.as_dict()
+
+
+async def get_cross_market_features_asof(
+    conn: Any,
+    polymarket_wallet: str,
+    asof_ts: datetime,
+    lookback_days: int = 30,
+) -> dict | None:
+    """Per-wallet cross-market aggregate. Returns the 3 J. CROSS_MARKET
+    slot values keyed by their short names, or None when the wallet has
+    no confirmed operator entry.
+
+    Two-step: resolve the operator_id, then read positions + trades.
+    """
+    if asof_ts.tzinfo is None:
+        asof_ts = asof_ts.replace(tzinfo=timezone.utc)
+    floor = asof_ts - timedelta(days=max(1, int(lookback_days)))
+    try:
+        op_row = await conn.fetchrow(
+            """
+            SELECT operator_id, confidence, resolution_source
+            FROM cross_market_operators
+            WHERE polymarket_wallet = $1
+            ORDER BY confidence DESC, resolved_at DESC
+            LIMIT 1
+            """,
+            polymarket_wallet,
+        )
+    except Exception as exc:
+        logger.debug(
+            f"feature_store.get_cross_market_features_asof: operator "
+            f"lookup failed for wallet={polymarket_wallet}: {exc}"
+        )
+        return None
+    if op_row is None:
+        return None
+    try:
+        position_rows = await conn.fetch(
+            """
+            SELECT venue, market_id, side, size_usdc,
+                   opened_at, closed_at, snapshot_at
+            FROM cross_market_positions
+            WHERE operator_id = $1
+              AND snapshot_at >= $2
+              AND snapshot_at <= $3
+            ORDER BY snapshot_at ASC
+            """,
+            int(op_row["operator_id"]),
+            floor,
+            asof_ts,
+        )
+    except Exception as exc:
+        logger.debug(
+            f"feature_store.get_cross_market_features_asof: positions "
+            f"fetch failed: {exc}"
+        )
+        position_rows = []
+    try:
+        trade_rows = await conn.fetch(
+            """
+            SELECT time, market_id, token_id, side
+            FROM trades_observed
+            WHERE wallet_address = $1
+              AND time >= $2
+              AND time <= $3
+            ORDER BY time ASC
+            """,
+            polymarket_wallet,
+            floor,
+            asof_ts,
+        )
+    except Exception:
+        trade_rows = []
+    from src.cross_market.feature_deriver import derive_features as _derive_xm
+
+    feats = _derive_xm(
+        cross_market_rows=[dict(r) for r in position_rows],
+        polymarket_trades=[dict(r) for r in trade_rows],
+        asof_ts=asof_ts,
+        lookback_days=lookback_days,
+    )
+    return feats.as_dict()
+
+
+async def get_cross_market_operator_resolution(
+    conn: Any, polymarket_wallet: str
+) -> dict | None:
+    """Returns the most-recent cross_market_operators row matching the
+    given Polymarket wallet, or None when no row exists.
+
+    Used by the R8 daemon for diagnostic logging + by tooling that wants
+    to know whether a wallet is confirmed-or-pending without computing
+    full features.
+    """
+    try:
+        row = await conn.fetchrow(
+            """
+            SELECT operator_id, polymarket_wallet, kalshi_account,
+                   manifold_handle, predictit_account, x_handle,
+                   resolution_source, confidence, resolved_at, notes
+            FROM cross_market_operators
+            WHERE polymarket_wallet = $1
+            ORDER BY resolved_at DESC
+            LIMIT 1
+            """,
+            polymarket_wallet,
+        )
+    except Exception as exc:
+        logger.debug(
+            f"feature_store.get_cross_market_operator_resolution failed "
+            f"for wallet={polymarket_wallet}: {exc}"
+        )
+        return None
+    if row is None:
+        return None
+    return _row_to_dict(row)

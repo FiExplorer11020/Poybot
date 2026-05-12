@@ -2,11 +2,14 @@
 
 Cover:
 
-* The vector shape is exactly FEATURE_COUNT (=42).
+* The vector shape is exactly FEATURE_COUNT (=45 after R12; was 42 pre-R12).
 * asof_ts is honored — trades AFTER asof are not included.
-* Microstructure / social slots are np.nan when upstream sources are
-  missing; the extractor doesn't crash.
+* Microstructure / social / cross-market slots are np.nan when upstream
+  sources are missing; the extractor doesn't crash.
 * PENDING_FEATURE_NAMES is preserved (R10/R11/R12 wiring is additive).
+* H. SOCIAL slots (35-38) populate from get_social_signals_asof.
+* J. CROSS_MARKET slots (42-44) populate from
+  get_cross_market_features_asof.
 """
 from __future__ import annotations
 
@@ -61,8 +64,9 @@ def _mock_conn_with_trades_positions(trades, positions, edges):
 
 
 class TestFeatureSchema:
-    def test_feature_count_is_42(self):
-        assert FEATURE_COUNT == 42
+    def test_feature_count_is_45(self):
+        # 42 (R8) + 3 (R12 J. CROSS_MARKET) = 45.
+        assert FEATURE_COUNT == 45
 
     def test_feature_names_unique(self):
         assert len(FEATURE_NAMES) == len(set(FEATURE_NAMES))
@@ -71,9 +75,18 @@ class TestFeatureSchema:
         for name in PENDING_FEATURE_NAMES:
             assert name in FEATURE_NAMES
 
-    def test_feature_categories_cover_a_through_i(self):
+    def test_feature_categories_cover_a_through_j(self):
+        # R12 appends J. CROSS_MARKET; the prefix set widens.
         prefixes = set(name.split("_", 1)[0] for name in FEATURE_NAMES)
-        assert prefixes == {"a", "b", "c", "d", "e", "f", "g", "h", "i"}
+        assert prefixes == {"a", "b", "c", "d", "e", "f", "g", "h", "i", "j"}
+
+    def test_cross_market_slots_present(self):
+        for name in (
+            "j_active_venue_count",
+            "j_cross_venue_correlation",
+            "j_cross_venue_lag_s",
+        ):
+            assert name in FEATURE_NAMES
 
 
 class TestExtractShape:
@@ -173,6 +186,12 @@ class TestExtractShape:
              ), patch(
                  "src.strategy_classifier.features.get_wallet_microstructure_signature_asof",
                  side_effect=_no_orderbook,
+             ), patch(
+                 "src.strategy_classifier.features.get_social_signals_asof",
+                 side_effect=_no_orderbook,
+             ), patch(
+                 "src.strategy_classifier.features.get_cross_market_features_asof",
+                 side_effect=_no_orderbook,
              ):
             ext = LeaderFeatureExtractor()
             fv = await ext.extract("0xabc", now)
@@ -191,6 +210,14 @@ class TestExtractShape:
             "h_tweets_per_active_day",
             "h_tweet_to_trade_lag_median_s",
             "h_social_signal_strategy_concordance",
+        ):
+            i = FEATURE_NAMES.index(name)
+            assert math.isnan(fv.values[i])
+        # J-category cross-market slots all nan (R12)
+        for name in (
+            "j_active_venue_count",
+            "j_cross_venue_correlation",
+            "j_cross_venue_lag_s",
         ):
             i = FEATURE_NAMES.index(name)
             assert math.isnan(fv.values[i])
@@ -312,6 +339,135 @@ class TestExtractShape:
         # 12 s of age → 12000 ms.
         assert fv.values[i_book_age] == pytest.approx(12000.0)
         assert fv.values.shape == (FEATURE_COUNT,)
+
+    @pytest.mark.asyncio
+    async def test_social_slots_populate_when_signals_present(self, now):
+        """R12 wiring: when get_social_signals_asof returns a populated
+        dict, the H. SOCIAL slots (35-38) carry real values."""
+        trades = [
+            {
+                "time": now - timedelta(days=1),
+                "market_id": "m1",
+                "token_id": "t1",
+                "side": "buy",
+                "price": 0.5,
+                "size_usdc": 100.0,
+                "category": "crypto",
+            }
+        ]
+        ctx, _ = _mock_conn_with_trades_positions(trades, [], [])
+
+        async def _no_orderbook(*args, **kwargs):
+            return None
+
+        async def _social(*args, **kwargs):
+            return {
+                "social_signal_density": 0.5,
+                "tweets_per_active_day": 1.2,
+                "tweet_to_trade_lag_median_s": -25.0,
+                "social_signal_strategy_concordance": 0.8,
+            }
+
+        async def _cross_market(*args, **kwargs):
+            return None
+
+        with patch("src.strategy_classifier.features.get_db", side_effect=ctx), \
+             patch(
+                 "src.strategy_classifier.features.get_orderbook_features_asof",
+                 side_effect=_no_orderbook,
+             ), patch(
+                 "src.strategy_classifier.features.get_microstructure_features_asof",
+                 side_effect=_no_orderbook,
+             ), patch(
+                 "src.strategy_classifier.features.get_wallet_microstructure_signature_asof",
+                 side_effect=_no_orderbook,
+             ), patch(
+                 "src.strategy_classifier.features.get_social_signals_asof",
+                 side_effect=_social,
+             ), patch(
+                 "src.strategy_classifier.features.get_cross_market_features_asof",
+                 side_effect=_cross_market,
+             ):
+            ext = LeaderFeatureExtractor()
+            fv = await ext.extract("0xabc", now)
+        # All four H. SOCIAL slots carry real values, none in missing.
+        i_d = FEATURE_NAMES.index("h_social_signal_density")
+        i_tpd = FEATURE_NAMES.index("h_tweets_per_active_day")
+        i_lag = FEATURE_NAMES.index("h_tweet_to_trade_lag_median_s")
+        i_conc = FEATURE_NAMES.index("h_social_signal_strategy_concordance")
+        assert fv.values[i_d] == pytest.approx(0.5)
+        assert fv.values[i_tpd] == pytest.approx(1.2)
+        assert fv.values[i_lag] == pytest.approx(-25.0)
+        assert fv.values[i_conc] == pytest.approx(0.8)
+        for name in (
+            "h_social_signal_density",
+            "h_tweets_per_active_day",
+            "h_tweet_to_trade_lag_median_s",
+            "h_social_signal_strategy_concordance",
+        ):
+            assert name not in fv.missing
+
+    @pytest.mark.asyncio
+    async def test_cross_market_slots_populate_when_present(self, now):
+        """R12 wiring: J. CROSS_MARKET slots (42-44) carry real values
+        when the reader returns a populated dict."""
+        trades = [
+            {
+                "time": now - timedelta(days=1),
+                "market_id": "m1",
+                "token_id": "t1",
+                "side": "buy",
+                "price": 0.5,
+                "size_usdc": 100.0,
+                "category": "crypto",
+            }
+        ]
+        ctx, _ = _mock_conn_with_trades_positions(trades, [], [])
+
+        async def _no_orderbook(*args, **kwargs):
+            return None
+
+        async def _social(*args, **kwargs):
+            return None
+
+        async def _cross_market(*args, **kwargs):
+            return {
+                "active_venue_count": 3,
+                "cross_venue_correlation": 0.75,
+                "cross_venue_lag_s": -12.5,
+            }
+
+        with patch("src.strategy_classifier.features.get_db", side_effect=ctx), \
+             patch(
+                 "src.strategy_classifier.features.get_orderbook_features_asof",
+                 side_effect=_no_orderbook,
+             ), patch(
+                 "src.strategy_classifier.features.get_microstructure_features_asof",
+                 side_effect=_no_orderbook,
+             ), patch(
+                 "src.strategy_classifier.features.get_wallet_microstructure_signature_asof",
+                 side_effect=_no_orderbook,
+             ), patch(
+                 "src.strategy_classifier.features.get_social_signals_asof",
+                 side_effect=_social,
+             ), patch(
+                 "src.strategy_classifier.features.get_cross_market_features_asof",
+                 side_effect=_cross_market,
+             ):
+            ext = LeaderFeatureExtractor()
+            fv = await ext.extract("0xabc", now)
+        i_avc = FEATURE_NAMES.index("j_active_venue_count")
+        i_corr = FEATURE_NAMES.index("j_cross_venue_correlation")
+        i_lag = FEATURE_NAMES.index("j_cross_venue_lag_s")
+        assert fv.values[i_avc] == pytest.approx(3.0)
+        assert fv.values[i_corr] == pytest.approx(0.75)
+        assert fv.values[i_lag] == pytest.approx(-12.5)
+        for name in (
+            "j_active_venue_count",
+            "j_cross_venue_correlation",
+            "j_cross_venue_lag_s",
+        ):
+            assert name not in fv.missing
 
     @pytest.mark.asyncio
     async def test_asof_in_past_is_used_in_query(self, now):

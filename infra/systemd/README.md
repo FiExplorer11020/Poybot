@@ -16,14 +16,31 @@ topology (see `docs/ROUND_6_THE_SPINE.md` § 3.5).
 | `polymarket-causal.service`                | `src.causal` *(Round 10)*       | 500 MB        |
 | `polymarket-book-l3.service`               | `src.observer.clob_book_main` *(Round 11)* | 500 MB |
 | `polymarket-microstructure.service`        | `src.microstructure` *(Round 11)* | 400 MB        |
+| `polymarket-social.service`                | `src.social` *(Round 12)*       | 300 MB        |
+| `polymarket-crossmarket.service`           | `src.cross_market` *(Round 12)* | 300 MB        |
 | `polymarket-api.service`                   | `src.api.main` (uvicorn)        | 300 MB        |
 
-Total budget: ~4.1 GB (CX23 has 4 GB; Round 11 adds two daemons —
-operators may need to provision a CX31 or move ingest to a dedicated
-box. The L3 firehose + microstructure deriver pair is the dominant
-cost; if either daemon is paused, the bot keeps trading at R10 level).
+Total budget: ~4.7 GB (CX23 has 4 GB; Round 12 adds two more daemons —
+operators may need to provision a CX33 or move ingest to a dedicated
+box. The L3 firehose + microstructure deriver pair remains the dominant
+cost; Round 12's social + cross-market daemons together fit in 600 MB.
 The R11 daemons MUST run alongside a 500 GB Hetzner volume mounted at
 the Postgres data directory — see R11 § 2.3 for the storage rationale.
+
+**Round 12 operator gates (NOT shipped in code, deliverable separately):**
+
+* X API basic-tier subscription (~$100/mo) — `X_API_KEY` in `.env`.
+* NLP classifier model file at `NLP_CLASSIFIER_MODEL_PATH`. Until the
+  operator delivers a trained sklearn pipeline, the daemon runs the
+  built-in `HeuristicTweetClassifier` (rule-based; ~50µs per call).
+* Kalshi API key (free, rate-limited) — `KALSHI_API_KEY`.
+* Telegram bot token + public-channel list — `TELEGRAM_BOT_TOKEN_READ`
+  and `TELEGRAM_PUBLIC_CHANNELS`.
+* Discord bot token + public-channel list — `DISCORD_BOT_TOKEN_READ`
+  and `DISCORD_PUBLIC_CHANNELS`.
+* ~100 manual wallet-resolution seeds via `WalletResolver.seed_manual`
+  (operator script). Per spec § 7 acceptance: ≥ 10 cross-market
+  operators resolved before R8 retrain.
 
 The `polymarket-causal.service` unit hosts the Round 10 nightly 2SLS
 estimator. It runs once per day (default 04:00 UTC) and exits cleanly
@@ -75,6 +92,8 @@ sudo systemctl enable --now polymarket-falcon-refresher.service
 sudo systemctl enable --now polymarket-mempool.service
 sudo systemctl enable --now polymarket-book-l3.service
 sudo systemctl enable --now polymarket-microstructure.service
+sudo systemctl enable --now polymarket-social.service
+sudo systemctl enable --now polymarket-crossmarket.service
 sudo systemctl enable --now polymarket-api.service
 
 # 4. Verify everything is active (running).

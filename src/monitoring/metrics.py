@@ -1104,6 +1104,153 @@ except Exception:  # pragma: no cover
     pass
 
 
+# === Round 12 (The Periphery) — Social + Cross-Market ===
+# Owned by src.social.* (X / Telegram / Discord daemons + NLP) and
+# src.cross_market.* (Kalshi / Manifold / PredictIt clients + wallet
+# resolver + position aggregator). Per spec § 6 — the canonical 14
+# metrics. Defensive registration (same pattern as R8/R9/R10/R11) so
+# duplicate registration on pytest hot-reload is silently swallowed.
+try:
+    social_tweets_ingested_total = Counter(
+        "polybot_social_tweets_ingested_total",
+        "Posts ingested by the social daemon, partitioned by source.",
+        ["source"],  # x|telegram|discord
+    )
+except Exception:  # pragma: no cover
+    pass
+
+try:
+    social_tweets_classified_total = Counter(
+        "polybot_social_tweets_classified_total",
+        "Posts that have been routed through the NLP classifier, "
+        "partitioned by predicted intent.",
+        ["intent"],  # entry_signal|exit_signal|noise
+    )
+except Exception:  # pragma: no cover
+    pass
+
+try:
+    social_x_quota_remaining = Gauge(
+        "polybot_social_x_quota_remaining",
+        "Gauge of the X API monthly tweet-pull budget remaining "
+        "(refreshed on every successful call's headers). Alerts at "
+        "< 10 % per spec § 3.1.",
+    )
+except Exception:  # pragma: no cover
+    pass
+
+try:
+    social_classifier_latency_seconds = Histogram(
+        "polybot_social_classifier_latency_seconds",
+        "NLP classifier per-post inference latency. The heuristic "
+        "fallback runs in microseconds; the trained-model loader (when "
+        "operator delivers a sklearn pipeline) sits in the 10-100 ms range.",
+        buckets=(0.0001, 0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0),
+    )
+except Exception:  # pragma: no cover
+    pass
+
+try:
+    social_classifier_uncertainty = Gauge(
+        "polybot_social_classifier_uncertainty",
+        "Rolling-mean max-prob across the most recent classified posts. "
+        "Low values signal classifier drift; spec § 6.",
+    )
+except Exception:  # pragma: no cover
+    pass
+
+try:
+    social_unresolved_authors = Gauge(
+        "polybot_social_unresolved_authors",
+        "Distinct author handles in social_signals with no matching "
+        "row in cross_market_operators (the manual-seed gap).",
+    )
+except Exception:  # pragma: no cover
+    pass
+
+try:
+    crossmarket_venues_reachable = Gauge(
+        "polybot_crossmarket_venues_reachable",
+        "Gauge of how many of the three cross-market venues "
+        "(Kalshi / Manifold / PredictIt) are currently responsive.",
+    )
+except Exception:  # pragma: no cover
+    pass
+
+try:
+    crossmarket_api_calls_total = Counter(
+        "polybot_crossmarket_api_calls_total",
+        "Cross-market venue API calls, partitioned by venue + result.",
+        ["venue", "result"],  # venue: kalshi|manifold|predictit  result: ok|rate_limited|error|timeout
+    )
+except Exception:  # pragma: no cover
+    pass
+
+try:
+    crossmarket_api_latency_seconds = Histogram(
+        "polybot_crossmarket_api_latency_seconds",
+        "Per-venue API call wall time.",
+        ["venue"],
+        buckets=(0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0),
+    )
+except Exception:  # pragma: no cover
+    pass
+
+try:
+    crossmarket_positions_observed_total = Counter(
+        "polybot_crossmarket_positions_observed_total",
+        "Cross-market position snapshots written to "
+        "cross_market_positions, partitioned by venue.",
+        ["venue"],
+    )
+except Exception:  # pragma: no cover
+    pass
+
+try:
+    crossmarket_resolved_operators = Gauge(
+        "polybot_crossmarket_resolved_operators",
+        "Total resolved cross-market operator identities (manual + "
+        "auto-confirmed). Acceptance gate: ≥ 10 per spec § 7.",
+    )
+except Exception:  # pragma: no cover
+    pass
+
+try:
+    crossmarket_resolution_attempts_total = Counter(
+        "polybot_crossmarket_resolution_attempts_total",
+        "Per-attempt counter for the wallet resolver, partitioned by "
+        "resolution source and result.",
+        # source: manual|profile_link|fingerprint  result: confirmed|pending_review|rejected|error
+        ["source", "result"],
+    )
+except Exception:  # pragma: no cover
+    pass
+
+try:
+    social_cross_market_signal_coverage = Gauge(
+        "polybot_social_cross_market_signal_coverage",
+        "Fraction of top-N leaders that have EITHER social OR "
+        "cross-market data in the last 30 days. Spec § 6 + acceptance.",
+    )
+except Exception:  # pragma: no cover
+    pass
+
+try:
+    social_to_trade_lag_seconds = Histogram(
+        "polybot_social_to_trade_lag_seconds",
+        "Distribution of tweet-to-trade lag (seconds; signed sign — "
+        "negative = tweet precedes trade) across leaders with both "
+        "social signal coverage and observed trade events.",
+        # 1 s … 1 d on either side; symmetric coverage.
+        buckets=(
+            -86400.0, -3600.0, -300.0, -60.0, -10.0, -1.0,
+            0.0, 1.0, 10.0, 60.0, 300.0, 3600.0, 86400.0,
+        ),
+    )
+except Exception:  # pragma: no cover
+    pass
+
+
 # ---------------------------------------------------------------------------
 # Build info — best-effort. Surfaces version + git short-SHA on /metrics so a
 # scrape can correlate metrics with a deploy. Failure here must NEVER break

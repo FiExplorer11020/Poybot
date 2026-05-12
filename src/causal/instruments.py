@@ -51,7 +51,8 @@ from src.database.connection import get_db
 
 
 class NewsEventDetector(Detector):
-    """NewsAPI-fed news event detector.
+    """NewsAPI-fed news event detector — R12 expands the event corpus to
+    include high-confidence social signals.
 
     Pipeline (real path):
         1. Fetch top headlines via NewsAPI (injected ``http_session``).
@@ -60,7 +61,12 @@ class NewsEventDetector(Detector):
            audit can swap in different NER backends).
         3. Match entities against candidate market subjects (markets
            whose ``question`` text contains the entity).
-        4. Emit one InstrumentalEvent per matched market with a
+        4. **R12**: also sweep ``social_signals`` for high-confidence
+           entry / exit signals (intent in {entry_signal, exit_signal}
+           AND intent_confidence > ``min_social_confidence``) and emit
+           one InstrumentalEvent per signal. Spec § 3.4 + R10
+           instruments contract.
+        5. Emit one InstrumentalEvent per matched market with a
            confidence score.
 
     The HTTP call is operator-deliverable infrastructure — we accept
@@ -78,24 +84,46 @@ class NewsEventDetector(Detector):
         http_session: Any | None = None,
         ner_extractor: Any | None = None,
         api_key: str | None = None,
+        *,
+        social_signal_lookback_s: int = 3600,
+        min_social_confidence: float | None = None,
     ) -> None:
         self._http = http_session
         self._ner = ner_extractor
         self._api_key = api_key
+        # R12 wiring — defaults to the periphery spec's threshold.
+        self._social_lookback_s = int(social_signal_lookback_s)
+        if min_social_confidence is None:
+            try:
+                from src.config import settings as _settings
+                self._min_social_conf = float(
+                    _settings.SOCIAL_NEWS_EVENT_MIN_CONFIDENCE
+                )
+            except Exception:  # pragma: no cover — defensive
+                self._min_social_conf = 0.7
+        else:
+            self._min_social_conf = float(min_social_confidence)
 
     async def detect(self, asof_ts: datetime) -> list[InstrumentalEvent]:
+        events: list[InstrumentalEvent] = []
+        # R12 — social signals always contribute, regardless of whether
+        # the NewsAPI side is wired. The social signals table is
+        # populated by the social daemon (R12) and may carry useful
+        # instrumental events even when the operator hasn't subscribed
+        # to NewsAPI yet.
+        events.extend(await self._fetch_social_signal_events(asof_ts))
         if self._http is None:
             logger.debug(
-                "NewsEventDetector: no http_session injected; returning empty. "
-                "Use FixtureNewsEventDetector for tests, wire a real "
-                "aiohttp.ClientSession in production."
+                "NewsEventDetector: no http_session injected; returning "
+                "social-signal events only. Use FixtureNewsEventDetector "
+                "for tests or wire a real aiohttp.ClientSession for the "
+                "NewsAPI side."
             )
-            return []
+            return events
         # Real-path skeleton — kept minimal so the methodology audit
         # has a clean target. The operator wires the actual NewsAPI
         # endpoint + NER in a separate deliverable.
         headlines = await self._fetch_headlines(asof_ts)
-        events: list[InstrumentalEvent] = []
         for h in headlines:
             entities = self._extract_entities(h)
             affected = await self._match_markets(entities, asof_ts)
@@ -112,6 +140,68 @@ class NewsEventDetector(Detector):
                     },
                     affected_market_ids=affected,
                     confidence=float(h.get("confidence", 0.8)),
+                )
+            )
+        return events
+
+    async def _fetch_social_signal_events(
+        self, asof_ts: datetime
+    ) -> list[InstrumentalEvent]:
+        """Read high-confidence entry/exit signals from
+        ``social_signals`` within ``social_signal_lookback_s`` of asof.
+        Each row maps to one InstrumentalEvent — the affected markets
+        are pulled from the ``parsed_market`` column (or left empty
+        when the classifier couldn't extract one)."""
+        floor = asof_ts.replace(microsecond=0)
+        try:
+            from datetime import timedelta as _td
+            floor = asof_ts - _td(seconds=self._social_lookback_s)
+        except Exception:  # pragma: no cover
+            pass
+        events: list[InstrumentalEvent] = []
+        try:
+            async with get_db() as conn:
+                rows = await conn.fetch(
+                    """
+                    SELECT signal_id, source, author_handle, posted_at,
+                           intent, intent_confidence, parsed_market,
+                           parsed_direction, text
+                    FROM social_signals
+                    WHERE posted_at >= $1
+                      AND posted_at <= $2
+                      AND intent IN ('entry_signal', 'exit_signal')
+                      AND intent_confidence > $3
+                    ORDER BY posted_at ASC
+                    LIMIT 500
+                    """,
+                    floor,
+                    asof_ts,
+                    self._min_social_conf,
+                )
+        except Exception as exc:
+            logger.debug(
+                f"NewsEventDetector: social_signals read failed: {exc}"
+            )
+            return []
+        for row in rows or []:
+            parsed_market = row["parsed_market"]
+            affected = [str(parsed_market)] if parsed_market else []
+            events.append(
+                InstrumentalEvent(
+                    event_type=self.event_type,
+                    event_time=row["posted_at"],
+                    source=f"social:{row['source']}",
+                    payload={
+                        "signal_id": int(row["signal_id"]),
+                        "author_handle": row["author_handle"],
+                        "intent": row["intent"],
+                        "parsed_direction": row["parsed_direction"],
+                        "text_excerpt": (
+                            row["text"][:280] if row["text"] else ""
+                        ),
+                    },
+                    affected_market_ids=affected,
+                    confidence=float(row["intent_confidence"]),
                 )
             )
         return events

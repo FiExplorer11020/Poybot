@@ -1038,6 +1038,75 @@ class Settings(BaseSettings):
     # readers fall back to None — too thin to inform the classifier.
     MICROSTRUCTURE_SIGNATURE_MIN_ORDERS: int = 50
 
+    # ------------------------------------------------------------------ #
+    # Round 12 (The Periphery) — Social + Cross-Market                    #
+    # ------------------------------------------------------------------ #
+    # X (Twitter) firehose. Empty defaults so unit tests don't touch the
+    # network; production wires both via .env. The basic-tier subscription
+    # is operator-deliverable ($100/mo per spec § 7).
+    X_API_KEY: str = ""
+    X_API_BASE_URL: str = "https://api.twitter.com/2"
+    # How often to re-POST the filter rules to the X API (handles +
+    # market URLs + keywords). 86400 s = once a day, matches spec § 3.1.
+    X_API_RULES_REFRESH_INTERVAL_S: int = 86400
+    # Comma-separated lower-cased handles to track via from:<handle>.
+    # Operator-curated against the leader registry.
+    X_TRACKED_HANDLES: str = ""
+    # Public Telegram channels — comma-separated channel ids. Public-
+    # only (spec § 3.3): no DMs, no private groups.
+    TELEGRAM_PUBLIC_CHANNELS: str = ""
+    # Read-only bot token for the python-telegram-bot listener. Empty
+    # disables the Telegram source gracefully.
+    TELEGRAM_BOT_TOKEN_READ: str = ""
+    # Public Discord channel ids — comma-separated. Polled via REST so
+    # we avoid the heavy discord.py dep.
+    DISCORD_PUBLIC_CHANNELS: str = ""
+    # Discord bot token (read-only). Empty disables the source.
+    DISCORD_BOT_TOKEN_READ: str = ""
+    # Poll cadence for Discord REST (sec). 30 s matches the spec's
+    # rate-limit-aware floor.
+    DISCORD_POLL_INTERVAL_S: int = 30
+    # Per-source Redis Stream names. Consumed by the daemon's NLP
+    # classifier loop which writes the classified rows to social_signals.
+    SOCIAL_X_STREAM_NAME: str = "social:x:stream"
+    SOCIAL_TELEGRAM_STREAM_NAME: str = "social:telegram:stream"
+    SOCIAL_DISCORD_STREAM_NAME: str = "social:discord:stream"
+    # Approximate stream cap so a consumer outage doesn't OOM Redis.
+    # Typical inflow < 5k/month per spec — generous headroom.
+    SOCIAL_STREAM_MAXLEN: int = 100_000
+    # Lookback window for per-wallet social feature derivation. 30 d
+    # matches the spec § 3.4 wording.
+    SOCIAL_SIGNAL_LOOKBACK_DAYS: int = 30
+    # NLP classifier model file path. If present the LoadableTweetClassifier
+    # mmaps it; if absent we fall back to HeuristicTweetClassifier per
+    # spec § 3.2 ("rule-based + simple-keyword + heuristic classifier as
+    # the production fallback when the trained model file is absent").
+    NLP_CLASSIFIER_MODEL_PATH: str = ""
+    # Minimum classifier confidence for a social signal to be considered
+    # a NEWS-event candidate by R10's instrumental-variable detector.
+    # Spec § 3.2 + R10 instruments contract.
+    SOCIAL_NEWS_EVENT_MIN_CONFIDENCE: float = 0.7
+
+    # Cross-market venue clients. All keys + base URLs operator-managed.
+    KALSHI_API_KEY: str = ""
+    KALSHI_BASE_URL: str = "https://trading-api.kalshi.com/trade-api/v2"
+    MANIFOLD_BASE_URL: str = "https://api.manifold.markets/v0"
+    PREDICTIT_BASE_URL: str = "https://www.predictit.org/api/marketdata"
+    # Per-venue HTTP timeout. Matches FALCON pattern (~8 s).
+    CROSS_MARKET_HTTP_TIMEOUT_S: float = 8.0
+    # Token bucket capacity / refill for the cross-market clients.
+    # Mirrors the FalconClient adaptive-bucket idiom (spec § 4.1).
+    CROSS_MARKET_BUCKET_CAPACITY: int = 30
+    CROSS_MARKET_BUCKET_REFILL_PER_SEC: float = 1.0
+    # Aggregator cadence: poll every N hours. 1 h matches the spec
+    # § 7 effort + acceptance criteria. Cheap relative to the position-
+    # snapshot table cardinality target.
+    CROSS_MARKET_POLL_INTERVAL_H: int = 1
+    # Auto-resolution confidence floor. Below this, fingerprint matches
+    # are written but flagged for manual review and excluded from the
+    # cross-market feature deriver. Per spec § 4.2 "manual-in-the-loop".
+    CROSS_MARKET_MIN_RESOLUTION_CONFIDENCE: float = 0.8
+
     @field_validator("CLOB_BOOK_QUEUE_MAXSIZE")
     @classmethod
     def _validate_clob_book_queue_maxsize(cls, v: int) -> int:

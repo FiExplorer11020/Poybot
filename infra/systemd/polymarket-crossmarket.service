@@ -1,0 +1,27 @@
+[Unit]
+Description=Polymarket Bot — Cross-market position aggregator (Round 12)
+Documentation=https://github.com/your-org/polymarket-bot/blob/main/docs/ROUND_12_SOCIAL_AND_CROSS_MARKET.md
+After=network-online.target postgresql.service redis-server.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=polymarket
+Group=polymarket
+WorkingDirectory=/opt/polymarket-bot/
+EnvironmentFile=/opt/polymarket-bot/.env
+ExecStart=/opt/polymarket-bot/.venv/bin/python -m src.cross_market
+Restart=always
+RestartSec=5s
+
+# Per Round 12 § 2 — three per-venue clients + wallet resolver +
+# position aggregator. Spec target ~200 MB; allow 300 MB headroom.
+MemoryMax=300M
+
+StandardOutput=journal
+StandardError=journal
+
+SyslogIdentifier=polymarket-crossmarket
+
+[Install]
+WantedBy=multi-user.target

@@ -29,8 +29,10 @@ from loguru import logger
 
 from src.database.connection import get_db
 from src.profiler.feature_store import (
+    get_cross_market_features_asof,
     get_microstructure_features_asof,
     get_orderbook_features_asof,
+    get_social_signals_asof,
     get_wallet_microstructure_signature_asof,
 )
 
@@ -85,7 +87,7 @@ FEATURE_NAMES: tuple[str, ...] = (
     "g_alpha_mu_ratio_to_follower_pool",
     "g_is_followed_back_pct",
     "g_cluster_density",
-    # H. SOCIAL (4) — R12 wires; np.nan until then.
+    # H. SOCIAL (4) — R12 wires via get_social_signals_asof.
     "h_social_signal_density",
     "h_tweets_per_active_day",
     "h_tweet_to_trade_lag_median_s",
@@ -94,13 +96,20 @@ FEATURE_NAMES: tuple[str, ...] = (
     "i_trading_hour_kde_peak",
     "i_weekday_bias",
     "i_time_of_day_entropy",
+    # J. CROSS_MARKET (3) — R12 appends. The model retrain after R12
+    # ships is the operator gate that picks up the new slots; the
+    # pre-R12 LightGBM model trained at the 42-slot shape is invalid
+    # and must be re-fit. Spec § 4.4.
+    "j_active_venue_count",
+    "j_cross_venue_correlation",
+    "j_cross_venue_lag_s",
 )
 
-FEATURE_COUNT = len(FEATURE_NAMES)  # 42 — asserted in tests.
+FEATURE_COUNT = len(FEATURE_NAMES)  # 45 — asserted in tests.
 
-# Categories E, F, H, and parts of G that depend on upstream rounds. The
-# daemon reports the fraction of NaNs in these slots as a metric so
-# operators can see when R9/R10/R11/R12 come online.
+# Categories E, F, H, J that depend on upstream rounds. The daemon
+# reports the fraction of NaNs in these slots as a metric so operators
+# can see when R9/R10/R11/R12 come online.
 PENDING_FEATURE_NAMES: frozenset[str] = frozenset({
     "e_microprice_deviation_at_entry_median",
     "e_spread_bps_at_entry_median",
@@ -114,6 +123,9 @@ PENDING_FEATURE_NAMES: frozenset[str] = frozenset({
     "h_tweets_per_active_day",
     "h_tweet_to_trade_lag_median_s",
     "h_social_signal_strategy_concordance",
+    "j_active_venue_count",
+    "j_cross_venue_correlation",
+    "j_cross_venue_lag_s",
 })
 
 
@@ -209,10 +221,18 @@ class LeaderFeatureExtractor:
                 self._populate_exit_microstructure(values, positions, missing)
                 # G. network
                 self._populate_network(values, edges, missing)
-                # H. social — R12 only; structural slots, all nan today
-                self._populate_social_stubs(missing)
+                # H. social — R12 wires via get_social_signals_asof.
+                await self._populate_social(
+                    conn, values, wallet_address, asof_ts, missing
+                )
                 # I. temporal
                 self._populate_temporal(values, trades)
+                # J. cross_market — R12 appends 3 slots beyond the
+                # original 42; populated from cross_market_positions +
+                # cross_market_operators.
+                await self._populate_cross_market(
+                    conn, values, wallet_address, asof_ts, missing
+                )
         except Exception as exc:  # pragma: no cover — defensive top-level
             logger.warning(
                 f"LeaderFeatureExtractor: extract failed for "
@@ -727,17 +747,154 @@ class LeaderFeatureExtractor:
         missing.append("g_cluster_density")
 
     # ------------------------------------------------------------------ #
-    # Category H — SOCIAL (4) — R12 wires; structural stubs only.         #
+    # Category H — SOCIAL (4) — R12 wires via get_social_signals_asof.    #
     # ------------------------------------------------------------------ #
 
-    def _populate_social_stubs(self, missing: list[str]) -> None:
-        for name in (
-            "h_social_signal_density",
-            "h_tweets_per_active_day",
-            "h_tweet_to_trade_lag_median_s",
-            "h_social_signal_strategy_concordance",
-        ):
-            missing.append(name)
+    async def _populate_social(
+        self,
+        conn: Any,
+        values: np.ndarray,
+        wallet_address: str,
+        asof_ts: datetime,
+        missing: list[str],
+    ) -> None:
+        """Populate the H. SOCIAL slots (35-38) from
+        ``get_social_signals_asof``. Spec § 3.4 of R12.
+
+        Slot map (LOAD-BEARING):
+          * 35 h_social_signal_density
+          * 36 h_tweets_per_active_day
+          * 37 h_tweet_to_trade_lag_median_s
+          * 38 h_social_signal_strategy_concordance
+
+        When the reader returns None (no signals) every slot stays
+        np.nan and the names are appended to ``missing``. Pre-R12 the
+        structural slot was unconditionally nan; R12 just changes the
+        values when data exists.
+        """
+        try:
+            social = await get_social_signals_asof(
+                conn,
+                wallet_address,
+                asof_ts,
+                lookback_days=self._lookback_days,
+            )
+        except Exception as exc:
+            logger.debug(
+                f"LeaderFeatureExtractor: social signals lookup failed "
+                f"for wallet={wallet_address[:10]}…: {exc}"
+            )
+            social = None
+        if not social:
+            for name in (
+                "h_social_signal_density",
+                "h_tweets_per_active_day",
+                "h_tweet_to_trade_lag_median_s",
+                "h_social_signal_strategy_concordance",
+            ):
+                missing.append(name)
+            return
+        density = social.get("social_signal_density")
+        if density is not None:
+            try:
+                values[35] = float(density)
+            except (TypeError, ValueError):
+                missing.append("h_social_signal_density")
+        else:
+            missing.append("h_social_signal_density")
+        tpd = social.get("tweets_per_active_day")
+        if tpd is not None:
+            try:
+                values[36] = float(tpd)
+            except (TypeError, ValueError):
+                missing.append("h_tweets_per_active_day")
+        else:
+            missing.append("h_tweets_per_active_day")
+        lag = social.get("tweet_to_trade_lag_median_s")
+        if lag is not None:
+            try:
+                values[37] = float(lag)
+            except (TypeError, ValueError):
+                missing.append("h_tweet_to_trade_lag_median_s")
+        else:
+            missing.append("h_tweet_to_trade_lag_median_s")
+        conc = social.get("social_signal_strategy_concordance")
+        if conc is not None:
+            try:
+                values[38] = float(conc)
+            except (TypeError, ValueError):
+                missing.append("h_social_signal_strategy_concordance")
+        else:
+            missing.append("h_social_signal_strategy_concordance")
+
+    # ------------------------------------------------------------------ #
+    # Category J — CROSS_MARKET (3) — R12 appends.                       #
+    # ------------------------------------------------------------------ #
+
+    async def _populate_cross_market(
+        self,
+        conn: Any,
+        values: np.ndarray,
+        wallet_address: str,
+        asof_ts: datetime,
+        missing: list[str],
+    ) -> None:
+        """Populate the J. CROSS_MARKET slots (42-44) from
+        ``get_cross_market_features_asof``. Spec § 4.4 of R12.
+
+        Slot map (LOAD-BEARING):
+          * 42 j_active_venue_count
+          * 43 j_cross_venue_correlation
+          * 44 j_cross_venue_lag_s
+
+        When the reader returns None (no resolved operator entry) every
+        slot stays np.nan and the names are appended to ``missing``.
+        """
+        try:
+            xm = await get_cross_market_features_asof(
+                conn,
+                wallet_address,
+                asof_ts,
+                lookback_days=self._lookback_days,
+            )
+        except Exception as exc:
+            logger.debug(
+                f"LeaderFeatureExtractor: cross-market lookup failed "
+                f"for wallet={wallet_address[:10]}…: {exc}"
+            )
+            xm = None
+        if not xm:
+            for name in (
+                "j_active_venue_count",
+                "j_cross_venue_correlation",
+                "j_cross_venue_lag_s",
+            ):
+                missing.append(name)
+            return
+        avc = xm.get("active_venue_count")
+        if avc is not None:
+            try:
+                values[42] = float(avc)
+            except (TypeError, ValueError):
+                missing.append("j_active_venue_count")
+        else:
+            missing.append("j_active_venue_count")
+        corr = xm.get("cross_venue_correlation")
+        if corr is not None:
+            try:
+                values[43] = float(corr)
+            except (TypeError, ValueError):
+                missing.append("j_cross_venue_correlation")
+        else:
+            missing.append("j_cross_venue_correlation")
+        lag = xm.get("cross_venue_lag_s")
+        if lag is not None:
+            try:
+                values[44] = float(lag)
+            except (TypeError, ValueError):
+                missing.append("j_cross_venue_lag_s")
+        else:
+            missing.append("j_cross_venue_lag_s")
 
     # ------------------------------------------------------------------ #
     # Category I — TEMPORAL (3)                                          #
