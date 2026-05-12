@@ -306,6 +306,27 @@ async def main() -> None:
         logger.warning(
             f"Scheduler: skipping mvhawkes_nightly registration: {exc}"
         )
+    # Round 10 (The Truth Test) — nightly 2SLS pass. Runs at 04:00 UTC,
+    # AFTER R9's 03:30 batch so the daemon can read freshly-written
+    # multivariate_hawkes_fits rows for the side-by-side comparison.
+    # Gated on the R10 daemon module being importable so a stripped
+    # test env doesn't crash the engine startup.
+    try:
+        from src.causal.daemon import CausalDaemon  # noqa: F401
+
+        async def _causal_nightly() -> None:
+            daemon = CausalDaemon()
+            await daemon.run_one_pass()
+
+        scheduler.add_cron(
+            "causal_nightly",
+            _causal_nightly,
+            hour=getattr(settings, "CAUSAL_DAEMON_BATCH_HOUR_UTC", 4),
+        )
+    except Exception as exc:  # pragma: no cover — graceful degrade
+        logger.warning(
+            f"Scheduler: skipping causal_nightly registration: {exc}"
+        )
     await scheduler.start()
     # ------------------------------------------------------------------- #
 

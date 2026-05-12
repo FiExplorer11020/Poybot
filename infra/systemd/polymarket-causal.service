@@ -1,0 +1,31 @@
+[Unit]
+Description=Polymarket Bot — Causal-inference daemon (Round 10 / The Truth Test)
+Documentation=https://github.com/your-org/polymarket-bot/blob/main/docs/ROUND_10_CAUSAL_INFERENCE.md
+After=network-online.target redis-server.service polymarket-engine.service polymarket-follower-volume.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=polymarket
+Group=polymarket
+WorkingDirectory=/opt/polymarket-bot/
+EnvironmentFile=/opt/polymarket-bot/.env
+ExecStart=/opt/polymarket-bot/.venv/bin/python -m src.causal
+Restart=always
+RestartSec=5s
+
+# Per Round 10 — memory budget. The 2SLS estimator over ~200 leaders ×
+# ~4 pool_classes × 1000-resample bootstrap stays under 500 MB. The
+# main allocation is the (n_bins × q) instrument matrix in numpy
+# (typical ~10k bins × 4 instruments ≈ 320 KB per fit; the bootstrap
+# resamples within each fit, no concurrent fits).
+MemoryMax=500M
+
+StandardOutput=journal
+StandardError=journal
+
+# Logging tag for journalctl filtering.
+SyslogIdentifier=polymarket-causal
+
+[Install]
+WantedBy=multi-user.target

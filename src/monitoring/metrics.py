@@ -865,6 +865,119 @@ except Exception:  # pragma: no cover
     pass
 
 
+# === Round 10 (The Truth Test) — Causal inference layer ===
+# Owned by src.causal.*. Same defensive-declaration pattern as the R9
+# block above — duplicate registration on pytest hot-reload is silently
+# swallowed. See docs/ROUND_10_CAUSAL_INFERENCE.md § 5 for the canonical
+# list. All 10 R10 metrics declared here.
+try:
+    iv_estimates_total = Counter(
+        "polybot_iv_estimates_total",
+        "2SLS estimates performed by the causal daemon, partitioned "
+        "by convergence outcome.",
+        ["result"],  # converged|weak_instruments|failed
+    )
+except Exception:  # pragma: no cover
+    pass
+
+try:
+    iv_first_stage_f = Histogram(
+        "polybot_iv_first_stage_f",
+        "Distribution of first-stage F-statistics across all 2SLS "
+        "estimates. Acceptance gate (spec § 6): > 10 for >= 80% of "
+        "(leader, pool) pairs.",
+        buckets=(0.0, 1.0, 5.0, 10.0, 25.0, 50.0, 100.0, 500.0),
+    )
+except Exception:  # pragma: no cover
+    pass
+
+try:
+    iv_wu_hausman_p = Histogram(
+        "polybot_iv_wu_hausman_p",
+        "Distribution of Wu-Hausman p-values across all 2SLS estimates. "
+        "Acceptance gate (spec § 6): p < 0.05 for >= 70% of pairs "
+        "(instruments are pulling weight, not just noise).",
+        buckets=(0.0, 0.01, 0.05, 0.1, 0.25, 0.5, 1.0),
+    )
+except Exception:  # pragma: no cover
+    pass
+
+try:
+    causal_ate_vs_hawkes_disagreement = Gauge(
+        "polybot_causal_ate_vs_hawkes_disagreement",
+        "Relative disagreement |ate - alpha/mu| / |alpha/mu| between "
+        "the IV-corrected causal ATE and the R9 Hawkes alpha/mu ratio. "
+        "Large = news-confounding case; gate should fire.",
+    )
+except Exception:  # pragma: no cover
+    pass
+
+try:
+    causal_ate_excludes_zero_count = Counter(
+        "polybot_causal_ate_excludes_zero_count",
+        "Per-leader count of (leader, pool) pairs whose 95% bootstrap CI "
+        "excludes zero (i.e. clean causal evidence). Acceptance gate "
+        "(spec § 6): >= 60% of pairs.",
+        ["leader"],
+    )
+except Exception:  # pragma: no cover
+    pass
+
+try:
+    instruments_detected_total = Counter(
+        "polybot_instruments_detected_total",
+        "Instrumental events detected by the InstrumentRegistry, "
+        "partitioned by event_type.",
+        ["event_type"],  # news|oracle_update|api_outage|funding|gas_quirk
+    )
+except Exception:  # pragma: no cover
+    pass
+
+try:
+    instrumental_event_lag_seconds = Histogram(
+        "polybot_instrumental_event_lag_seconds",
+        "Per-detector detection lag in seconds (inserted_at - event_time). "
+        "Shorter = the instrument is closer to real-time; oracle log "
+        "subscriptions sit at <30 s while NewsAPI ingestion floats at "
+        "5-30 min.",
+        ["event_type"],
+        buckets=(1.0, 10.0, 60.0, 300.0, 1800.0, 3600.0, 7200.0, 86400.0),
+    )
+except Exception:  # pragma: no cover
+    pass
+
+try:
+    counterfactual_replays_total = Counter(
+        "polybot_counterfactual_replays_total",
+        "CounterfactualReplayer invocations, partitioned by kind.",
+        ["kind"],  # classifier_override|policy_disabled|event_shift
+    )
+except Exception:  # pragma: no cover
+    pass
+
+try:
+    counterfactual_replay_duration_seconds = Histogram(
+        "polybot_counterfactual_replay_duration_seconds",
+        "Wall time per counterfactual replay. Acceptance gate "
+        "(spec § 3.4): 30-day replay < 300 s (5 min).",
+        buckets=(0.1, 0.5, 1.0, 5.0, 15.0, 60.0, 300.0, 900.0),
+    )
+except Exception:  # pragma: no cover
+    pass
+
+try:
+    confidence_engine_causal_gates_total = Counter(
+        "polybot_confidence_engine_causal_gates_total",
+        "Confidence-engine R10 gate decisions. 'downgraded' = the "
+        "causal CI did not exclude zero positively and the engine "
+        "halved follow_confidence; 'allowed' = clean causal evidence "
+        "(or the gate flag was off).",
+        ["result"],  # downgraded|allowed|blocked
+    )
+except Exception:  # pragma: no cover
+    pass
+
+
 # ---------------------------------------------------------------------------
 # Build info — best-effort. Surfaces version + git short-SHA on /metrics so a
 # scrape can correlate metrics with a deploy. Failure here must NEVER break

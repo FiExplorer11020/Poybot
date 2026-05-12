@@ -69,6 +69,22 @@ ALLOWED_KEYS: dict[str, str] = {
         "volume (USDC) for a volume_anticipation entry to fire. Numeric, "
         "default 5000."
     ),
+    # Round 10 (The Truth Test) — causal gate. When False (default)
+    # the confidence engine is byte-identical to pre-R10 behavior.
+    # When True, the engine consults causal_estimates for the (leader,
+    # pool) pair and: (a) downgrades follow_confidence by
+    # CAUSAL_GATE_FOLLOW_PENALTY when the IV-adjusted CI does NOT
+    # exclude zero positively, and (b) BLOCKS volume_anticipation
+    # entries on those pairs entirely. The flag stays OFF until the
+    # methodology audit gate (spec § 6, ~1 week external causal-
+    # inference expert) signs off + 60-day A/B Sharpe + max-drawdown
+    # passes.
+    "causal_gating_enabled": (
+        "Round 10 gate: when True, downgrade follow_confidence and "
+        "block volume_anticipation entries when the IV-adjusted causal "
+        "ATE for the (leader, pool) pair does not exclude zero "
+        "positively. Boolean, default False (shadow phase)."
+    ),
 }
 
 # Inclusive (min, max) bounds for each editable key. Writes outside the
@@ -93,6 +109,8 @@ BOUNDS: dict[str, tuple[float, float]] = {
     # Threshold lower bound = MIN_POSITION_USDC; upper bound is a
     # reasonable ceiling that catches accidental typos (1M).
     "volume_anticipation_threshold_usdc": (50.0, 1_000_000.0),
+    # Round 10 — boolean flag (coerced to {0, 1}).
+    "causal_gating_enabled": (0.0, 1.0),
 }
 
 # Keys that store booleans (not floats). set_overrides coerces these
@@ -102,6 +120,8 @@ BOOLEAN_KEYS: frozenset[str] = frozenset({
     "strategy_conditional_confidence_enabled",
     # Round 9 — volume_anticipation gate.
     "volume_anticipation_enabled",
+    # Round 10 — causal gating flag.
+    "causal_gating_enabled",
 })
 
 REDIS_KEY = "runtime_config:overrides"
@@ -135,6 +155,9 @@ def _defaults_from_settings() -> dict[str, Any]:
         "volume_anticipation_threshold_usdc": float(
             getattr(settings, "VOLUME_ANTICIPATION_THRESHOLD_USDC", 5000.0)
         ),
+        # Round 10 — default OFF until methodology audit + 60-day A/B
+        # passes (spec § 6).
+        "causal_gating_enabled": False,
     }
 
 

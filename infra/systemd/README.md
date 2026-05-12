@@ -13,9 +13,18 @@ topology (see `docs/ROUND_6_THE_SPINE.md` § 3.5).
 | `polymarket-mempool.service`               | `src.mempool` *(Round 7)*       | 300 MB        |
 | `polymarket-strategy-classifier.service`   | `src.strategy_classifier` *(Round 8)* | 400 MB  |
 | `polymarket-follower-volume.service`       | `src.follower_volume` *(Round 9)* | 400 MB        |
+| `polymarket-causal.service`                | `src.causal` *(Round 10)*       | 500 MB        |
 | `polymarket-api.service`                   | `src.api.main` (uvicorn)        | 300 MB        |
 
-Total budget: ~2.7 GB (CX23 has 4 GB; leaves headroom for Postgres + Redis).
+Total budget: ~3.2 GB (CX23 has 4 GB; leaves headroom for Postgres + Redis).
+
+The `polymarket-causal.service` unit hosts the Round 10 nightly 2SLS
+estimator. It runs once per day (default 04:00 UTC) and exits cleanly
+between passes; the systemd unit keeps the process alive across the
+sleep window. The engine's APScheduler also registers a `causal_nightly`
+cron job at the same hour — operators can deploy EITHER the systemd
+unit OR rely on the engine cron, both write the same `causal_estimates`
+table.
 
 ## Pre-flight
 

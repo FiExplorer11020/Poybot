@@ -895,6 +895,76 @@ class Settings(BaseSettings):
             )
         return v
 
+    # ───── Round 10 (The Truth Test) — Causal inference layer ──────────
+    # See docs/ROUND_10_CAUSAL_INFERENCE.md for the full spec.
+    #
+    # CAUSAL_2SLS_BOOTSTRAP_N: number of resamples for the bootstrap CI
+    # on the 2SLS ATE coefficient. 1000 is the spec § 3.2 default;
+    # test fixtures drop to 100 for speed. Below 100 the percentile CI
+    # is essentially noise; above 5000 returns diminish (per
+    # Efron-Tibshirani's bootstrap CI saturation rule of thumb).
+    CAUSAL_2SLS_BOOTSTRAP_N: int = 1000
+    # CAUSAL_WU_HAUSMAN_THRESHOLD: p-value below which the gate
+    # considers the IV correction to be doing "real work". Per spec
+    # § 6 the acceptance criterion is p < 0.05 for >= 70% of pairs.
+    CAUSAL_WU_HAUSMAN_THRESHOLD: float = 0.05
+    # CAUSAL_FIRST_STAGE_F_MIN: weak-instrument floor on the first-stage
+    # F-statistic. Below this the IVEstimate.convergence is flagged
+    # 'weak_instruments' and the gate treats the estimate as missing.
+    # Staiger-Stock (1997) -> 10.
+    CAUSAL_FIRST_STAGE_F_MIN: float = 10.0
+    # CAUSAL_GATE_FOLLOW_PENALTY: multiplier applied to follow_confidence
+    # when the causal gate triggers (no causal evidence / IV correction
+    # disagrees with Hawkes). 0.5 = halve the confidence — the spec
+    # § 3.5 example value.
+    CAUSAL_GATE_FOLLOW_PENALTY: float = 0.5
+    # CAUSAL_DAEMON_BATCH_HOUR_UTC: hour-of-day to run the nightly
+    # 2SLS pass. 04:00 UTC sits AFTER R9's 03:30 batch so the daemon
+    # can read the freshly-written multivariate_hawkes_fits rows for
+    # the side-by-side comparison.
+    CAUSAL_DAEMON_BATCH_HOUR_UTC: int = 4
+    # CAUSAL_BIN_SECONDS: bin width for the (L, F, Z) intensity
+    # histograms in the daemon's matrix construction. 300 s = 5 min
+    # matches the FOLLOWER_WINDOW_S used elsewhere in the bot — keeps
+    # the IV time-grid commensurate with the Hawkes excitation scale.
+    CAUSAL_BIN_SECONDS: int = 300
+
+    @field_validator("CAUSAL_2SLS_BOOTSTRAP_N")
+    @classmethod
+    def _validate_causal_bootstrap(cls, v: int) -> int:
+        if not 10 <= v <= 10_000:
+            raise ValueError(
+                f"CAUSAL_2SLS_BOOTSTRAP_N must be in [10, 10000], got {v}."
+            )
+        return v
+
+    @field_validator("CAUSAL_WU_HAUSMAN_THRESHOLD")
+    @classmethod
+    def _validate_causal_wh_threshold(cls, v: float) -> float:
+        if not 0.0 < v < 1.0:
+            raise ValueError(
+                f"CAUSAL_WU_HAUSMAN_THRESHOLD must be in (0, 1), got {v}."
+            )
+        return v
+
+    @field_validator("CAUSAL_FIRST_STAGE_F_MIN")
+    @classmethod
+    def _validate_causal_f_min(cls, v: float) -> float:
+        if not 1.0 <= v <= 1000.0:
+            raise ValueError(
+                f"CAUSAL_FIRST_STAGE_F_MIN must be in [1, 1000], got {v}."
+            )
+        return v
+
+    @field_validator("CAUSAL_GATE_FOLLOW_PENALTY")
+    @classmethod
+    def _validate_causal_follow_penalty(cls, v: float) -> float:
+        if not 0.0 <= v <= 1.0:
+            raise ValueError(
+                f"CAUSAL_GATE_FOLLOW_PENALTY must be in [0, 1], got {v}."
+            )
+        return v
+
 
 settings = Settings()
 

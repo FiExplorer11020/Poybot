@@ -280,6 +280,23 @@ class ConfidenceEngine:
 
         thompson_follow, thompson_fade = self._sample_thompson(wallet)
 
+        # ── Round 10 (The Truth Test) — causal gate ──────────────────────
+        # Gated by runtime config flag `causal_gating_enabled`. When
+        # disabled (default), behavior is byte-identical to pre-R10.
+        # When enabled, consult causal_estimates for the (leader, pool)
+        # pair; if the IV-adjusted CI does NOT exclude zero positively,
+        # halve follow_confidence and BLOCK volume_anticipation entries.
+        causal_gate = await self._maybe_apply_causal_gate(wallet, trade_context)
+        if causal_gate is not None:
+            thompson_follow *= float(causal_gate.get("follow_multiplier", 1.0))
+            trade_context["causal_gate"] = {
+                "result": causal_gate.get("result"),
+                "ate": causal_gate.get("ate"),
+                "ci_low": causal_gate.get("ci_low"),
+                "ci_high": causal_gate.get("ci_high"),
+                "pool_class": causal_gate.get("pool_class"),
+            }
+
         # ── Round 8 (The Lens) — strategy-conditional weighting ────────
         # Gated by runtime config flag. When disabled (default) we leave
         # the Thompson outputs untouched, byte-identical to pre-R8.
@@ -481,6 +498,155 @@ class ConfidenceEngine:
             economic_model_version=decision.economic_model_version,
         )
         return decision
+
+    async def _maybe_apply_causal_gate(
+        self,
+        wallet: str,
+        trade_context: dict,
+    ) -> dict[str, Any] | None:
+        """Round 10 (The Truth Test) — return causal gate decision or None.
+
+        Returns None (no-op path) when EITHER:
+          1. The runtime flag ``causal_gating_enabled`` is False
+             (default — shadow phase).
+          2. No ``causal_estimates`` row exists for the (leader, pool)
+             pair, or the DB read fails.
+
+        When the flag is on and a causal estimate exists, returns a
+        dict with:
+
+            {
+              "result": "allowed" | "downgraded" | "blocked",
+              "follow_multiplier": 1.0 | CAUSAL_GATE_FOLLOW_PENALTY,
+              "ate": float,
+              "ci_low": float,
+              "ci_high": float,
+              "pool_class": str,
+            }
+
+        Decision rules (per spec § 3.5):
+          * CI strictly excludes 0 with ci_low > 0   -> "allowed" (full conf)
+          * CI strictly excludes 0 with ci_high < 0  -> "downgraded"
+          * CI brackets 0 (no clean evidence)        -> "downgraded"
+        """
+        try:
+            from src.control.runtime_config import get_runtime_config
+
+            cfg = get_runtime_config()
+            effective = await cfg.effective()
+            enabled = bool(effective.get("causal_gating_enabled", False))
+        except Exception as exc:  # pragma: no cover — defensive
+            logger.debug(f"Causal gate: runtime_config read failed: {exc}")
+            return None
+
+        if not enabled:
+            return None
+
+        # Resolve the pool_class for this leader. We prefer the R8
+        # strategy fingerprint already on `trade_context['wallet_strategy']`
+        # (set above when present); otherwise default to 'all_followers'
+        # to align with the R9 daemon's graceful-degradation pool name.
+        pool_class = (
+            (trade_context or {}).get("wallet_strategy")
+            or "all_followers"
+        )
+
+        try:
+            async with get_db() as conn:
+                row = await conn.fetchrow(
+                    """
+                    SELECT
+                        causal_ate,
+                        causal_ate_ci_low,
+                        causal_ate_ci_high,
+                        wu_hausman_p,
+                        first_stage_f,
+                        convergence
+                    FROM causal_estimates
+                    WHERE leader_wallet = $1
+                      AND pool_class = $2
+                    ORDER BY estimated_at DESC
+                    LIMIT 1
+                    """,
+                    wallet,
+                    pool_class,
+                )
+        except Exception as exc:
+            logger.debug(
+                f"Causal gate: causal_estimates read failed for {wallet}: {exc}"
+            )
+            self._inc_causal_gate_metric("allowed")
+            return None
+
+        if not row or row["causal_ate"] is None:
+            # No causal evidence available - use default behavior. This
+            # is the "missing causal_estimates row" path: per spec the
+            # gate should treat absence as "downgrade" to be on the
+            # safe side (we don't have evidence the leader is causally
+            # influential). We mirror that here.
+            self._inc_causal_gate_metric("downgraded")
+            return {
+                "result": "downgraded",
+                "follow_multiplier": float(
+                    getattr(settings, "CAUSAL_GATE_FOLLOW_PENALTY", 0.5)
+                ),
+                "ate": None,
+                "ci_low": None,
+                "ci_high": None,
+                "pool_class": pool_class,
+            }
+
+        ate = float(row["causal_ate"])
+        ci_low = float(row["causal_ate_ci_low"]) if row["causal_ate_ci_low"] is not None else float("nan")
+        ci_high = float(row["causal_ate_ci_high"]) if row["causal_ate_ci_high"] is not None else float("nan")
+        convergence = str(row["convergence"] or "")
+
+        # Acceptance rule: CI strictly excludes 0 with positive sign.
+        # If ci_low or ci_high is NaN (rare path) we treat as "no
+        # evidence" -> downgrade. Weak-instrument fits are also
+        # downgraded — the spec § 6 risk row "Instrument invalidity"
+        # mitigation is exactly this.
+        has_positive_evidence = (
+            convergence == "converged"
+            and ci_low == ci_low  # NaN check
+            and ci_high == ci_high
+            and ci_low > 0
+        )
+
+        if has_positive_evidence:
+            self._inc_causal_gate_metric("allowed")
+            return {
+                "result": "allowed",
+                "follow_multiplier": 1.0,
+                "ate": ate,
+                "ci_low": ci_low,
+                "ci_high": ci_high,
+                "pool_class": pool_class,
+            }
+
+        self._inc_causal_gate_metric("downgraded")
+        return {
+            "result": "downgraded",
+            "follow_multiplier": float(
+                getattr(settings, "CAUSAL_GATE_FOLLOW_PENALTY", 0.5)
+            ),
+            "ate": ate,
+            "ci_low": ci_low,
+            "ci_high": ci_high,
+            "pool_class": pool_class,
+        }
+
+    @staticmethod
+    def _inc_causal_gate_metric(result: str) -> None:
+        """Best-effort Prometheus increment for the R10 gate."""
+        try:
+            from src.monitoring.metrics import (
+                confidence_engine_causal_gates_total,
+            )
+
+            confidence_engine_causal_gates_total.labels(result=result).inc()
+        except Exception:
+            pass
 
     async def _maybe_get_strategy_weights(
         self,
