@@ -14,9 +14,16 @@ topology (see `docs/ROUND_6_THE_SPINE.md` § 3.5).
 | `polymarket-strategy-classifier.service`   | `src.strategy_classifier` *(Round 8)* | 400 MB  |
 | `polymarket-follower-volume.service`       | `src.follower_volume` *(Round 9)* | 400 MB        |
 | `polymarket-causal.service`                | `src.causal` *(Round 10)*       | 500 MB        |
+| `polymarket-book-l3.service`               | `src.observer.clob_book_main` *(Round 11)* | 500 MB |
+| `polymarket-microstructure.service`        | `src.microstructure` *(Round 11)* | 400 MB        |
 | `polymarket-api.service`                   | `src.api.main` (uvicorn)        | 300 MB        |
 
-Total budget: ~3.2 GB (CX23 has 4 GB; leaves headroom for Postgres + Redis).
+Total budget: ~4.1 GB (CX23 has 4 GB; Round 11 adds two daemons —
+operators may need to provision a CX31 or move ingest to a dedicated
+box. The L3 firehose + microstructure deriver pair is the dominant
+cost; if either daemon is paused, the bot keeps trading at R10 level).
+The R11 daemons MUST run alongside a 500 GB Hetzner volume mounted at
+the Postgres data directory — see R11 § 2.3 for the storage rationale.
 
 The `polymarket-causal.service` unit hosts the Round 10 nightly 2SLS
 estimator. It runs once per day (default 04:00 UTC) and exits cleanly
@@ -66,6 +73,8 @@ sudo systemctl enable --now polymarket-onchain.service
 sudo systemctl enable --now polymarket-crawler.service
 sudo systemctl enable --now polymarket-falcon-refresher.service
 sudo systemctl enable --now polymarket-mempool.service
+sudo systemctl enable --now polymarket-book-l3.service
+sudo systemctl enable --now polymarket-microstructure.service
 sudo systemctl enable --now polymarket-api.service
 
 # 4. Verify everything is active (running).

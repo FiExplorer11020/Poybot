@@ -978,6 +978,132 @@ except Exception:  # pragma: no cover
     pass
 
 
+# === Round 11 (The Microscope) — CLOB Book L3 + Microstructure ===
+# Owned by src.observer.clob_book_observer (raw L3 capture) and
+# src.microstructure.* (deriver pipeline). Same defensive-declaration
+# pattern as R8/R9/R10 — duplicate registration on pytest hot-reload is
+# silently swallowed. See docs/ROUND_11_CLOB_BOOK_MICROSTRUCTURE.md § 5
+# for the canonical 12-metric list.
+try:
+    book_events_received_total = Counter(
+        "polybot_book_events_received_total",
+        "L3 order-events received from the Polymarket WebSocket, "
+        "partitioned by event_type.",
+        ["event_type"],  # placed|modified|cancelled|partial_fill|filled
+    )
+except Exception:  # pragma: no cover
+    pass
+
+try:
+    book_events_dropped_total = Counter(
+        "polybot_book_events_dropped_total",
+        "Order events the observer dropped before writing to the DB or "
+        "the Redis Stream. queue_full = backpressure drop (oldest event "
+        "evicted); invalid = malformed payload; attribution_missing = "
+        "wallet expected but absent.",
+        ["reason"],  # queue_full|invalid|attribution_missing
+    )
+except Exception:  # pragma: no cover
+    pass
+
+try:
+    book_ws_latency_seconds = Histogram(
+        "polybot_book_ws_latency_seconds",
+        "Latency from WS message receipt to our publish on book:events:stream.",
+        # Tight low-end buckets — the deriver assumes sub-second
+        # freshness. Tail rare > 5 s.
+        buckets=(0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0),
+    )
+except Exception:  # pragma: no cover
+    pass
+
+try:
+    book_queue_depth = Gauge(
+        "polybot_book_queue_depth",
+        "Current depth of the L3 observer's bounded asyncio.Queue. "
+        "Approaching CLOB_BOOK_QUEUE_MAXSIZE indicates the DB writer "
+        "is falling behind and oldest-event drops are imminent.",
+    )
+except Exception:  # pragma: no cover
+    pass
+
+try:
+    book_partitions_open = Gauge(
+        "polybot_book_partitions_open",
+        "Number of hourly partitions currently present for "
+        "clob_book_events. Steady state ≈ 720 (30d × 24h) plus a small "
+        "forward window. Surfaces partition-maintainer drift.",
+    )
+except Exception:  # pragma: no cover
+    pass
+
+try:
+    book_partition_rows_total = Gauge(
+        "polybot_book_partition_rows_total",
+        "Row count per clob_book_events hourly partition. Sampled by "
+        "the partition maintainer.",
+        ["partition"],  # clob_book_events_YYYYMMDD_HH
+    )
+except Exception:  # pragma: no cover
+    pass
+
+try:
+    microstructure_features_emitted_total = Counter(
+        "polybot_microstructure_features_emitted_total",
+        "Rows written to microstructure_features by the per-minute "
+        "rollup. One row = one (market_id, token_id, bucket_ts) tuple.",
+    )
+except Exception:  # pragma: no cover
+    pass
+
+try:
+    iceberg_detections_total = Counter(
+        "polybot_iceberg_detections_total",
+        "Order-flow patterns flagged as iceberg by the rolling "
+        "(wallet, price) detector — see § 3.2.A.",
+    )
+except Exception:  # pragma: no cover
+    pass
+
+try:
+    spoof_detections_total = Counter(
+        "polybot_spoof_detections_total",
+        "Order-flow patterns flagged as spoof — large order, zero fill, "
+        "cancel within MICROSTRUCTURE_SPOOF_CANCEL_LIMIT_S — see § 3.2.B.",
+    )
+except Exception:  # pragma: no cover
+    pass
+
+try:
+    ofi_calculations_per_minute = Gauge(
+        "polybot_ofi_calculations_per_minute",
+        "Rolling rate of order-flow-imbalance computations fired by the "
+        "deriver in the trailing minute. Surfaces detector liveness.",
+    )
+except Exception:  # pragma: no cover
+    pass
+
+try:
+    wallet_signatures_updated_total = Counter(
+        "polybot_wallet_signatures_updated_total",
+        "Rows upserted into wallet_microstructure_signature by the "
+        "nightly batch. One row = one tier-0/1 wallet's 30d signature.",
+    )
+except Exception:  # pragma: no cover
+    pass
+
+try:
+    wallet_signatures_cardinality = Gauge(
+        "polybot_wallet_signatures_cardinality",
+        "Distinct wallets with at least one row in "
+        "wallet_microstructure_signature. Cold-start gate: until this "
+        "approaches the tier-0/1 wallet count, the R8 classifier still "
+        "sees mostly None values in the per-wallet microstructure slots.",
+    )
+except Exception:  # pragma: no cover
+    pass
+
+
 # ---------------------------------------------------------------------------
 # Build info — best-effort. Surfaces version + git short-SHA on /metrics so a
 # scrape can correlate metrics with a deploy. Failure here must NEVER break

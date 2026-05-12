@@ -1,0 +1,30 @@
+[Unit]
+Description=Polymarket Bot — CLOB Book L3 firehose subscriber (Round 11, The Microscope)
+Documentation=https://github.com/your-org/polymarket-bot/blob/main/docs/ROUND_11_CLOB_BOOK_MICROSTRUCTURE.md
+After=network-online.target postgresql.service redis-server.service polymarket-onchain.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=polymarket
+Group=polymarket
+WorkingDirectory=/opt/polymarket-bot/
+EnvironmentFile=/opt/polymarket-bot/.env
+ExecStart=/opt/polymarket-bot/.venv/bin/python -m src.observer.clob_book_main
+Restart=always
+RestartSec=5s
+
+# Per Round 11 § 2.2 memory budget — 500 MB ceiling.
+# Breakdown: WS state (50 MB) + per-market book replicas (100 MB) +
+# iceberg/spoof rolling buffers (100 MB) + queue + output buffers
+# (50 MB) + headroom (200 MB).
+MemoryMax=500M
+
+StandardOutput=journal
+StandardError=journal
+
+# Logging tag for journalctl filtering.
+SyslogIdentifier=polymarket-book-l3
+
+[Install]
+WantedBy=multi-user.target

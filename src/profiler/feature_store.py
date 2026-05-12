@@ -427,3 +427,155 @@ async def get_orderbook_features_asof(
         pass
 
     return result
+
+
+# --------------------------------------------------------------------------- #
+# Round 11 (The Microscope) — microstructure features                         #
+# --------------------------------------------------------------------------- #
+# Two read surfaces feed the R8 strategy classifier:
+#
+# * ``get_microstructure_features_asof``        — per-token rollup row from
+#                                                 ``microstructure_features``
+#                                                 (migration 033). Returns
+#                                                 None if no row is within
+#                                                 the lookback window.
+#
+# * ``get_wallet_microstructure_signature_asof`` — per-wallet rolling
+#                                                  signature from
+#                                                  ``wallet_microstructure_signature``
+#                                                  (migration 034). Returns
+#                                                  None if no row at-or-before
+#                                                  asof_ts within
+#                                                  ``lookback_days``.
+#
+# Both read at most one row per call. The R8 ``LeaderFeatureExtractor`` calls
+# them per (token, time) and per (wallet, time) — the calls are batched at
+# the extractor level, not here, because the batch shape is N tokens at the
+# same asof_ts, which doesn't benefit from a LATERAL JOIN over UNNEST the
+# way the market-features path does.
+
+
+async def get_microstructure_features_asof(
+    conn: Any,
+    market_id: str,
+    token_id: str,
+    asof_ts: datetime,
+    lookback_s: int = 300,
+) -> dict | None:
+    """Return the most-recent ``microstructure_features`` row for
+    ``(market_id, token_id)`` with
+    ``bucket_ts <= asof_ts AND bucket_ts >= asof_ts - lookback_s``.
+
+    Returns ``None`` when no row qualifies — caller (R8
+    LeaderFeatureExtractor) treats None as "no microstructure signal"
+    and lets the feature slot stay np.nan. The R8 schema is preserved
+    exactly; values populated when data exists, nan when not.
+
+    The lookback default (300 s) is generous relative to the 60 s
+    rollup cadence so a single skipped bucket doesn't cause a miss.
+    """
+    floor = asof_ts - timedelta(seconds=max(1, int(lookback_s)))
+    try:
+        row = await conn.fetchrow(
+            """
+            SELECT bucket_ts,
+                   iceberg_orders_count, iceberg_total_size,
+                   spoof_orders_count, spoof_total_size,
+                   ofi_mean, ofi_max, ofi_min, ofi_std
+            FROM microstructure_features
+            WHERE market_id = $1
+              AND token_id = $2
+              AND bucket_ts <= $3
+              AND bucket_ts >= $4
+            ORDER BY bucket_ts DESC
+            LIMIT 1
+            """,
+            market_id,
+            token_id,
+            asof_ts,
+            floor,
+        )
+    except Exception as exc:
+        logger.debug(
+            f"feature_store.get_microstructure_features_asof query failed "
+            f"for market={market_id} token={token_id} "
+            f"asof={asof_ts.isoformat()}: {exc}"
+        )
+        return None
+    if row is None:
+        return None
+    result = _row_to_dict(row)
+    bucket_ts = result.get("bucket_ts")
+    try:
+        if bucket_ts is not None:
+            result["feature_age_s"] = max(
+                0.0, (asof_ts - bucket_ts).total_seconds()
+            )
+    except Exception:
+        result["feature_age_s"] = None
+    return result
+
+
+async def get_wallet_microstructure_signature_asof(
+    conn: Any,
+    wallet: str,
+    asof_ts: datetime,
+    lookback_days: int = 30,
+) -> dict | None:
+    """Return the most-recent ``wallet_microstructure_signature`` row
+    for ``wallet`` with
+    ``rollup_at <= asof_ts AND rollup_at >= asof_ts - lookback_days``.
+
+    Returns ``None`` if no signature exists or if the latest row's
+    n_orders_30d is below the cold-start gate (the row exists but the
+    wallet is too thin to inform R8). R8 caller treats None as
+    "structural slot stays np.nan".
+
+    The ``lookback_days`` cap matches the signature's own rolling
+    window — a row older than that is referencing a window that
+    doesn't include any of the asof_ts data.
+    """
+    if asof_ts.tzinfo is None:
+        asof_ts = asof_ts.replace(tzinfo=timezone.utc)
+    floor = asof_ts - timedelta(days=max(1, int(lookback_days)))
+    try:
+        row = await conn.fetchrow(
+            """
+            SELECT rollup_at,
+                   cancel_to_fill_ratio_30d,
+                   iceberg_score_30d,
+                   spoof_score_30d,
+                   place_to_fill_seconds_p50,
+                   place_to_fill_seconds_p99,
+                   n_orders_30d,
+                   n_fills_30d
+            FROM wallet_microstructure_signature
+            WHERE wallet_address = $1
+              AND rollup_at <= $2
+              AND rollup_at >= $3
+            ORDER BY rollup_at DESC
+            LIMIT 1
+            """,
+            wallet,
+            asof_ts,
+            floor,
+        )
+    except Exception as exc:
+        logger.debug(
+            f"feature_store.get_wallet_microstructure_signature_asof "
+            f"query failed for wallet={wallet[:10]}… "
+            f"asof={asof_ts.isoformat()}: {exc}"
+        )
+        return None
+    if row is None:
+        return None
+    result = _row_to_dict(row)
+    rollup_at = result.get("rollup_at")
+    try:
+        if rollup_at is not None:
+            result["signature_age_s"] = max(
+                0.0, (asof_ts - rollup_at).total_seconds()
+            )
+    except Exception:
+        result["signature_age_s"] = None
+    return result

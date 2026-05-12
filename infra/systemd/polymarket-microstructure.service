@@ -1,0 +1,29 @@
+[Unit]
+Description=Polymarket Bot — Microstructure feature deriver (Round 11)
+Documentation=https://github.com/your-org/polymarket-bot/blob/main/docs/ROUND_11_CLOB_BOOK_MICROSTRUCTURE.md
+After=network-online.target postgresql.service redis-server.service polymarket-book-l3.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=polymarket
+Group=polymarket
+WorkingDirectory=/opt/polymarket-bot/
+EnvironmentFile=/opt/polymarket-bot/.env
+ExecStart=/opt/polymarket-bot/.venv/bin/python -m src.microstructure
+Restart=always
+RestartSec=5s
+
+# Per Round 11 § 2.2 — the deriver runs at lower memory than the book
+# observer because it doesn't replicate the books. 400 MB ceiling
+# covers the four detectors' rolling buffers + per-wallet state +
+# Redis Stream consumer.
+MemoryMax=400M
+
+StandardOutput=journal
+StandardError=journal
+
+SyslogIdentifier=polymarket-microstructure
+
+[Install]
+WantedBy=multi-user.target

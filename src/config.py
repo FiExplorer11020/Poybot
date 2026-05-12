@@ -965,6 +965,124 @@ class Settings(BaseSettings):
             )
         return v
 
+    # ───── Round 11 (The Microscope) — CLOB Book L3 + Microstructure ──
+    # See docs/ROUND_11_CLOB_BOOK_MICROSTRUCTURE.md for the spec.
+    #
+    # The L3 book observer subscribes to Polymarket's full order-event
+    # firehose for the top-N markets. R11 § 2.3 sizes the system at
+    # ~5,000 events/sec peak across the top-100 — the daemon's whole
+    # design is sized to that load.
+
+    # CLOB_BOOK_TOP_MARKETS: how many markets the L3 subscriber tracks.
+    # 100 per § 2.3 — captures the volume that matters; below that we'd
+    # miss mid-tier markets where iceberg/spoof patterns also appear.
+    CLOB_BOOK_TOP_MARKETS: int = 100
+    # CLOB_BOOK_QUEUE_MAXSIZE: bounded asyncio.Queue between the WS
+    # reader and the DB writer. 50,000 events × ~150 bytes ≈ 7.5 MB
+    # of in-flight memory — comfortably under the 500 MB envelope.
+    # Under overload the OLDEST event is dropped (spec § 3.1) so the
+    # WS reader never blocks.
+    CLOB_BOOK_QUEUE_MAXSIZE: int = 50_000
+    # CLOB_BOOK_PARTITION_GRANULARITY: 'hour' — see migration 032 § 2.3.
+    # Daily partitions would put each one at ~13 GB and the DROP pass
+    # would be load-bearing on busy days.
+    CLOB_BOOK_PARTITION_GRANULARITY: str = "hour"
+    # CLOB_BOOK_RETENTION_DAYS: how long the hot tier keeps L3 events.
+    # 30 days × 13 GB/day = ~390 GB — fits on a Hetzner 500 GB volume.
+    # Cold-tier Parquet export (R6 § 3.6) carries the long tail.
+    CLOB_BOOK_RETENTION_DAYS: int = 30
+    # CLOB_BOOK_DB_BATCH_SIZE: rows flushed per executemany. Mirrors the
+    # R3 trade_observer pattern; tuned to keep DB latency below the WS
+    # consumer rate.
+    CLOB_BOOK_DB_BATCH_SIZE: int = 500
+    # CLOB_BOOK_DB_BATCH_INTERVAL_S: how long the writer waits to fill a
+    # batch before flushing what it has. Trades freshness for write
+    # efficiency; 0.5 s matches the per-minute rollup cadence so the
+    # rollup never sees a write more than ~0.5 s stale.
+    CLOB_BOOK_DB_BATCH_INTERVAL_S: float = 0.5
+    # CLOB_BOOK_STREAM_NAME: Redis Stream the observer publishes to.
+    # Consumed by src.microstructure.daemon for real-time derivation.
+    CLOB_BOOK_STREAM_NAME: str = "book:events:stream"
+    # CLOB_BOOK_STREAM_MAXLEN: bound the stream length so a consumer
+    # outage doesn't OOM Redis. ~5 minutes of peak events: 5000/s × 300s
+    # = 1.5M entries. We use approximate trim (`~`) for speed.
+    CLOB_BOOK_STREAM_MAXLEN: int = 1_500_000
+
+    # Microstructure deriver — see § 3.2 of the spec.
+    MICROSTRUCTURE_ROLLUP_BUCKET_S: int = 60
+    # Iceberg detector window — § 3.2.A. 60 s rolling per (wallet, price).
+    MICROSTRUCTURE_ICEBERG_WINDOW_S: int = 60
+    # Minimum number of same-(wallet, price) placements in the window to
+    # flag an iceberg. 3 = "two refills after the first". Below 3 the
+    # false-positive rate from natural latency-induced retries dominates.
+    MICROSTRUCTURE_ICEBERG_MIN_REFILLS: int = 3
+    # Spoof detector — § 3.2.B. An order placed-then-cancelled within
+    # this window with zero fill is a spoof candidate. 5 s matches the
+    # spec.
+    MICROSTRUCTURE_SPOOF_CANCEL_LIMIT_S: int = 5
+    # Spoof size percentile gate — § 3.2.B says "large order (>= 95th
+    # pct)". The deriver tracks a rolling size distribution per market+
+    # token and applies this percentile gate.
+    MICROSTRUCTURE_SPOOF_SIZE_PERCENTILE: float = 0.95
+    # OFI rolling window — § 3.2.C.
+    MICROSTRUCTURE_OFI_WINDOW_S: int = 5
+    # Cancel-to-fill ratio window — § 3.2.E. The on-line tracker uses 30
+    # minutes (high-cardinality enough that anything longer would blow
+    # memory; shorter would miss the market-maker pattern).
+    MICROSTRUCTURE_CANCEL_TO_FILL_WINDOW_S: int = 1800
+    # Wallet signature batch lookback — § 3.2 nightly rollup. 30 days
+    # matches the cold-tier retention so we never read past the boundary.
+    MICROSTRUCTURE_SIGNATURE_LOOKBACK_DAYS: int = 30
+    # Minimum n_orders_30d for a wallet's signature to be considered
+    # "trustworthy" by readers (e.g. R8 features). Below this the
+    # readers fall back to None — too thin to inform the classifier.
+    MICROSTRUCTURE_SIGNATURE_MIN_ORDERS: int = 50
+
+    @field_validator("CLOB_BOOK_QUEUE_MAXSIZE")
+    @classmethod
+    def _validate_clob_book_queue_maxsize(cls, v: int) -> int:
+        # Below 1k we lose all backpressure value (every burst drops);
+        # above 1M we'd blow the daemon's 500 MB envelope on a backlog.
+        if not 1_000 <= v <= 1_000_000:
+            raise ValueError(
+                f"CLOB_BOOK_QUEUE_MAXSIZE must be in [1000, 1_000_000], got {v}."
+            )
+        return v
+
+    @field_validator("CLOB_BOOK_RETENTION_DAYS")
+    @classmethod
+    def _validate_clob_book_retention_days(cls, v: int) -> int:
+        # 1 day floor — anything less and the rollup batch can't read
+        # its own input. 365 day ceiling — at 13 GB/day past 30 days
+        # this stops fitting on any sensible volume.
+        if not 1 <= v <= 365:
+            raise ValueError(
+                f"CLOB_BOOK_RETENTION_DAYS must be in [1, 365], got {v}."
+            )
+        return v
+
+    @field_validator("MICROSTRUCTURE_ROLLUP_BUCKET_S")
+    @classmethod
+    def _validate_microstructure_bucket(cls, v: int) -> int:
+        # Per-second buckets would explode microstructure_features
+        # cardinality (~84M rows/day across the top-100). Per-hour
+        # would lose all granularity. 1 min is the architect's pick;
+        # 5 s ≤ v ≤ 300 s is the operator-tunable window.
+        if not 5 <= v <= 300:
+            raise ValueError(
+                f"MICROSTRUCTURE_ROLLUP_BUCKET_S must be in [5, 300], got {v}."
+            )
+        return v
+
+    @field_validator("MICROSTRUCTURE_SPOOF_SIZE_PERCENTILE")
+    @classmethod
+    def _validate_microstructure_spoof_percentile(cls, v: float) -> float:
+        if not 0.5 <= v <= 0.999:
+            raise ValueError(
+                f"MICROSTRUCTURE_SPOOF_SIZE_PERCENTILE must be in [0.5, 0.999], got {v}."
+            )
+        return v
+
 
 settings = Settings()
 

@@ -28,7 +28,11 @@ import numpy as np
 from loguru import logger
 
 from src.database.connection import get_db
-from src.profiler.feature_store import get_orderbook_features_asof
+from src.profiler.feature_store import (
+    get_microstructure_features_asof,
+    get_orderbook_features_asof,
+    get_wallet_microstructure_signature_asof,
+)
 
 # --------------------------------------------------------------------------- #
 # Feature schema. Order is LOAD-BEARING — the LightGBM model is trained       #
@@ -194,6 +198,12 @@ class LeaderFeatureExtractor:
                 # E. entry microstructure — best-effort, often nan
                 await self._populate_entry_microstructure(
                     conn, values, trades, missing
+                )
+                # E/F per-wallet microstructure signature (R11). Populates
+                # e_cancel_to_fill_ratio_30d (slot 25) when the signature
+                # exists; structural slot otherwise.
+                await self._populate_wallet_microstructure(
+                    conn, values, wallet_address, asof_ts, missing
                 )
                 # F. exit microstructure
                 self._populate_exit_microstructure(values, positions, missing)
@@ -474,16 +484,30 @@ class LeaderFeatureExtractor:
         trades: list[dict],
         missing: list[str],
     ) -> None:
-        # Most slots here need R11. We DO have orderbook_features_minute
-        # from R2, so e_depth_imbalance / e_spread_bps / e_microprice
-        # MIGHT be available. Median over up to 100 entries to keep DB
-        # cost bounded.
+        # Slots populated here:
+        #   19 e_microprice_deviation_at_entry_median  — orderbook_features
+        #   20 e_spread_bps_at_entry_median            — orderbook_features
+        #   21 e_depth_imbalance_at_entry_median       — orderbook_features
+        #   24 e_book_age_ms_at_entry_median           — orderbook_features
+        #                                                 (n_snapshots-derived)
+        # The remaining E slots (22 momentum_5m, 23 momentum_60m, 26
+        # takes_vs_makes_ratio) need data sources that R11 doesn't
+        # ship. e_cancel_to_fill_ratio_30d (slot 25) comes from the
+        # per-wallet signature populated by
+        # :meth:`_populate_wallet_microstructure`. Median over up to
+        # 100 entries to keep DB cost bounded.
         sampled = trades[: min(100, len(trades))]
         depth_vals: list[float] = []
         spread_vals: list[float] = []
         microprice_dev_vals: list[float] = []
+        book_age_vals: list[float] = []
+        # Per-token microstructure features (R11). The rollup only
+        # contains rows for tokens with detected events in the bucket;
+        # we tolerate misses silently.
+        ofi_vals: list[float] = []
         for t in sampled:
             token_id = t.get("token_id")
+            market_id = t.get("market_id")
             ts = t.get("time")
             if not token_id or ts is None:
                 continue
@@ -493,17 +517,39 @@ class LeaderFeatureExtractor:
                 )
             except Exception:
                 ob = None
-            if not ob:
-                continue
-            di = ob.get("depth_imbalance_mean")
-            sp = ob.get("spread_bps_mean")
-            md = ob.get("microprice_deviation_mean")
-            if di is not None:
-                depth_vals.append(float(di))
-            if sp is not None:
-                spread_vals.append(float(sp))
-            if md is not None:
-                microprice_dev_vals.append(float(md))
+            if ob:
+                di = ob.get("depth_imbalance_mean")
+                sp = ob.get("spread_bps_mean")
+                md = ob.get("microprice_deviation_mean")
+                age = ob.get("feature_age_s")
+                if di is not None:
+                    depth_vals.append(float(di))
+                if sp is not None:
+                    spread_vals.append(float(sp))
+                if md is not None:
+                    microprice_dev_vals.append(float(md))
+                if age is not None:
+                    # feature_age_s is seconds; convert to ms for the
+                    # e_book_age_ms_at_entry_median slot.
+                    book_age_vals.append(float(age) * 1000.0)
+            # R11 microstructure read — feeds slot 24 (book age proxy
+            # via the rollup's age) and is captured here for future
+            # OFI-driven feature additions without changing FEATURE_NAMES.
+            if market_id:
+                try:
+                    micro = await get_microstructure_features_asof(
+                        conn,
+                        market_id,
+                        token_id,
+                        ts,
+                        lookback_s=self._orderbook_lookback_s,
+                    )
+                except Exception:
+                    micro = None
+                if micro is not None:
+                    ofi_mean = micro.get("ofi_mean")
+                    if ofi_mean is not None:
+                        ofi_vals.append(float(ofi_mean))
 
         # Slot order: micro, spread, depth, mom5m, mom60m, book_age, c2f, takes_v_makes
         if microprice_dev_vals:
@@ -518,15 +564,85 @@ class LeaderFeatureExtractor:
             values[21] = float(np.median(depth_vals))
         else:
             missing.append("e_depth_imbalance_at_entry_median")
-        # 22-26: pure R11 features, stub for now.
+        # 22-23: momentum features need candlestick data, not R11 scope.
         for name in (
             "e_price_momentum_5m_at_entry",
             "e_price_momentum_60m_at_entry",
-            "e_book_age_ms_at_entry_median",
-            "e_cancel_to_fill_ratio_30d",
-            "e_takes_vs_makes_ratio",
         ):
             missing.append(name)
+        # 24 e_book_age_ms_at_entry_median: R11 surfaces an order-event
+        # age via the microstructure rollup; we already capture the
+        # orderbook-feature age above. The slot was np.nan pre-R11 and
+        # now carries a real number when ANY orderbook or microstructure
+        # row is found.
+        if book_age_vals:
+            values[24] = float(np.median(book_age_vals))
+        else:
+            missing.append("e_book_age_ms_at_entry_median")
+        # 25 (e_cancel_to_fill_ratio_30d) and 26 (e_takes_vs_makes_ratio)
+        # are wallet-level — populated by _populate_wallet_microstructure.
+        # We DON'T append them here; that helper records the structural
+        # absence when no signature exists.
+
+    # ------------------------------------------------------------------ #
+    # Category E (wallet portion) — populated from R11 wallet signature  #
+    # ------------------------------------------------------------------ #
+
+    async def _populate_wallet_microstructure(
+        self,
+        conn: Any,
+        values: np.ndarray,
+        wallet_address: str,
+        asof_ts: datetime,
+        missing: list[str],
+    ) -> None:
+        """Populate the wallet-level microstructure slots (25 + 26) from
+        ``wallet_microstructure_signature`` (R11 migration 034).
+
+        Slots:
+          * 25 e_cancel_to_fill_ratio_30d — direct value from the
+            signature. Spec § 3.2.E.
+          * 26 e_takes_vs_makes_ratio — approximated as
+            ``n_fills_30d / max(1, n_orders_30d)`` (a maker leaves orders
+            resting; a taker hits the book → mostly fills). Falls back
+            to nan when the signature is missing.
+
+        The slot shape is preserved exactly — values change from nan to
+        real numbers when data exists, nan otherwise. This is the
+        headline R11 acceptance contract for the R8 classifier.
+        """
+        try:
+            sig = await get_wallet_microstructure_signature_asof(
+                conn, wallet_address, asof_ts, lookback_days=self._lookback_days
+            )
+        except Exception as exc:
+            logger.debug(
+                f"LeaderFeatureExtractor: wallet signature lookup failed "
+                f"for wallet={wallet_address[:10]}…: {exc}"
+            )
+            sig = None
+        if not sig:
+            missing.append("e_cancel_to_fill_ratio_30d")
+            missing.append("e_takes_vs_makes_ratio")
+            return
+        c2f = sig.get("cancel_to_fill_ratio_30d")
+        if c2f is not None:
+            try:
+                values[25] = float(c2f)
+            except (TypeError, ValueError):
+                missing.append("e_cancel_to_fill_ratio_30d")
+        else:
+            missing.append("e_cancel_to_fill_ratio_30d")
+        # takes/makes proxy: high fills/orders ratio = taker; low = maker.
+        n_orders = sig.get("n_orders_30d")
+        n_fills = sig.get("n_fills_30d")
+        try:
+            if n_orders and int(n_orders) > 0 and n_fills is not None:
+                values[26] = float(n_fills) / float(n_orders)
+            else:
+                missing.append("e_takes_vs_makes_ratio")
+        except (TypeError, ValueError):
+            missing.append("e_takes_vs_makes_ratio")
 
     # ------------------------------------------------------------------ #
     # Category F — EXIT MICROSTRUCTURE (4)                               #

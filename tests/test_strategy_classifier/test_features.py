@@ -167,6 +167,12 @@ class TestExtractShape:
              patch(
                  "src.strategy_classifier.features.get_orderbook_features_asof",
                  side_effect=_no_orderbook,
+             ), patch(
+                 "src.strategy_classifier.features.get_microstructure_features_asof",
+                 side_effect=_no_orderbook,
+             ), patch(
+                 "src.strategy_classifier.features.get_wallet_microstructure_signature_asof",
+                 side_effect=_no_orderbook,
              ):
             ext = LeaderFeatureExtractor()
             fv = await ext.extract("0xabc", now)
@@ -188,6 +194,124 @@ class TestExtractShape:
         ):
             i = FEATURE_NAMES.index(name)
             assert math.isnan(fv.values[i])
+
+    @pytest.mark.asyncio
+    async def test_microstructure_wallet_signature_populates_slots(self, now):
+        """When the R11 wallet signature is populated, slots 25
+        (e_cancel_to_fill_ratio_30d) and 26 (e_takes_vs_makes_ratio)
+        carry real numbers — not np.nan. This is the headline R11
+        acceptance criterion (3pp R8 accuracy gate depends on these
+        new dimensions). Slot SHAPE is preserved; only values change.
+        """
+        trades = [
+            {
+                "time": now - timedelta(days=1),
+                "market_id": "m1",
+                "token_id": "t1",
+                "side": "buy",
+                "price": 0.5,
+                "size_usdc": 100.0,
+                "category": "crypto",
+            }
+        ]
+        ctx, _ = _mock_conn_with_trades_positions(trades, [], [])
+
+        async def _orderbook(*args, **kwargs):
+            return None
+
+        async def _microstructure(*args, **kwargs):
+            return None
+
+        async def _wallet_sig(*args, **kwargs):
+            return {
+                "rollup_at": now - timedelta(hours=1),
+                "cancel_to_fill_ratio_30d": 2.5,
+                "iceberg_score_30d": 0.1,
+                "spoof_score_30d": 0.05,
+                "place_to_fill_seconds_p50": 30.0,
+                "place_to_fill_seconds_p99": 600.0,
+                "n_orders_30d": 200,
+                "n_fills_30d": 80,
+            }
+
+        with patch("src.strategy_classifier.features.get_db", side_effect=ctx), \
+             patch(
+                 "src.strategy_classifier.features.get_orderbook_features_asof",
+                 side_effect=_orderbook,
+             ), patch(
+                 "src.strategy_classifier.features.get_microstructure_features_asof",
+                 side_effect=_microstructure,
+             ), patch(
+                 "src.strategy_classifier.features.get_wallet_microstructure_signature_asof",
+                 side_effect=_wallet_sig,
+             ):
+            ext = LeaderFeatureExtractor()
+            fv = await ext.extract("0xabc", now)
+        # Slot 25 (e_cancel_to_fill_ratio_30d) → real number, not nan.
+        i_c2f = FEATURE_NAMES.index("e_cancel_to_fill_ratio_30d")
+        assert not math.isnan(fv.values[i_c2f])
+        assert fv.values[i_c2f] == pytest.approx(2.5)
+        assert "e_cancel_to_fill_ratio_30d" not in fv.missing
+        # Slot 26 (e_takes_vs_makes_ratio) → 80/200 = 0.4.
+        i_tvm = FEATURE_NAMES.index("e_takes_vs_makes_ratio")
+        assert not math.isnan(fv.values[i_tvm])
+        assert fv.values[i_tvm] == pytest.approx(0.4)
+        # Vector shape is preserved.
+        assert fv.values.shape == (FEATURE_COUNT,)
+
+    @pytest.mark.asyncio
+    async def test_microstructure_per_token_rollup_populates_book_age(self, now):
+        """When the R11 microstructure rollup returns features-via-
+        orderbook (depth/spread/microprice), slot 24
+        (e_book_age_ms_at_entry_median) is populated from the rollup
+        age — values change from nan to a real number. Slot shape
+        preserved."""
+        trades = [
+            {
+                "time": now - timedelta(days=1),
+                "market_id": "m1",
+                "token_id": "t1",
+                "side": "buy",
+                "price": 0.5,
+                "size_usdc": 100.0,
+                "category": "crypto",
+            }
+        ]
+        ctx, _ = _mock_conn_with_trades_positions(trades, [], [])
+
+        async def _orderbook(*args, **kwargs):
+            return {
+                "bucket_ts": now - timedelta(days=1),
+                "depth_imbalance_mean": 0.1,
+                "spread_bps_mean": 5.0,
+                "microprice_deviation_mean": 0.002,
+                "feature_age_s": 12.0,
+            }
+
+        async def _microstructure(*args, **kwargs):
+            return None
+
+        async def _wallet_sig(*args, **kwargs):
+            return None
+
+        with patch("src.strategy_classifier.features.get_db", side_effect=ctx), \
+             patch(
+                 "src.strategy_classifier.features.get_orderbook_features_asof",
+                 side_effect=_orderbook,
+             ), patch(
+                 "src.strategy_classifier.features.get_microstructure_features_asof",
+                 side_effect=_microstructure,
+             ), patch(
+                 "src.strategy_classifier.features.get_wallet_microstructure_signature_asof",
+                 side_effect=_wallet_sig,
+             ):
+            ext = LeaderFeatureExtractor()
+            fv = await ext.extract("0xabc", now)
+        i_book_age = FEATURE_NAMES.index("e_book_age_ms_at_entry_median")
+        assert not math.isnan(fv.values[i_book_age])
+        # 12 s of age → 12000 ms.
+        assert fv.values[i_book_age] == pytest.approx(12000.0)
+        assert fv.values.shape == (FEATURE_COUNT,)
 
     @pytest.mark.asyncio
     async def test_asof_in_past_is_used_in_query(self, now):
