@@ -829,23 +829,26 @@ def _v2_fmt_uptime(seconds: int | float | None) -> str:
 
 @app.get("/api/overview")
 async def api_overview():
-    """V2 OVERVIEW + sidebar data source.
+    """V2 OVERVIEW + sidebar data source — LEAN VARIANT.
 
-    Returns a V2-shaped composite that the dashboard reads at 3s
-    intervals. KEY DESIGN: the endpoint must respond in <500ms even
-    under load because every sub-tab re-mounts trigger a fetch.
+    The V2 dashboard polls this every 3s and (until we add a global
+    cache layer in `useApi`) every sub-tab navigation triggers a
+    fresh fetch. The endpoint MUST respond in <500ms.
 
-    The earlier implementation invoked ``_get_terminal_snapshot()``,
-    which fires 14+ parallel DB queries for the V1 ``/api/v1/live-summary``
-    payload. Under V2 + V1 polling concurrently this saturated the
-    asyncpg pool and caused 30s timeouts. The current implementation
-    is lean: one parallelized batch of light COUNT(*) queries +
-    cheap Redis lookups, no terminal snapshot.
+    Implementation history:
+    - v1 (commit edd49ee): called `_get_terminal_snapshot()` → 14
+      parallel queries → 30s timeouts under load.
+    - v2 (commit 8c58fd6): replaced with light parallel COUNT batch
+      BUT still called `_get_live_snapshot()` for legacy_keys —
+      which transitively triggers `queries.overview()` (a heavy
+      activity_feed JOIN + follower_map CTE). Measured 25s/call
+      in production under polling load.
+    - v3 (this): drop `_get_live_snapshot()` entirely. The legacy
+      portfolio fields (capital, equity_curve, total_pnl, etc.) are
+      not consumed by V2 — V1 reads them via /api/v1/live-summary.
+      The endpoint is now pure V2-shape: 1 SQL batch + 1 Redis GET
+      + module-time arithmetic. Target: <100ms warm.
     """
-    # --- Legacy portfolio (cached, fast) ------------------------------- #
-    legacy = await _get_live_snapshot()
-    legacy_keys = {k: v for k, v in legacy.items() if k not in ("ml", "bot", "stats")}
-
     # --- Single parallel batch for all V2 counts ----------------------- #
     async with _pool.acquire() as conn:
         row = await conn.fetchrow(
@@ -937,7 +940,6 @@ async def api_overview():
     }
 
     return {
-        **legacy_keys,
         "bot": bot_block,
         "stats": stats,
         "ingestion": ingestion,
@@ -1053,11 +1055,13 @@ async def api_ml():
     `maturity_pct`, `phase_distribution.{p1,p2,p3}`, `decisions_24h`,
     and a 24h hourly `trajectory.{trades,resolved,edges}` series.
 
-    We keep the legacy fields (V1 still reads them via /api/v1/live-summary
-    → snapshot.ml → /api/ml/diagnostics) AND add the V2-shape on top.
+    The legacy fields are NOT included here — V1 reads them via
+    /api/v1/live-summary → snapshot.ml. Calling `_get_live_snapshot()`
+    from this endpoint cascades into `queries.overview()` which is
+    slow (activity_feed JOIN + follower_map CTE) and was killing
+    V2 performance.
     """
-    snapshot = await _get_live_snapshot()
-    base = dict(snapshot.get("ml", {}) or {})
+    base: dict = {}
 
     async with _pool.acquire() as conn:
         # Total profiles + mean maturity (V2 KPI: TOTAL PROFILES + MATURITY).

@@ -89,30 +89,42 @@ def app_client(mock_pool, mock_redis):
 
 
 class TestOverview:
-    def test_returns_required_keys(self, app_client, mock_pool):
+    """V2-shape contract (post `fix(v2)` overhaul).
+
+    Legacy fields like `activity_feed`, `pnl_series`, `health` are no
+    longer exposed by `/api/overview` — they were the bottleneck of
+    the endpoint, cascading into a heavy `queries.overview()` SQL JOIN.
+    Consumers needing them should read `/api/v1/live-summary` directly.
+    """
+
+    def test_returns_v2_shape(self, app_client, mock_pool):
         resp = app_client.get("/api/overview")
         assert resp.status_code == 200
         data = resp.json()
-        for key in (
+        for key in ("bot", "stats", "ingestion", "layers", "coverage_pct"):
+            assert key in data, f"Missing V2 key: {key}"
+
+    def test_stats_block_shape(self, app_client):
+        resp = app_client.get("/api/overview")
+        stats = resp.json()["stats"]
+        for k in (
+            "net_pnl",
             "total_pnl",
             "win_rate",
-            "active_leaders",
-            "open_positions",
-            "pnl_series",
-            "activity_feed",
-            "health",
+            "positions_open",
+            "max_positions",
+            "decisions_24h",
         ):
-            assert key in data, f"Missing key: {key}"
+            assert k in stats, f"Missing stats key: {k}"
+        assert isinstance(stats["net_pnl"], (int, float))
 
-    def test_pnl_is_numeric(self, app_client):
+    def test_layers_block_shape(self, app_client):
         resp = app_client.get("/api/overview")
-        assert isinstance(resp.json()["total_pnl"], (int, float))
-
-    def test_health_has_components(self, app_client):
-        resp = app_client.get("/api/overview")
-        h = resp.json()["health"]
-        for k in ("db", "redis", "falcon", "websocket"):
-            assert k in h
+        layers = resp.json()["layers"]
+        for k in ("onchain", "cold_tier", "book_l3", "social", "crossmarket"):
+            assert k in layers, f"Missing layer: {k}"
+            # Each layer is one of running / gated / off / down.
+            assert layers[k] in ("running", "gated", "off", "down"), layers[k]
 
 
 class TestLeaders:
@@ -193,18 +205,36 @@ class TestDecisions:
 
 
 class TestML:
-    def test_returns_ml_summary(self, app_client):
+    """V2 shape for /api/ml (post `fix(v2)` overhaul).
+
+    The legacy fields (`leaders_with_process`, `phase2_leaders`, `follow`,
+    `fade`, `top_loss_reasons`) lived under snapshot.ml in the V1 path.
+    Calling `_get_live_snapshot()` to populate them was triggering the
+    heavy activity_feed JOIN and killing V2 performance. They are now
+    available via `/api/ml/diagnostics` or `/api/v1/live-summary`.
+    """
+
+    def test_returns_v2_shape(self, app_client):
         resp = app_client.get("/api/ml")
         assert resp.status_code == 200
         data = resp.json()
         for key in (
-            "leaders_with_process",
-            "leaders_with_decision_learning",
-            "follow",
-            "fade",
-            "top_loss_reasons",
+            "total_profiles",
+            "maturity_pct",
+            "phase_distribution",
+            "decisions_24h",
+            "trajectory",
+            "lens_trained",
         ):
-            assert key in data
+            assert key in data, f"Missing V2 key: {key}"
+        # phase_distribution structure
+        pd = data["phase_distribution"]
+        assert set(pd.keys()) == {"p1", "p2", "p3"}
+        # trajectory structure
+        traj = data["trajectory"]
+        for k in ("trades", "resolved", "edges"):
+            assert k in traj
+            assert isinstance(traj[k], list)
 
 
 class TestNeuralReadiness:
