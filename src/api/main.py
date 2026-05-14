@@ -831,133 +831,118 @@ def _v2_fmt_uptime(seconds: int | float | None) -> str:
 async def api_overview():
     """V2 OVERVIEW + sidebar data source.
 
-    Returns the terminal-snapshot shape (bot/stats/ingestion/analytics)
-    that the V2 sidebar + Bento cards consume, PLUS the V2-specific
-    `layers` / `coverage_pct` / `decisions_24h` fields that the KPI
-    strip reads. The legacy portfolio block (capital, equity_curve,
-    drawdown) is preserved for any caller relying on it.
+    Returns a V2-shaped composite that the dashboard reads at 3s
+    intervals. KEY DESIGN: the endpoint must respond in <500ms even
+    under load because every sub-tab re-mounts trigger a fetch.
 
-    Why we don't just return the terminal snapshot raw: V2 expects
-    `stats.net_pnl` / `stats.decisions_24h` / `bot.uptime_human` /
-    `bot.killswitch_active` / `layers.{...}` which are not part of
-    the V1 terminal snapshot. We compose them here once instead of
-    making every V2 sub-component re-derive them.
+    The earlier implementation invoked ``_get_terminal_snapshot()``,
+    which fires 14+ parallel DB queries for the V1 ``/api/v1/live-summary``
+    payload. Under V2 + V1 polling concurrently this saturated the
+    asyncpg pool and caused 30s timeouts. The current implementation
+    is lean: one parallelized batch of light COUNT(*) queries +
+    cheap Redis lookups, no terminal snapshot.
     """
-    # Pull the full terminal snapshot (cached ≤1s — same cache that
-    # serves /api/v1/live-summary, so this is free when the V1 client
-    # is also polling).
-    snap = await _get_terminal_snapshot()
+    # --- Legacy portfolio (cached, fast) ------------------------------- #
+    legacy = await _get_live_snapshot()
+    legacy_keys = {k: v for k, v in legacy.items() if k not in ("ml", "bot", "stats")}
 
-    # --- Compute V2-specific derived fields ---------------------------- #
+    # --- Single parallel batch for all V2 counts ----------------------- #
     async with _pool.acquire() as conn:
-        decisions_24h = await conn.fetchval(
-            "SELECT COUNT(*)::int FROM decision_log WHERE time >= NOW() - INTERVAL '24 hours'"
+        row = await conn.fetchrow(
+            """
+            SELECT
+                (SELECT COUNT(*)::int FROM decision_log
+                 WHERE time >= NOW() - INTERVAL '24 hours')                                              AS decisions_24h,
+                (SELECT COUNT(*)::int FROM paper_trades WHERE status = 'open')                            AS positions_open,
+                (SELECT COUNT(*)::int FROM microstructure_features
+                 WHERE bucket_ts >= NOW() - INTERVAL '5 minutes')                                         AS microstructure_recent,
+                (SELECT COUNT(*)::int FROM wallet_universe)                                               AS wallet_universe_n,
+                (SELECT COUNT(*)::int FROM social_signals
+                 WHERE posted_at >= NOW() - INTERVAL '24 hours')                                          AS social_recent,
+                (SELECT COUNT(*)::int FROM cross_market_positions)                                        AS crossmarket_recent,
+                (SELECT COUNT(*)::int FROM chain_sync_state)                                              AS onchain_recent,
+                (SELECT COUNT(*)::int FROM markets WHERE active = TRUE)                                   AS total_markets,
+                (SELECT COUNT(DISTINCT (market_id, token_id))::int FROM book_quality_snapshots
+                 WHERE observed_at >= NOW() - INTERVAL '15 seconds')                                      AS live_markets,
+                (SELECT COALESCE(SUM(pnl_usdc), 0)::float FROM paper_trades WHERE status = 'closed')      AS net_pnl,
+                (SELECT
+                    COUNT(*) FILTER (WHERE pnl_usdc > 0)::float / NULLIF(COUNT(*), 0)
+                 FROM paper_trades WHERE status = 'closed')                                               AS win_rate
+            """
         )
-        # Layer status heuristics — each round's "is it producing?"
-        # signal mapped to {running, gated, off}.
-        try:
-            microstructure_recent = await conn.fetchval(
-                "SELECT COUNT(*)::int FROM microstructure_features "
-                "WHERE bucket_ts >= NOW() - INTERVAL '5 minutes'"
-            )
-        except Exception:
-            microstructure_recent = 0
-        try:
-            wallet_universe_n = await conn.fetchval(
-                "SELECT COUNT(*)::int FROM wallet_universe"
-            )
-        except Exception:
-            wallet_universe_n = 0
-        try:
-            social_recent = await conn.fetchval(
-                "SELECT COUNT(*)::int FROM social_signals "
-                "WHERE observed_at >= NOW() - INTERVAL '24 hours'"
-            )
-        except Exception:
-            social_recent = 0
-        try:
-            crossmarket_recent = await conn.fetchval(
-                "SELECT COUNT(*)::int FROM cross_market_positions"
-            )
-        except Exception:
-            crossmarket_recent = 0
-        try:
-            onchain_recent = await conn.fetchval(
-                "SELECT COUNT(*)::int FROM chain_sync_state"
-            )
-        except Exception:
-            onchain_recent = 0
+    row = dict(row) if row else {}
 
     # --- Layer statuses ------------------------------------------------- #
     layers = {
-        # R6 onchain verifier — green if the cursor table has rows.
-        "onchain": "running" if (onchain_recent or 0) > 0 else "gated",
-        # R6 cold tier wallet universe — green once the crawler has
-        # seeded any wallets.
-        "cold_tier": "running" if (wallet_universe_n or 0) > 0 else "gated",
-        # R11 book L3 — green if the rollup wrote a bucket in the last
-        # 5 min (catches the Phase 1 regression where flush errors
-        # silenced the pipeline).
-        "book_l3": "running" if (microstructure_recent or 0) > 0 else "gated",
-        # R12 social — "off" is the expected steady state in stub mode
-        # (X_API_KEY=""). Promote to "running" if any signal lands.
-        "social": "running" if (social_recent or 0) > 0 else "off",
-        # R12 cross-market — same convention.
-        "crossmarket": "running" if (crossmarket_recent or 0) > 0 else "off",
+        "onchain":     "running" if (row.get("onchain_recent") or 0) > 0       else "gated",
+        "cold_tier":   "running" if (row.get("wallet_universe_n") or 0) > 0    else "gated",
+        "book_l3":     "running" if (row.get("microstructure_recent") or 0) > 0 else "gated",
+        "social":      "running" if (row.get("social_recent") or 0) > 0        else "off",
+        "crossmarket": "running" if (row.get("crossmarket_recent") or 0) > 0   else "off",
     }
 
-    # --- Coverage -------------------------------------------------------- #
-    ingestion = snap.get("ingestion") or {}
-    live = int(ingestion.get("live_markets") or 0)
-    total = int(ingestion.get("total_markets") or 0)
+    # --- Coverage ------------------------------------------------------- #
+    live = int(row.get("live_markets") or 0)
+    total = int(row.get("total_markets") or 0)
     coverage_pct = round((live / total * 100), 2) if total > 0 else None
 
-    # --- Bot block (extend terminal snapshot's bot with V2-only fields) - #
-    bot_raw = dict(snap.get("bot") or {})
-    bot_raw["uptime_human"] = _v2_fmt_uptime(bot_raw.get("uptime_seconds"))
-    # Killswitch state — check Redis first (cache), fall back to False.
-    killswitch_active = False
+    # --- Bot block (light — no terminal snapshot needed) ---------------- #
+    health = await _health_checks()
+    # Process uptime — computed from module load time (same source the
+    # terminal snapshot uses, just inlined to avoid the snapshot cost).
+    try:
+        uptime_seconds = int((datetime.now(timezone.utc) - _api_started_at).total_seconds())
+    except Exception:
+        uptime_seconds = 0
+    # `_health_checks()` exposes booleans under keys 'db' + 'redis'
+    # (not 'database'). Treat the bot as 'running' if both backends
+    # respond AND the WS hasn't gone silent (last message < 60s ago).
+    db_ok = bool(health.get("db"))
+    redis_ok = bool(health.get("redis"))
+    ws_lag_s = float(health.get("last_message_age_s") or 0.0)
+    ws_healthy = ws_lag_s < 60.0
+    bot_status = "running" if (db_ok and redis_ok and ws_healthy) else "stopped"
+    bot_block = {
+        "status": bot_status,
+        "execution_enabled": False,  # paper-only — flipped by ops via killswitch
+        "uptime_seconds": uptime_seconds,
+        "uptime_human": _v2_fmt_uptime(uptime_seconds),
+        "latency_ms": round(ws_lag_s * 1000, 2),
+        "killswitch_active": False,
+        "paper_only": True,
+    }
+    # Killswitch via Redis (single GET — fast).
     try:
         if _redis is not None:
             ks = await _redis.get("polymarket:killswitch")
-            killswitch_active = bool(ks and str(ks).strip().lower() not in ("", "0", "false", "off"))
+            bot_block["killswitch_active"] = bool(ks and str(ks).strip().lower() not in ("", "0", "false", "off"))
     except Exception:
-        killswitch_active = False
-    bot_raw["killswitch_active"] = killswitch_active
+        pass
 
-    # --- Stats block (V2-shape names) ----------------------------------- #
-    raw_stats = snap.get("stats") or {}
+    # --- Stats block (V2 shape) ----------------------------------------- #
     stats = {
-        # V2 reads .net_pnl, the terminal snapshot calls it .total_pnl
-        # — keep both keys so consumers from either era work.
-        "net_pnl": raw_stats.get("total_pnl", 0.0),
-        "total_pnl": raw_stats.get("total_pnl", 0.0),
-        "win_rate": raw_stats.get("win_rate", 0.0),
-        "positions_open": raw_stats.get("open_positions", 0),
+        "net_pnl":       float(row.get("net_pnl") or 0.0),
+        "total_pnl":     float(row.get("net_pnl") or 0.0),
+        "win_rate":      float(row.get("win_rate") or 0.0) if row.get("win_rate") is not None else 0.0,
+        "positions_open": int(row.get("positions_open") or 0),
         "max_positions": int(getattr(settings, "MAX_CONCURRENT_POSITIONS", 10) or 10),
-        "decisions_24h": int(decisions_24h or 0),
-        "active_markets": raw_stats.get("active_markets", 0),
-        "portfolio_total": raw_stats.get("portfolio_total", 0.0),
-        "pnl_percent": raw_stats.get("pnl_percent", 0.0),
-        "detected_arbs_today": raw_stats.get("detected_arbs_today", 0),
-        "capital_in_trade": raw_stats.get("capital_in_trade", 0.0),
+        "decisions_24h": int(row.get("decisions_24h") or 0),
+        "active_markets": live,
     }
 
-    # --- Legacy portfolio block (preserved) ----------------------------- #
-    # /api/overview historically returned `_get_live_snapshot()` which is
-    # the portfolio overview. We compose both the V2 shape and the
-    # legacy fields here so nothing breaks.
-    legacy_portfolio = await _get_live_snapshot()
-    legacy = {k: v for k, v in legacy_portfolio.items() if k not in ("ml", "bot", "stats")}
+    # --- Ingestion block ------------------------------------------------ #
+    ingestion = {
+        "live_markets": live,
+        "total_markets": total,
+    }
 
     return {
-        **legacy,                              # legacy portfolio (total_pnl, equity_curve, drawdown_pct, etc.)
-        "bot": bot_raw,                        # V2 sidebar + KPI strip
-        "stats": stats,                        # V2 KPI strip
-        "ingestion": ingestion,                # V2 sidebar + KPI strip
-        "analytics": snap.get("analytics", {}),# V2 misc
-        "layers": layers,                      # V2 OverviewEyes
-        "coverage_pct": coverage_pct,          # V2 OverviewEyes
+        **legacy_keys,
+        "bot": bot_block,
+        "stats": stats,
+        "ingestion": ingestion,
+        "layers": layers,
+        "coverage_pct": coverage_pct,
     }
 
 
