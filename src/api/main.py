@@ -68,6 +68,15 @@ STATS_PUSH_INTERVAL_S = 1.0  # how often to push live stats over WebSocket
 HEALTH_CACHE_TTL_S = 5.0
 LIVE_SNAPSHOT_TTL_S = 5.0
 TERMINAL_SNAPSHOT_TTL_S = 5.0
+# Background rebuilder cadence. Each cycle calls _get_terminal_snapshot(force=True)
+# so the cache stays warm. Aligned with V1 client poll interval (5s) — by the
+# time the V1 client polls, a fresh snapshot is already in cache.
+SNAPSHOT_REBUILDER_INTERVAL_S = 5.0
+# If the background rebuilder hasn't produced a fresh snapshot within this
+# many seconds, the snapshot endpoint logs a warning and falls back to a
+# synchronous rebuild (slow but correct). 30s = 6x the normal cadence —
+# allows for one or two transient stalls without flipping to fallback.
+SNAPSHOT_STALENESS_WARN_S = 30.0
 LOG_PATHS = [
     Path("/tmp/polymarket-bot-observer.log"),
     Path(__file__).parent.parent.parent / "orchestrate.log",
@@ -130,9 +139,18 @@ async def lifespan(app: FastAPI):
     await _bridge.start()
     _schedule_falcon_probe()
     push_task = asyncio.create_task(_stats_push_loop())
+    # Background snapshot rebuilder — keeps `/api/v1/live-summary` cache
+    # always-warm so cold start is 0ms instead of 30s. See _snapshot_rebuilder_loop
+    # for design rationale.
+    snapshot_task = asyncio.create_task(_snapshot_rebuilder_loop(), name="snapshot-rebuilder")
     logger.info("Dashboard API started")
     yield
     push_task.cancel()
+    snapshot_task.cancel()
+    try:
+        await snapshot_task
+    except (asyncio.CancelledError, Exception):
+        pass
     try:
         await get_runtime_config().stop_pubsub()
     except Exception:
@@ -593,19 +611,41 @@ async def _get_live_snapshot(force: bool = False) -> dict:
 
 
 async def _get_terminal_snapshot(force: bool = False) -> dict:
+    """Read the cached terminal snapshot, or rebuild if needed.
+
+    DESIGN POST-PHASE-2 (background worker introduction):
+    The background `_snapshot_rebuilder_loop` holds the lock for the
+    entire ~30s rebuild duration. The previous double-checked-locking
+    pattern made every reader wait on the lock — so readers timed out
+    even though cache was present. The new design separates concerns:
+
+      * Readers (`force=False`): NEVER block. If cache is present
+        (even stale), return it. The background worker will refresh it.
+      * Background worker (`force=True`): builds with the lock so two
+        rebuilders can't run in parallel.
+      * Cold start fallback (`force=False`, no cache): if no cache
+        exists at all, block on the lock to build the first snapshot
+        synchronously — but only on the very first request after
+        process start.
+
+    This means a reader may see snapshot up to ~30s stale during a
+    slow rebuild — much better than blocking 30s.
+    """
     now = time.monotonic()
     cached = _terminal_snapshot_cache.get("data")
-    if (
-        not force
-        and cached is not None
-        and now - float(_terminal_snapshot_cache.get("last_built", 0.0) or 0.0)
-        < TERMINAL_SNAPSHOT_TTL_S
-    ):
+    last_built = float(_terminal_snapshot_cache.get("last_built", 0.0) or 0.0)
+
+    # Readers always return whatever cache exists — fresh or stale.
+    if not force and cached is not None:
         return copy.deepcopy(cached)
 
+    # No cache + not forced: cold start, must build synchronously.
+    # `force=True` (background worker): also reach the rebuild path.
     async with _terminal_snapshot_lock:
         now = time.monotonic()
         cached = _terminal_snapshot_cache.get("data")
+        # Double-checked: another rebuilder may have just finished
+        # while we were waiting on the lock.
         if (
             not force
             and cached is not None
@@ -812,6 +852,83 @@ async def _stats_push_loop() -> None:
             break
         except Exception as exc:
             logger.warning(f"Stats push loop error: {exc}")
+
+
+# Stats for `/api/snapshot/health` — telemetry of the background rebuilder.
+# Updated by `_snapshot_rebuilder_loop` each cycle so operators can see
+# whether the snapshot pipeline is keeping up.
+_snapshot_rebuilder_stats: dict = {
+    "last_completed_at": None,      # monotonic time of last successful rebuild
+    "last_duration_ms": None,        # how long the last rebuild took
+    "consecutive_failures": 0,       # incremented on exception, reset on success
+    "total_rebuilds": 0,             # cumulative successful rebuilds
+    "total_failures": 0,             # cumulative failed rebuilds
+    "last_error": None,              # last exception repr (for /api/snapshot/health)
+}
+
+
+async def _snapshot_rebuilder_loop() -> None:
+    """Background loop that keeps `_terminal_snapshot_cache` warm.
+
+    DESIGN RATIONALE
+    ----------------
+    Before this loop existed, `_get_terminal_snapshot()` was invoked
+    lazily on every incoming request whose cache had expired. With a
+    TTL of 1s (5s post-Phase-1) and a rebuild cost of ~15-30s, this
+    meant:
+      * Every V1 client polling /api/v1/live-summary triggered a
+        rebuild if the cache had expired between polls.
+      * Concurrent rebuilds were serialised by `_terminal_snapshot_lock`
+        so the second client waited for the first to finish (15-30s).
+      * Cold start (first request after restart) was always ~30s.
+    By moving rebuild to a single background task running every
+    SNAPSHOT_REBUILDER_INTERVAL_S, we get:
+      * 1 rebuild per period — predictable DB load.
+      * Cold start ≈ 0ms (request reads cache).
+      * No request thread ever waits on rebuild (cache always fresh
+        or, in the worst case, slightly stale within the TTL window).
+      * Backpressure isolated to one task; clients never feel it.
+
+    FAILURE HANDLING
+    ----------------
+    If a rebuild fails (exception inside `_get_terminal_snapshot`), we
+    record it in stats and continue the loop. The cache keeps the
+    last-known-good value so the endpoint serves stale data rather
+    than 500s. After SNAPSHOT_STALENESS_WARN_S of staleness,
+    `/api/snapshot/health` flips to warning and the next request that
+    hits `/api/v1/live-summary` may trigger a synchronous fallback
+    rebuild (still capped by the lock).
+    """
+    logger.info(
+        f"Snapshot rebuilder loop starting "
+        f"(interval={SNAPSHOT_REBUILDER_INTERVAL_S}s, "
+        f"staleness_warn={SNAPSHOT_STALENESS_WARN_S}s)"
+    )
+    while True:
+        try:
+            t_start = time.perf_counter()
+            await _get_terminal_snapshot(force=True)
+            duration_ms = round((time.perf_counter() - t_start) * 1000, 2)
+            _snapshot_rebuilder_stats["last_completed_at"] = time.monotonic()
+            _snapshot_rebuilder_stats["last_duration_ms"] = duration_ms
+            _snapshot_rebuilder_stats["consecutive_failures"] = 0
+            _snapshot_rebuilder_stats["total_rebuilds"] += 1
+            _snapshot_rebuilder_stats["last_error"] = None
+        except asyncio.CancelledError:
+            logger.info("Snapshot rebuilder loop cancelled")
+            break
+        except Exception as exc:  # pragma: no cover — defensive top-level
+            _snapshot_rebuilder_stats["consecutive_failures"] += 1
+            _snapshot_rebuilder_stats["total_failures"] += 1
+            _snapshot_rebuilder_stats["last_error"] = repr(exc)
+            logger.warning(
+                f"Snapshot rebuilder failed (consecutive={_snapshot_rebuilder_stats['consecutive_failures']}): {exc}"
+            )
+        # Sleep regardless — even on failure, don't tight-loop the DB.
+        try:
+            await asyncio.sleep(SNAPSHOT_REBUILDER_INTERVAL_S)
+        except asyncio.CancelledError:
+            break
 
 
 # ---------------------------------------------------------------------------
@@ -1330,6 +1447,42 @@ async def api_live_summary_v1(request: Request, response: Response):
     response.headers["ETag"] = etag
     response.headers["Cache-Control"] = "private, no-cache, must-revalidate"
     return Response(content=payload, media_type="application/json", headers={"ETag": etag})
+
+
+@app.get("/api/snapshot/health")
+async def api_snapshot_health():
+    """Telemetry for the background snapshot rebuilder.
+
+    Exposes how the cache-keeping loop is doing. Useful for the
+    dashboard's BOT HEALTH tab and for external monitoring (alerting
+    if `staleness_s` exceeds the warn threshold for several poll
+    cycles). All times are seconds, all counters are cumulative
+    since process start.
+    """
+    last_completed_at = _snapshot_rebuilder_stats.get("last_completed_at")
+    if last_completed_at is None:
+        staleness_s = None
+        status = "warming_up"
+    else:
+        staleness_s = round(time.monotonic() - last_completed_at, 2)
+        status = (
+            "ok"
+            if staleness_s <= SNAPSHOT_STALENESS_WARN_S
+            else "degraded"
+        )
+    cache_present = _terminal_snapshot_cache.get("data") is not None
+    return {
+        "status": status,
+        "staleness_s": staleness_s,
+        "cache_present": cache_present,
+        "last_duration_ms": _snapshot_rebuilder_stats.get("last_duration_ms"),
+        "consecutive_failures": _snapshot_rebuilder_stats.get("consecutive_failures", 0),
+        "total_rebuilds": _snapshot_rebuilder_stats.get("total_rebuilds", 0),
+        "total_failures": _snapshot_rebuilder_stats.get("total_failures", 0),
+        "last_error": _snapshot_rebuilder_stats.get("last_error"),
+        "rebuilder_interval_s": SNAPSHOT_REBUILDER_INTERVAL_S,
+        "staleness_warn_s": SNAPSHOT_STALENESS_WARN_S,
+    }
 
 
 @app.get("/api/inspector/snapshot")
