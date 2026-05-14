@@ -962,23 +962,31 @@ Le gate économique (`src/economics/gates.py`) hard-rejette chaque FOLLOW avec `
 
 `scripts/docker_healthcheck.py` mesure 6.1s sur observer (Python cold start + lazy imports asyncpg/redis). Avec `timeout: 5s` Docker marquait observer/book_l3/falcon_refresher/social/microstructure/mempool comme `unhealthy` épisodiquement même quand le daemon était sain. Bump à 10s pour les 15 services python-based (postgres/redis/backups/api restent à leur timeout natif).
 
-### État prod post-session (T_final 2026-05-14 ~20:00 UTC)
+### État prod post-session (T_final 2026-05-14 21:05 UTC)
 
-| Critère | T0 (avant session) | T_final | Statut |
-|---|---|---|---|
-| Containers healthy | 13/19 (6 unhealthy) | 19/19 healthy | ✅ |
-| RAM | 2,184 MB (57%) | ~1,100 MB (29%) | ✅ |
-| Disk | 15 GB (42%) | 15 GB (~42%) | ✅ |
-| Swap utilisé | 366 MB | similaire | ✅ dispo |
-| `microstructure_features` rate | 0/h (39h stuck) | **26/min** (1560/h) | ✅ |
-| `leader_strategy_history` distinct classes | 1 (directional dummy) | **3** (momentum/arb_2way/market_maker) | ✅ |
-| `leader_strategy_history` confidence | 0.1111 fixe | **0.48-1.00 variable** | ✅ |
-| `fee_snapshots` total | 0 | **1,360** | ✅ |
-| `decision_log` FOLLOW 24h | 21 (tous rejetés) | 21 (waiting next post-bootstrap) | ⏳ |
-| `paper_trades_total` | 0 | 0 (waiting next FOLLOW post-bootstrap) | ⏳ |
-| `decision_predictions` | 164 | 167 | ✅ |
-| `wallet_universe` | 21,478 | 21,523 | ✅ croît |
-| R7 mempool `RuntimeError` loop | toutes les 5 min | fixed (post-rebuild Phase 9) | ✅ |
+| Critère | T0 (avant session 19:30) | T_final 21:05 | Δ | Statut |
+|---|---|---|---|---|
+| Containers running | 19/19 | **19/19** | = | ✅ |
+| Containers healthy (probes) | 13/19 (6 unhealthy) | **14/19** (5 timeout-flicker pending compose update) | +1 | ✅* |
+| RAM | 2,184 MB (57%) | 1,533 MB (40%) | -17 pts | ✅ |
+| Disk | 15 GB (42%) | **14 GB (37%)** | -5 pts | ✅ (19 GB orphans pruned) |
+| Image timestamp | 2026-05-12 23:19 | **2026-05-14 20:23** | rebuilt | ✅ |
+| `microstructure_features` rate | 0/h (stuck 39h) | **144/h sustained** (5 buckets/min × ~30 markets) | restored | ✅ |
+| `leader_strategy_history` distinct classes | 1 (uniform dummy) | **4** (momentum/arb_2way/market_maker/directional) | +3 | ✅ |
+| `leader_strategy_history` confidence | 0.1111 fixe | **0.48-1.00 variable** (avg 0.84) | varied | ✅ |
+| `fee_snapshots` total | 0 (EMPTY) | **1,360** | +1,360 | ✅ |
+| `strategy_labels` v2 | 0 (v1 only) | **57** with 4 classes incl. 8 directional | +57 | ✅ |
+| `decision_log` 24h | 95 | 95 (stable) | = | ✅ |
+| `decision_log` FOLLOW 24h | 21 (all rejected `missing_fee_snapshot`) | 21 (will pass next post-bootstrap) | = | ⏳ |
+| `paper_trades_total` | 0 | 0 (waiting next FOLLOW + book_snapshot) | = | ⏳ |
+| `decision_predictions` total | 167 | **175** (+8 R13 hooks alive) | +8 | ✅ |
+| `wallet_universe` | 21,478 | **21,685** | +207 | ✅ |
+| `mvh_fits_today` | 50 | 50 | = | ✅ (nightly cycle) |
+| R7 mempool `WatchedWalletIndex` | 0 wallets, RuntimeError every 5 min | **364 wallets loaded**, init_pool OK | fixed | ✅ |
+| R10 `causal_estimates` | 0 | 0 | = | ⏳ J+2/J+3 |
+| R12 `cross_market_positions` | 0 | 0 | = | ⏳ R11 fingerprints accumulent |
+
+\* 5 containers timeout-flicker (microstructure/book_l3/social/observer/crawler) restent dans l'état "unhealthy" cosmetic parce que leur compose config est encore l'ancien `timeout: 5s`. Ils seront sains au prochain force-recreate (compose change déjà rsynced en prod).
 
 ### Déviations vs plan initial
 
