@@ -18,3 +18,9 @@ data_cache/
 
 # R13 research workspace — local DuckDB working files
 research/duckdb/
+
+# R8 trained model artifacts — produced on prod by
+# scripts/train_strategy_classifier.py, persisted in the
+# ./models docker-compose volume. Pickles can be 1-10 MB binary;
+# train each environment from its own labels.
+models/
