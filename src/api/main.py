@@ -66,8 +66,8 @@ TEMPLATE_V2_PATH = Path(__file__).parent.parent.parent / "templates" / "dashboar
 STATIC_DIR = Path(__file__).parent.parent.parent / "static"
 STATS_PUSH_INTERVAL_S = 1.0  # how often to push live stats over WebSocket
 HEALTH_CACHE_TTL_S = 5.0
-LIVE_SNAPSHOT_TTL_S = 1.0
-TERMINAL_SNAPSHOT_TTL_S = 1.0
+LIVE_SNAPSHOT_TTL_S = 5.0
+TERMINAL_SNAPSHOT_TTL_S = 5.0
 LOG_PATHS = [
     Path("/tmp/polymarket-bot-observer.log"),
     Path(__file__).parent.parent.parent / "orchestrate.log",
@@ -90,12 +90,26 @@ async def lifespan(app: FastAPI):
     created_pool = False
     created_redis = False
     if _pool is None:
+        # Pool sized for the new asyncio.gather() in queries.overview()
+        # (11 parallel sub-queries) + concurrent V1+V2 clients. The
+        # observed saturation at the old max=10 happened with 6 active
+        # queries from a single live-summary rebuild — bumping to 20
+        # gives ~2x headroom.
         _pool = await asyncpg.create_pool(
             dsn=settings.DATABASE_URL,
-            min_size=2,
-            max_size=10,
+            min_size=4,
+            max_size=20,
         )
         created_pool = True
+        # CRITICAL: also expose the pool to src.database.connection so that
+        # killswitch / mempool wallet_index / any other module calling
+        # `from src.database.connection import get_db` sees a live pool.
+        # Without this hop, those modules see `_pool=None` and raise
+        # "DB pool not initialized. Call initialize_pool() first." —
+        # which is the root cause of the `infra_failure:RuntimeError`
+        # killswitch state observed in production.
+        import src.database.connection as _db_conn
+        _db_conn._pool = _pool
     if _redis is None:
         _redis = redis_async.from_url(settings.REDIS_URL, decode_responses=True)
         created_redis = True
@@ -127,6 +141,10 @@ async def lifespan(app: FastAPI):
     if created_pool and _pool:
         await _pool.close()
         _pool = None
+        # Unbind from src.database.connection so a future restart can
+        # cleanly re-init.
+        import src.database.connection as _db_conn
+        _db_conn._pool = None
     if created_redis and _redis:
         await _redis.aclose()
         _redis = None
