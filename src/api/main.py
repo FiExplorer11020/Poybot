@@ -806,11 +806,159 @@ async def root():
     return HTMLResponse(content=TEMPLATE_PATH.read_text())
 
 
+def _v2_fmt_uptime(seconds: int | float | None) -> str:
+    """Format uptime seconds as e.g. '2d 4h' / '6h 32m' / '12m' / '45s'.
+
+    Mirrors the V1 dashboard's `fmtAge()` helper so the V2 sidebar's
+    `bot.uptime_human` rendering is consistent across both UIs.
+    """
+    s = int(seconds or 0)
+    if s <= 0:
+        return "—"
+    days, rem = divmod(s, 86400)
+    hours, rem = divmod(rem, 3600)
+    minutes, secs = divmod(rem, 60)
+    if days:
+        return f"{days}d {hours}h"
+    if hours:
+        return f"{hours}h {minutes}m"
+    if minutes:
+        return f"{minutes}m"
+    return f"{secs}s"
+
+
 @app.get("/api/overview")
 async def api_overview():
-    snapshot = await _get_live_snapshot()
-    data = {key: value for key, value in snapshot.items() if key != "ml"}
-    return data
+    """V2 OVERVIEW + sidebar data source.
+
+    Returns the terminal-snapshot shape (bot/stats/ingestion/analytics)
+    that the V2 sidebar + Bento cards consume, PLUS the V2-specific
+    `layers` / `coverage_pct` / `decisions_24h` fields that the KPI
+    strip reads. The legacy portfolio block (capital, equity_curve,
+    drawdown) is preserved for any caller relying on it.
+
+    Why we don't just return the terminal snapshot raw: V2 expects
+    `stats.net_pnl` / `stats.decisions_24h` / `bot.uptime_human` /
+    `bot.killswitch_active` / `layers.{...}` which are not part of
+    the V1 terminal snapshot. We compose them here once instead of
+    making every V2 sub-component re-derive them.
+    """
+    # Pull the full terminal snapshot (cached ≤1s — same cache that
+    # serves /api/v1/live-summary, so this is free when the V1 client
+    # is also polling).
+    snap = await _get_terminal_snapshot()
+
+    # --- Compute V2-specific derived fields ---------------------------- #
+    async with _pool.acquire() as conn:
+        decisions_24h = await conn.fetchval(
+            "SELECT COUNT(*)::int FROM decision_log WHERE time >= NOW() - INTERVAL '24 hours'"
+        )
+        # Layer status heuristics — each round's "is it producing?"
+        # signal mapped to {running, gated, off}.
+        try:
+            microstructure_recent = await conn.fetchval(
+                "SELECT COUNT(*)::int FROM microstructure_features "
+                "WHERE bucket_ts >= NOW() - INTERVAL '5 minutes'"
+            )
+        except Exception:
+            microstructure_recent = 0
+        try:
+            wallet_universe_n = await conn.fetchval(
+                "SELECT COUNT(*)::int FROM wallet_universe"
+            )
+        except Exception:
+            wallet_universe_n = 0
+        try:
+            social_recent = await conn.fetchval(
+                "SELECT COUNT(*)::int FROM social_signals "
+                "WHERE observed_at >= NOW() - INTERVAL '24 hours'"
+            )
+        except Exception:
+            social_recent = 0
+        try:
+            crossmarket_recent = await conn.fetchval(
+                "SELECT COUNT(*)::int FROM cross_market_positions"
+            )
+        except Exception:
+            crossmarket_recent = 0
+        try:
+            onchain_recent = await conn.fetchval(
+                "SELECT COUNT(*)::int FROM chain_sync_state"
+            )
+        except Exception:
+            onchain_recent = 0
+
+    # --- Layer statuses ------------------------------------------------- #
+    layers = {
+        # R6 onchain verifier — green if the cursor table has rows.
+        "onchain": "running" if (onchain_recent or 0) > 0 else "gated",
+        # R6 cold tier wallet universe — green once the crawler has
+        # seeded any wallets.
+        "cold_tier": "running" if (wallet_universe_n or 0) > 0 else "gated",
+        # R11 book L3 — green if the rollup wrote a bucket in the last
+        # 5 min (catches the Phase 1 regression where flush errors
+        # silenced the pipeline).
+        "book_l3": "running" if (microstructure_recent or 0) > 0 else "gated",
+        # R12 social — "off" is the expected steady state in stub mode
+        # (X_API_KEY=""). Promote to "running" if any signal lands.
+        "social": "running" if (social_recent or 0) > 0 else "off",
+        # R12 cross-market — same convention.
+        "crossmarket": "running" if (crossmarket_recent or 0) > 0 else "off",
+    }
+
+    # --- Coverage -------------------------------------------------------- #
+    ingestion = snap.get("ingestion") or {}
+    live = int(ingestion.get("live_markets") or 0)
+    total = int(ingestion.get("total_markets") or 0)
+    coverage_pct = round((live / total * 100), 2) if total > 0 else None
+
+    # --- Bot block (extend terminal snapshot's bot with V2-only fields) - #
+    bot_raw = dict(snap.get("bot") or {})
+    bot_raw["uptime_human"] = _v2_fmt_uptime(bot_raw.get("uptime_seconds"))
+    # Killswitch state — check Redis first (cache), fall back to False.
+    killswitch_active = False
+    try:
+        if _redis is not None:
+            ks = await _redis.get("polymarket:killswitch")
+            killswitch_active = bool(ks and str(ks).strip().lower() not in ("", "0", "false", "off"))
+    except Exception:
+        killswitch_active = False
+    bot_raw["killswitch_active"] = killswitch_active
+
+    # --- Stats block (V2-shape names) ----------------------------------- #
+    raw_stats = snap.get("stats") or {}
+    stats = {
+        # V2 reads .net_pnl, the terminal snapshot calls it .total_pnl
+        # — keep both keys so consumers from either era work.
+        "net_pnl": raw_stats.get("total_pnl", 0.0),
+        "total_pnl": raw_stats.get("total_pnl", 0.0),
+        "win_rate": raw_stats.get("win_rate", 0.0),
+        "positions_open": raw_stats.get("open_positions", 0),
+        "max_positions": int(getattr(settings, "MAX_CONCURRENT_POSITIONS", 10) or 10),
+        "decisions_24h": int(decisions_24h or 0),
+        "active_markets": raw_stats.get("active_markets", 0),
+        "portfolio_total": raw_stats.get("portfolio_total", 0.0),
+        "pnl_percent": raw_stats.get("pnl_percent", 0.0),
+        "detected_arbs_today": raw_stats.get("detected_arbs_today", 0),
+        "capital_in_trade": raw_stats.get("capital_in_trade", 0.0),
+    }
+
+    # --- Legacy portfolio block (preserved) ----------------------------- #
+    # /api/overview historically returned `_get_live_snapshot()` which is
+    # the portfolio overview. We compose both the V2 shape and the
+    # legacy fields here so nothing breaks.
+    legacy_portfolio = await _get_live_snapshot()
+    legacy = {k: v for k, v in legacy_portfolio.items() if k not in ("ml", "bot", "stats")}
+
+    return {
+        **legacy,                              # legacy portfolio (total_pnl, equity_curve, drawdown_pct, etc.)
+        "bot": bot_raw,                        # V2 sidebar + KPI strip
+        "stats": stats,                        # V2 KPI strip
+        "ingestion": ingestion,                # V2 sidebar + KPI strip
+        "analytics": snap.get("analytics", {}),# V2 misc
+        "layers": layers,                      # V2 OverviewEyes
+        "coverage_pct": coverage_pct,          # V2 OverviewEyes
+    }
 
 
 @app.get("/api/leaders")
@@ -912,8 +1060,151 @@ async def api_risk():
 
 @app.get("/api/ml")
 async def api_ml():
+    """V2 INTELLIGENCE / Maturity sub-tab data source.
+
+    The legacy shape (returned by `_aggregate_ml_profiles`) exposed
+    `leaders_with_process`, `phase2_leaders`, `phase3_leaders`, etc.
+    V2's `IntelligenceMaturity` component instead reads `total_profiles`,
+    `maturity_pct`, `phase_distribution.{p1,p2,p3}`, `decisions_24h`,
+    and a 24h hourly `trajectory.{trades,resolved,edges}` series.
+
+    We keep the legacy fields (V1 still reads them via /api/v1/live-summary
+    → snapshot.ml → /api/ml/diagnostics) AND add the V2-shape on top.
+    """
     snapshot = await _get_live_snapshot()
-    return snapshot.get("ml", {})
+    base = dict(snapshot.get("ml", {}) or {})
+
+    async with _pool.acquire() as conn:
+        # Total profiles + mean maturity (V2 KPI: TOTAL PROFILES + MATURITY).
+        try:
+            row = await conn.fetchrow(
+                """
+                SELECT
+                    COUNT(*)::int AS total_profiles,
+                    COALESCE(AVG(profile_maturity), 0)::float AS avg_maturity
+                FROM leader_profiles
+                """
+            )
+            total_profiles = int(row["total_profiles"] or 0)
+            maturity_pct = float(row["avg_maturity"] or 0.0)
+        except Exception:
+            total_profiles = 0
+            maturity_pct = 0.0
+
+        # Phase distribution across all profiles (V2 KPI: PHASE 1/2/3).
+        try:
+            phase_rows = await conn.fetch(
+                """
+                SELECT
+                    COALESCE(error_model_phase, 1)::int AS phase,
+                    COUNT(*)::int AS n
+                FROM leader_profiles
+                GROUP BY 1
+                """
+            )
+            phase_distribution = {"p1": 0, "p2": 0, "p3": 0}
+            for r in phase_rows:
+                p = int(r["phase"])
+                if p <= 1:
+                    phase_distribution["p1"] += int(r["n"])
+                elif p == 2:
+                    phase_distribution["p2"] += int(r["n"])
+                else:
+                    phase_distribution["p3"] += int(r["n"])
+        except Exception:
+            phase_distribution = {"p1": 0, "p2": 0, "p3": 0}
+
+        # Decisions in last 24h (V2 KPI: DECISIONS 24H).
+        try:
+            decisions_24h = await conn.fetchval(
+                "SELECT COUNT(*)::int FROM decision_log "
+                "WHERE time >= NOW() - INTERVAL '24 hours'"
+            )
+        except Exception:
+            decisions_24h = 0
+
+        # 24h hourly trajectory (V2 LEARNING TRAJECTORY chart).
+        # Three series: new trades observed, positions resolved, new
+        # edges confirmed — each as a 24-element array of hourly counts.
+        try:
+            traj_rows = await conn.fetch(
+                """
+                WITH hours AS (
+                    SELECT generate_series(0, 23) AS h
+                ),
+                bucket_trades AS (
+                    SELECT
+                        EXTRACT(HOUR FROM (NOW() - time))::int AS hours_ago,
+                        COUNT(*)::int AS n
+                    FROM trades_observed
+                    WHERE time >= NOW() - INTERVAL '24 hours'
+                    GROUP BY 1
+                ),
+                bucket_resolved AS (
+                    SELECT
+                        EXTRACT(HOUR FROM (NOW() - close_time))::int AS hours_ago,
+                        COUNT(*)::int AS n
+                    FROM positions_reconstructed
+                    WHERE close_time >= NOW() - INTERVAL '24 hours'
+                      AND close_time IS NOT NULL
+                    GROUP BY 1
+                ),
+                bucket_edges AS (
+                    SELECT
+                        EXTRACT(HOUR FROM (NOW() - last_observed))::int AS hours_ago,
+                        COUNT(*)::int AS n
+                    FROM follower_edges
+                    WHERE last_observed >= NOW() - INTERVAL '24 hours'
+                      AND follow_probability > 0.6
+                      AND co_occurrences >= 5
+                    GROUP BY 1
+                )
+                SELECT
+                    hours.h AS h,
+                    COALESCE(bucket_trades.n, 0)   AS trades,
+                    COALESCE(bucket_resolved.n, 0) AS resolved,
+                    COALESCE(bucket_edges.n, 0)    AS edges
+                FROM hours
+                LEFT JOIN bucket_trades   ON bucket_trades.hours_ago   = hours.h
+                LEFT JOIN bucket_resolved ON bucket_resolved.hours_ago = hours.h
+                LEFT JOIN bucket_edges    ON bucket_edges.hours_ago    = hours.h
+                ORDER BY hours.h DESC
+                """
+            )
+            # The query returns hours_ago=0 first (now) ... 23 (oldest).
+            # The chart expects ascending time → reverse.
+            traj_rows = list(reversed(traj_rows))
+            trajectory = {
+                "trades":   [int(r["trades"])   for r in traj_rows],
+                "resolved": [int(r["resolved"]) for r in traj_rows],
+                "edges":    [int(r["edges"])    for r in traj_rows],
+            }
+        except Exception as exc:
+            logger.warning(f"api_ml trajectory query failed: {exc}")
+            trajectory = {"trades": [], "resolved": [], "edges": []}
+
+        # Lens trained flag — does a strategy classifier model file exist
+        # AND has it produced any non-uniform prediction recently?
+        try:
+            distinct_classes = await conn.fetchval(
+                "SELECT COUNT(DISTINCT primary_strategy)::int "
+                "FROM leader_strategy_history "
+                "WHERE classified_at >= NOW() - INTERVAL '24 hours'"
+            )
+            lens_trained = int(distinct_classes or 0) >= 2
+        except Exception:
+            lens_trained = False
+
+    return {
+        **base,                                  # legacy fields (leaders_with_process, phase2_leaders, etc.)
+        # V2 IntelligenceMaturity expects these names:
+        "total_profiles": total_profiles,
+        "maturity_pct": maturity_pct,
+        "phase_distribution": phase_distribution,
+        "decisions_24h": int(decisions_24h or 0),
+        "trajectory": trajectory,
+        "lens_trained": lens_trained,
+    }
 
 
 @app.get("/api/neural-readiness")

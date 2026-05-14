@@ -198,14 +198,36 @@ const Sidebar = ({ tab, onTabChange }) => {
           </div>
         ))}
         <div style={{ marginTop: 10, paddingTop: 10, borderTop: `1px solid ${T.border.subtle}` }}>
+          {/* Live PNL + win rate — sourced from /api/overview.stats which is
+              already polled above (line 105). Falls back to "—" when the
+              backend hasn't responded yet so we don't flash a misleading
+              "0.0%" on initial load. The colour-coding mirrors the V1
+              sidebar's pnlColor() helper. */}
           <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 10 }}>
             <span style={{ color: T.text.tertiary, letterSpacing: 'var(--letter-spacing-wide)' }}>NET PNL</span>
-            <span style={{ color: T.status.ok, fontWeight: 600 }}>{fmtPnl(0)}</span>
+            <span style={{
+              color: (overview?.stats?.net_pnl ?? 0) >= 0 ? T.status.ok : T.status.err,
+              fontWeight: 600,
+            }}>
+              {overview?.stats?.net_pnl != null ? fmtPnl(overview.stats.net_pnl) : '—'}
+            </span>
           </div>
           <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 10 }}>
             <span style={{ color: T.text.tertiary, letterSpacing: 'var(--letter-spacing-wide)' }}>WIN RATE</span>
-            <span style={{ color: T.text.primary, fontWeight: 600 }}>0.0%</span>
+            <span style={{ color: T.text.primary, fontWeight: 600 }}>
+              {overview?.stats?.win_rate != null
+                ? `${(overview.stats.win_rate * 100).toFixed(1)}%`
+                : '—'}
+            </span>
           </div>
+          {/* Bot uptime — surfaces the 188k+ seconds = "2d 4h" so the
+              operator sees the process IS alive even when paper_trades=0. */}
+          {bot.uptime_human && (
+            <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 10, marginTop: 2 }}>
+              <span style={{ color: T.text.tertiary, letterSpacing: 'var(--letter-spacing-wide)' }}>UPTIME</span>
+              <span style={{ color: T.text.primary, fontWeight: 600, fontFamily: 'var(--font-mono)' }}>{bot.uptime_human}</span>
+            </div>
+          )}
         </div>
       </footer>
     </aside>
