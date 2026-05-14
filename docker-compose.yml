@@ -41,7 +41,7 @@ x-app-base: &app-base
   healthcheck:
     test: ["CMD", "python", "/app/scripts/docker_healthcheck.py"]
     interval: 30s
-    timeout: 5s
+    timeout: 10s
     start_period: 20s
     retries: 3
 
@@ -90,7 +90,7 @@ services:
     healthcheck:
       test: ["CMD", "python", "/app/scripts/docker_healthcheck.py"]
       interval: 30s
-      timeout: 5s
+      timeout: 10s
       start_period: 60s
       retries: 3
 
@@ -103,7 +103,7 @@ services:
     healthcheck:
       test: ["CMD", "python", "/app/scripts/docker_healthcheck.py"]
       interval: 30s
-      timeout: 5s
+      timeout: 10s
       start_period: 60s
       retries: 3
 
@@ -144,7 +144,7 @@ services:
     healthcheck:
       test: ["CMD", "python", "/app/scripts/docker_healthcheck.py"]
       interval: 60s
-      timeout: 5s
+      timeout: 10s
       start_period: 45s
       retries: 3
 
@@ -156,7 +156,7 @@ services:
     healthcheck:
       test: ["CMD", "python", "/app/scripts/docker_healthcheck.py"]
       interval: 60s
-      timeout: 5s
+      timeout: 10s
       start_period: 30s
       retries: 3
 
@@ -168,7 +168,7 @@ services:
     healthcheck:
       test: ["CMD", "python", "/app/scripts/docker_healthcheck.py"]
       interval: 60s
-      timeout: 5s
+      timeout: 10s
       start_period: 30s
       retries: 3
 
@@ -182,7 +182,7 @@ services:
     healthcheck:
       test: ["CMD", "python", "/app/scripts/docker_healthcheck.py"]
       interval: 120s
-      timeout: 5s
+      timeout: 10s
       start_period: 30s
       retries: 3
 
@@ -203,10 +203,17 @@ services:
     profiles: ["sprint2"]
     container_name: polymarket_strategy_classifier
     command: ["python", "-m", "src.strategy_classifier"]
+    # Mount the host's models/ directory so the LightGBM pickle
+    # produced by `scripts/train_strategy_classifier.py` persists
+    # across container recreates AND is visible to the daemon at
+    # boot (STRATEGY_CLASSIFIER_MODEL_PATH defaults to
+    # `models/strategy_classifier.pkl`, resolved relative to /app).
+    volumes:
+      - ./models:/app/models
     healthcheck:
       test: ["CMD", "python", "/app/scripts/docker_healthcheck.py"]
       interval: 120s
-      timeout: 5s
+      timeout: 10s
       start_period: 60s
       retries: 3
 
@@ -219,7 +226,7 @@ services:
     healthcheck:
       test: ["CMD", "python", "/app/scripts/docker_healthcheck.py"]
       interval: 120s
-      timeout: 5s
+      timeout: 10s
       start_period: 60s
       retries: 3
 
@@ -233,7 +240,7 @@ services:
     healthcheck:
       test: ["CMD", "python", "/app/scripts/docker_healthcheck.py"]
       interval: 120s
-      timeout: 5s
+      timeout: 10s
       start_period: 60s
       retries: 3
 
@@ -263,7 +270,7 @@ services:
     healthcheck:
       test: ["CMD", "python", "/app/scripts/docker_healthcheck.py"]
       interval: 60s
-      timeout: 5s
+      timeout: 10s
       start_period: 60s
       retries: 3
 
@@ -279,7 +286,7 @@ services:
     healthcheck:
       test: ["CMD", "python", "/app/scripts/docker_healthcheck.py"]
       interval: 120s
-      timeout: 5s
+      timeout: 10s
       start_period: 60s
       retries: 3
 
@@ -300,7 +307,7 @@ services:
     healthcheck:
       test: ["CMD", "python", "/app/scripts/docker_healthcheck.py"]
       interval: 120s
-      timeout: 5s
+      timeout: 10s
       start_period: 60s
       retries: 3
 
@@ -321,7 +328,7 @@ services:
     healthcheck:
       test: ["CMD", "python", "/app/scripts/docker_healthcheck.py"]
       interval: 120s
-      timeout: 5s
+      timeout: 10s
       start_period: 60s
       retries: 3
 
@@ -343,7 +350,7 @@ services:
     healthcheck:
       test: ["CMD", "python", "/app/scripts/docker_healthcheck.py"]
       interval: 60s
-      timeout: 5s
+      timeout: 10s
       start_period: 60s
       retries: 3
 

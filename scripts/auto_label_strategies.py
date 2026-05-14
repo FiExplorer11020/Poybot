@@ -41,8 +41,15 @@ from datetime import date, datetime, timedelta, timezone
 import asyncpg
 from loguru import logger
 
-LABELLER = "auto_v1"
+LABELLER = "auto_v2"
 LABEL_CONFIDENCE = 0.5
+# v2 widens the directional threshold from 24h → 12h. After the
+# Sprint 1 backfill (517k historical trades), most "swing" leaders
+# show median holding in the 12-48h range. The 24h cutoff missed all
+# of them — auto_v1 produced 0 directional labels out of 60. v2 also
+# filters out positions with close_time < open_time (the data-quality
+# bug noted in EXECUTION_PLAN § 14 dev #5).
+DIRECTIONAL_HOLDING_S_MIN = 43_200  # 12h
 
 # Canonical 9 strategy classes — must match the DB CHECK constraint.
 STRATEGY_CLASSES = (
@@ -84,6 +91,11 @@ async def fetch_candidates(
         FROM positions_reconstructed
         WHERE close_time IS NOT NULL
           AND open_time >= $1
+          -- v2: filter out the data-quality bug from
+          -- `position_tracker._close_position` where merge/resolution
+          -- close races produce close_time < open_time (skews the
+          -- holding-period median negative).
+          AND close_time > open_time
         GROUP BY wallet_address
         HAVING COUNT(*) >= $2
         ORDER BY COUNT(*) DESC
@@ -177,18 +189,24 @@ def classify(
             f"trades_per_day={trades_per_day:.1f}>=20 + median_holding_s={holding_s:.1f}<300",
         )
 
-    # Rule 3: arb_2way (paired YES+NO in same market).
+    # Rule 3: directional (long hold) — v2 promoted to fire BEFORE
+    # arb_2way. Rationale: a wallet that holds positions median >= 12h
+    # is by definition NOT pure arbitrage (true arb_2way exits within
+    # minutes once prices converge). The previous order treated any
+    # paired YES+NO observation as arb_2way which swallowed swing
+    # traders that incidentally entered both legs of a market.
+    if holding_s >= DIRECTIONAL_HOLDING_S_MIN:
+        return (
+            "directional",
+            f"median_holding_s={holding_s:.0f}s>={DIRECTIONAL_HOLDING_S_MIN} (12h)",
+        )
+
+    # Rule 4: arb_2way (paired YES+NO in same market, short hold).
     if has_arb_pair:
         return (
             "arb_2way",
-            f"paired_yes_no_observed (n_positions={n_pos})",
-        )
-
-    # Rule 4: directional (long hold, no arb pattern).
-    if holding_s >= 86_400:
-        return (
-            "directional",
-            f"median_holding_s={holding_s:.0f}s>=86400 (24h)",
+            f"paired_yes_no_observed (n_positions={n_pos}, "
+            f"median_holding_s={holding_s:.0f})",
         )
 
     # Rule 5: momentum (short hold + regular cadence).
@@ -308,8 +326,13 @@ def main() -> None:
     parser.add_argument(
         "--lookback-days",
         type=int,
-        default=30,
-        help="Window length for the holding-period + frequency stats.",
+        default=90,
+        help=(
+            "Window length for the holding-period + frequency stats. "
+            "v2 default is 90 days (was 30 in v1) so the backfilled "
+            "historical trades are within the lookback window — this "
+            "is the main reason v2 produces ~3-5x more labels than v1."
+        ),
     )
     args = parser.parse_args()
     sys.exit(asyncio.run(run(args)))

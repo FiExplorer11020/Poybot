@@ -36,6 +36,7 @@ import redis.asyncio as redis_async
 from loguru import logger
 
 from src.config import settings
+from src.database.connection import close_pool, initialize_pool
 from src.mempool.event_emitter import LeaderIntentPublisher
 from src.mempool.node_client import (
     LeaderTradeSubscription,
@@ -100,6 +101,19 @@ async def main() -> None:
         "mode={} contract={}",
         mode,
         settings.POLYMARKET_CLOB_CONTRACT_ADDRESS,
+    )
+
+    # Initialize the asyncpg pool BEFORE any code that touches the DB.
+    # `WatchedWalletIndex.refresh_from_universe()` calls `get_db()` which
+    # raises `RuntimeError('DB pool not initialized. Call initialize_pool()
+    # first.')` if we skip this step — the failure mode observed in prod
+    # post-Sprint 4 (see EXECUTION_PLAN § 18). All sibling daemons
+    # (engine, observer, microstructure, crossmarket, etc.) initialize
+    # the pool at boot for the same reason.
+    await initialize_pool(
+        dsn=settings.DATABASE_URL,
+        min_size=settings.DB_POOL_MIN,
+        max_size=settings.DB_POOL_MAX,
     )
 
     wallet_index = WatchedWalletIndex()
@@ -212,6 +226,10 @@ async def main() -> None:
                 await proxy_redis.aclose()
             except Exception:
                 pass
+        try:
+            await close_pool()
+        except Exception:
+            pass
         logger.info("polymarket-mempool: shutdown complete")
 
 
