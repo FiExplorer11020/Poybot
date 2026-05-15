@@ -489,6 +489,20 @@ class PaperTrader:
             fade_fallback = max(0.01, 1.0 - leader_mid)
             entry_price = await self._entry_ask(market_id, actual_token_id, fade_fallback)
 
+        # Final asymmetry gate: the confidence_engine filter checks the
+        # leader's trade price but the actual entry price is the book ask
+        # at fire time. On near-resolution markets the ask can be 0.99
+        # even when the leader's trade was at 0.50, leading to the same
+        # asymmetric-bad outcome the upstream filter is meant to prevent.
+        # Reject FOLLOWs when the actual entry ask is in the high zone.
+        if strategy == "follow" and entry_price >= 0.85:
+            await self._record_open_trade_refusal(
+                decision,
+                "high_entry_ask_blocked",
+                {"entry_ask": entry_price, "leader_price": decision.get("price")},
+            )
+            return None
+
         strategy_track = (
             trade_context.get("strategy_track")
             or decision.get("strategy_track")
@@ -906,12 +920,13 @@ class PaperTrader:
         leader_wallet: str,
         strategy: str,
     ) -> bool:
+        # PER-MARKET CAP: don't open multiple trades on the same market,
+        # regardless of which leader fired the signal. Without this we
+        # saw 4 separate trades on 0x59eb6... within 1 minute as
+        # different leaders all signaled the same near-resolution market
+        # — they all lost. One position per market caps that exposure.
         for trade in self._open_trades:
-            if (
-                trade.market_id == market_id
-                and trade.leader_wallet == leader_wallet
-                and trade.strategy == strategy
-            ):
+            if trade.market_id == market_id:
                 return True
         try:
             async with get_db() as conn:
@@ -920,14 +935,10 @@ class PaperTrader:
                     SELECT 1
                     FROM paper_trades
                     WHERE market_id = $1
-                      AND leader_wallet = $2
-                      AND strategy = $3
                       AND status = 'open'
                     LIMIT 1
                     """,
                     market_id,
-                    leader_wallet,
-                    strategy,
                 )
                 return row is not None
         except Exception:
