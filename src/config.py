@@ -1076,9 +1076,11 @@ class Settings(BaseSettings):
     # Consumed by src.microstructure.daemon for real-time derivation.
     CLOB_BOOK_STREAM_NAME: str = "book:events:stream"
     # CLOB_BOOK_STREAM_MAXLEN: bound the stream length so a consumer
-    # outage doesn't OOM Redis. ~5 minutes of peak events: 5000/s × 300s
-    # = 1.5M entries. We use approximate trim (`~`) for speed.
-    CLOB_BOOK_STREAM_MAXLEN: int = 1_500_000
+    # outage doesn't OOM Redis. Reduced from 1.5M to 100k after a
+    # 573k-entry stream consumed 256MB and crashed observer.
+    # The microstructure deriver consumes in real-time so a 100k
+    # buffer (≈20 s peak) is plenty for handoff smoothing.
+    CLOB_BOOK_STREAM_MAXLEN: int = 100_000
 
     # Microstructure deriver — see § 3.2 of the spec.
     MICROSTRUCTURE_ROLLUP_BUCKET_S: int = 60

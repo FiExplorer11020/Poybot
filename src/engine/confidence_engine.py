@@ -809,14 +809,24 @@ class ConfidenceEngine:
 
         kelly_fraction = max(0.0, f_star * shrinkage)
 
+        # Cold-start floor: when Thompson posterior is uniform (Beta(1,1)
+        # ⇒ p=0.5) AND the market is balanced (mp≈0.5) the f_star ≈ 0
+        # and the bot never opens a position despite a high-confidence
+        # FOLLOW signal. Apply a small fixed Kelly so we accumulate
+        # outcomes and the posterior can converge. The hard cap below
+        # still bounds total risk.
+        min_kelly_cold_start = 0.005  # 0.5% of capital
+        if alpha + beta_ <= 6 and kelly_fraction < min_kelly_cold_start:
+            kelly_fraction = min_kelly_cold_start
+
         max_size = settings.PAPER_CAPITAL_USDC * settings.MAX_POSITION_PCT
         if action == "fade":
             max_size *= settings.FADE_SIZE_RATIO
 
         size_usdc = max(0.0, min(kelly_fraction * settings.PAPER_CAPITAL_USDC, max_size))
         if 0.0 < size_usdc < settings.MIN_POSITION_USDC:
-            size_usdc = 0.0
-            kelly_fraction = 0.0
+            size_usdc = float(settings.MIN_POSITION_USDC)  # floor to min, never zero
+            kelly_fraction = max_size / settings.PAPER_CAPITAL_USDC if max_size > 0 else kelly_fraction
 
         return round(kelly_fraction, 4), round(size_usdc, 2)
 

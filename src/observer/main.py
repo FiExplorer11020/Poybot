@@ -65,13 +65,36 @@ async def _load_db_subscriptions(conn, *, wallet_limit: int = 50, token_limit: i
     tokens: set[str] = set()
 
     try:
+        # Mix: top by falcon_score (curated quality) + top by confirmed-
+        # follower count (where the real leader signal lives).
+        # The leaderboard ranks wallets by PnL — but the bot's edge is
+        # the FOLLOWER POOL the leader excites, not the leader's own
+        # accuracy. So we must include both populations: high-pnl
+        # wallets that have a small but reliable follower cluster
+        # already, AND high-influence wallets we may have missed in
+        # the leaderboard.
         wallet_rows = await conn.fetch(
             """
-            SELECT wallet_address
-            FROM leaders
-            WHERE excluded = FALSE
-            ORDER BY falcon_score DESC NULLS LAST
-            LIMIT $1
+            (
+                SELECT wallet_address
+                FROM leaders
+                WHERE excluded = FALSE
+                ORDER BY falcon_score DESC NULLS LAST
+                LIMIT $1
+            )
+            UNION
+            (
+                SELECT fe.leader_wallet AS wallet_address
+                FROM follower_edges fe
+                JOIN leaders l ON l.wallet_address = fe.leader_wallet
+                                AND l.excluded = FALSE
+                WHERE fe.co_occurrences >= 5
+                  AND fe.same_direction_rate >= 0.7
+                GROUP BY fe.leader_wallet
+                HAVING COUNT(*) >= 5
+                ORDER BY COUNT(*) DESC
+                LIMIT $1
+            )
             """,
             wallet_limit,
         )

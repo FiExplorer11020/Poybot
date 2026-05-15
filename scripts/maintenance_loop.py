@@ -42,7 +42,9 @@ FEE_BOOTSTRAP_INTERVAL_S = 3600           # 1 h
 GAMMA_REFRESH_INTERVAL_S = 3600           # 1 h
 PROFILES_RECONCILE_INTERVAL_S = 600       # 10 min
 GRAPH_REBUILD_INTERVAL_S = 21600          # 6 h
-BOOK_CACHE_REFRESH_INTERVAL_S = 1800      # 30 min
+BOOK_CACHE_REFRESH_INTERVAL_S = 120       # 2 min — must be < BOOK_CACHE_TTL_S
+BOOK_CACHE_TTL_S = 600                    # 10 min TTL (>> refresh interval)
+STREAM_TRIM_INTERVAL_S = 300              # 5 min
 
 _running = True
 
@@ -282,6 +284,27 @@ async def rebuild_follower_graph(pool: asyncpg.Pool, *, days: int = 7) -> tuple[
 # Job: book:last cache refresh
 # ──────────────────────────────────────────────────────────────────────
 
+async def trim_runaway_streams(redis_client) -> dict:
+    """Safety net: trim known unbounded Redis streams. The producer-side
+    cap is the primary defense (CLOB_BOOK_STREAM_MAXLEN) but a stale
+    consumer or a producer with an old MAXLEN config can still let
+    book:events:stream balloon and OOM Redis.
+    """
+    caps = {
+        "book:events:stream": 100_000,
+        "trades:stream": 50_000,
+        "mempool:leader_intent": 10_000,
+    }
+    trimmed = {}
+    for stream, cap in caps.items():
+        try:
+            n = await redis_client.xtrim(stream, maxlen=cap, approximate=True)
+            trimmed[stream] = int(n) if n is not None else 0
+        except Exception:
+            pass
+    return trimmed
+
+
 async def refresh_book_cache(redis_client) -> int:
     """For markets where book:last is missing/stale, fetch fresh quotes
     from Polymarket CLOB orderbook endpoint and SET them with a fresh
@@ -340,7 +363,7 @@ async def refresh_book_cache(redis_client) -> int:
                 })
                 key = f"book:last:{row['market_id']}:{token}"
                 try:
-                    await redis_client.set(key, payload, ex=60)
+                    await redis_client.set(key, payload, ex=BOOK_CACHE_TTL_S)
                     refreshed += 1
                 except Exception:
                     pass
@@ -370,6 +393,9 @@ async def main():
     _log("maintenance_loop: started")
 
     # initial pass — run everything once on startup
+    trim_res = await run_with_recovery("stream_trim", trim_runaway_streams, redis_client) or {}
+    _log(f"[startup] stream_trim={trim_res}")
+
     fee_n = await run_with_recovery("fees", bootstrap_fee_snapshots, pool) or 0
     _log(f"[startup] fee_snapshots inserted={fee_n}")
 
@@ -398,6 +424,7 @@ async def main():
         "profiles": time.monotonic(),
         "graph": time.monotonic(),
         "book": time.monotonic(),
+        "trim": time.monotonic(),
     }
 
     while _running:
@@ -434,6 +461,11 @@ async def main():
             n = await run_with_recovery("book", refresh_book_cache, redis_client) or 0
             _log(f"book: refreshed={n}")
             last_run["book"] = now
+
+        if now - last_run["trim"] > STREAM_TRIM_INTERVAL_S:
+            res = await run_with_recovery("stream_trim", trim_runaway_streams, redis_client) or {}
+            _log(f"stream_trim: {res}")
+            last_run["trim"] = now
 
     _log("maintenance_loop: shutting down")
     await pool.close()
