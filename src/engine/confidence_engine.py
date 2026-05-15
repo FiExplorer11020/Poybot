@@ -365,7 +365,12 @@ class ConfidenceEngine:
         context_penalty = follow_penalty if action == "follow" else fade_penalty
         selected_codes = follow_reason_codes if action == "follow" else fade_reason_codes
 
-        if process_score < 0.25:
+        # Tunable floor — was 0.25, lowered to 0.05 to unblock cold-start
+        # decisions when profiler hasn't accumulated stability data yet.
+        # The behavioral-penalty path (follow_penalty/fade_penalty above)
+        # still scales size down for unstable wallets — this gate is
+        # only a "kill switch" for truly degenerate cases.
+        if process_score < 0.05:
             await self._log_decision(
                 wallet,
                 market_id,
@@ -443,7 +448,13 @@ class ConfidenceEngine:
             market_price=market_price,
         )
 
-        penalty_multiplier = max(0.0, 1.0 - context_penalty)
+        # Floor multiplier at 0.20 so behavior penalties scale size DOWN
+        # to 20% of Kelly, never to 0. Pre-fix this zeroed out 18 FOLLOWs
+        # yesterday because every active leader trips behavioral
+        # heuristics (burst_trading, aggressive_scale_in, etc.).
+        # Active = penalized but still tradable; truly degenerate
+        # wallets are caught by the kill-switch process_score < 0.05.
+        penalty_multiplier = max(0.20, 1.0 - context_penalty)
         kelly_fraction = round(kelly_fraction * penalty_multiplier, 4)
         size_usdc = round(size_usdc * penalty_multiplier, 2)
         if 0.0 < size_usdc < settings.MIN_POSITION_USDC:
@@ -1305,6 +1316,17 @@ class ConfidenceEngine:
         if not row:
             return None
         try:
+            # JSONB columns come back from asyncpg as plain strings unless
+            # a codec was registered. Parse them defensively so callers
+            # always see a dict (or {} on parse failure).
+            raw_compat = self._row_value(row, "compatibility", {}) or {}
+            if isinstance(raw_compat, str):
+                try:
+                    raw_compat = json.loads(raw_compat) if raw_compat else {}
+                except Exception:
+                    raw_compat = {}
+            if not isinstance(raw_compat, dict):
+                raw_compat = {}
             return FeeSnapshot(
                 market_id=str(self._row_value(row, "market_id", "")),
                 token_id=str(self._row_value(row, "token_id", "")),
@@ -1313,7 +1335,7 @@ class ConfidenceEngine:
                 maker_fee_rate=Decimal(str(self._row_value(row, "maker_fee_rate", "0"))),
                 source=str(self._row_value(row, "source", "fee_snapshots")),
                 captured_at=self._parse_dt_value(self._row_value(row, "captured_at")),
-                compatibility=dict(self._row_value(row, "compatibility", {}) or {}),
+                compatibility=raw_compat,
                 economic_model_version=str(
                     self._row_value(row, "economic_model_version", ECONOMIC_MODEL_VERSION)
                 ),

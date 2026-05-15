@@ -58,46 +58,65 @@ async def _fetch_active_market_tokens(
 
 
 async def _load_db_subscriptions(conn, *, wallet_limit: int = 50, token_limit: int = 250):
-    wallet_rows = await conn.fetch(
-        """
-        SELECT wallet_address
-        FROM leaders
-        WHERE excluded = FALSE
-        ORDER BY falcon_score DESC NULLS LAST
-        LIMIT $1
-        """,
-        wallet_limit,
-    )
-    trade_token_rows = await conn.fetch(
-        """
-        SELECT token_id
-        FROM trades_observed
-        WHERE NULLIF(token_id, '') IS NOT NULL
-        GROUP BY token_id
-        ORDER BY MAX(time) DESC
-        LIMIT $1
-        """,
-        token_limit,
-    )
-    market_token_rows = await conn.fetch(
-        """
-        SELECT token_yes, token_no
-        FROM markets
-        WHERE active = TRUE
-          AND (NULLIF(token_yes, '') IS NOT NULL OR NULLIF(token_no, '') IS NOT NULL)
-        ORDER BY updated_at DESC NULLS LAST
-        LIMIT $1
-        """,
-        token_limit,
-    )
+    # IMPORTANT: each query is wrapped in its own try/except so a slow / failing
+    # query (e.g. GROUP BY full-scan on trades_observed) doesn't void the whole
+    # bootstrap — the silent root cause of the "0 leader wallets" bug.
+    wallets: set[str] = set()
+    tokens: set[str] = set()
 
-    wallets = {str(row["wallet_address"]) for row in wallet_rows if row["wallet_address"]}
-    tokens = {str(row["token_id"]) for row in trade_token_rows if row["token_id"]}
-    for row in market_token_rows:
-        if row["token_yes"]:
-            tokens.add(str(row["token_yes"]))
-        if row["token_no"]:
-            tokens.add(str(row["token_no"]))
+    try:
+        wallet_rows = await conn.fetch(
+            """
+            SELECT wallet_address
+            FROM leaders
+            WHERE excluded = FALSE
+            ORDER BY falcon_score DESC NULLS LAST
+            LIMIT $1
+            """,
+            wallet_limit,
+        )
+        wallets = {str(row["wallet_address"]) for row in wallet_rows if row["wallet_address"]}
+    except Exception as exc:
+        logger.warning(f"Observer bootstrap: leaders query failed: {exc!r}")
+
+    # Use a time-bounded query that hits the (time DESC) index instead of a
+    # full GROUP BY scan. Cheap path: most recent active tokens last 24h.
+    try:
+        trade_token_rows = await conn.fetch(
+            """
+            SELECT DISTINCT token_id
+            FROM trades_observed
+            WHERE time >= NOW() - INTERVAL '24 hours'
+              AND NULLIF(token_id, '') IS NOT NULL
+            LIMIT $1
+            """,
+            token_limit,
+        )
+        tokens.update(str(r["token_id"]) for r in trade_token_rows if r["token_id"])
+    except Exception as exc:
+        logger.warning(f"Observer bootstrap: recent token query failed: {exc!r}")
+
+    try:
+        market_token_rows = await conn.fetch(
+            """
+            SELECT token_yes, token_no, volume_24h
+            FROM markets
+            WHERE active = TRUE
+              AND end_date > NOW()
+              AND (NULLIF(token_yes, '') IS NOT NULL OR NULLIF(token_no, '') IS NOT NULL)
+            ORDER BY volume_24h DESC NULLS LAST
+            LIMIT $1
+            """,
+            token_limit,
+        )
+        for row in market_token_rows:
+            if row["token_yes"]:
+                tokens.add(str(row["token_yes"]))
+            if row["token_no"]:
+                tokens.add(str(row["token_no"]))
+    except Exception as exc:
+        logger.warning(f"Observer bootstrap: markets query failed: {exc!r}")
+
     return wallets, tokens
 
 
@@ -129,7 +148,7 @@ async def _bootstrap_subscriptions() -> tuple[set[str], set[str]]:
         async with get_db() as conn:
             wallets, tokens = await _load_db_subscriptions(conn)
     except Exception as exc:
-        logger.warning(f"Observer DB subscription bootstrap failed: {exc}")
+        logger.warning(f"Observer DB subscription bootstrap failed: {exc!r}")
 
     async with aiohttp.ClientSession() as session:
         active_tokens = await _fetch_active_market_tokens(session, limit=50)

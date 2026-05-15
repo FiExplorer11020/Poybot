@@ -601,7 +601,7 @@ class StreamConsumer:
                 except Exception:
                     # Will retry on next loop iteration.
                     pass
-            except Exception:
+            except Exception as exc:
                 self._is_connected = False
                 self._total_reconnects += 1
                 self._bump_reconnect()
@@ -613,6 +613,21 @@ class StreamConsumer:
                     f"StreamConsumer({self._stream}/{self._group}): "
                     f"unexpected error in run loop, retrying in {backoff:.1f}s"
                 )
+                # If the consumer group / stream disappeared under us
+                # (NOGROUP), recreate them before the next attempt — the
+                # MKSTREAM=True path will recreate both atomically.
+                # Without this, the engine stays in a crashloop until
+                # someone manually `XGROUP CREATE`s the missing group.
+                if "NOGROUP" in str(exc):
+                    try:
+                        await self._ensure_group()
+                        logger.info(
+                            f"StreamConsumer({self._stream}/{self._group}): "
+                            f"recreated stream + group after NOGROUP"
+                        )
+                    except Exception:
+                        # Will retry on next loop iteration.
+                        pass
                 try:
                     await asyncio.sleep(backoff)
                 except asyncio.CancelledError:
