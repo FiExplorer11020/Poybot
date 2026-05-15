@@ -525,6 +525,16 @@ _HELPER_CACHE_TTLS = {
     "equity_curve_v2": 30.0,
     "market_scanner": 30.0,
     "neural_readiness": 10.0,  # /api/neural-readiness compose health+activation+risk+ml
+    # Phase 1 V2 audit — slow endpoints with high poll frequency:
+    "decisions_200": 5.0,       # /api/decisions?limit=200, 407 KB payload, V2 polls 5s
+    "wallet_universe_500": 30.0, # /api/wallet/universe?limit=500, 94 KB, V2 polls 30s
+    "leaders_200": 30.0,         # /api/leaders?limit=200, 124 KB, V2 polls 30s
+    "inspector_snapshot": 3.0,   # /api/inspector/snapshot, 55 KB, V2 polls 3s, query 5-11s
+    # Phase 2 V2 audit — OPS endpoints filling the R6/R7 gaps:
+    "ops_fee_snapshots": 30.0,
+    "ops_chain_sync": 10.0,
+    "ops_rpc_health": 15.0,
+    "ops_mempool_wallet_index": 15.0,
 }
 
 
@@ -1182,7 +1192,15 @@ async def api_leaders(
     full set). Default `limit=200` covers the Wallet Scanner first
     paint comfortably. Frontends needing more can request additional
     pages via offset.
+
+    Cached 30s on the default V2 query (limit=200, offset=0). Other
+    pages bypass cache for accurate cursor traversal.
     """
+    if limit == 200 and offset == 0:
+        async def _build():
+            async with _pool.acquire() as conn:
+                return await queries.leaders(conn, limit=200, offset=0)
+        return await _cached_helper("leaders_200", _build)
     async with _pool.acquire() as conn:
         return await queries.leaders(conn, limit=limit, offset=offset)
 
@@ -1267,6 +1285,21 @@ async def api_decisions(
     limit: int = Query(default=100, ge=1, le=1000),
     offset: int = Query(default=0, ge=0),
 ):
+    """Recent decisions feed. Cached 5s when paginated default params.
+
+    The V2 ExecutionDecisions sub-tab polls this every 5s with
+    limit=200, generating a 407 KB payload per poll. The cache lets
+    multiple subscribers share one DB roundtrip per 5s window.
+    Custom (limit/offset) params still bypass the cache so drill-down
+    pagination stays accurate.
+    """
+    # Only cache the "default" V2 query (limit=200, offset=0) — other
+    # combos are likely drill-downs that need accurate cursors.
+    if limit == 200 and offset == 0:
+        async def _build():
+            async with _pool.acquire() as conn:
+                return await queries.decisions(conn, limit=200, offset=0)
+        return await _cached_helper("decisions_200", _build)
     async with _pool.acquire() as conn:
         return await queries.decisions(conn, limit=limit, offset=offset)
 
@@ -1597,9 +1630,231 @@ async def api_snapshot_health():
     }
 
 
+# ---------------------------------------------------------------------------
+# OPS endpoints — fill the 4 R6/R7 visibility gaps identified in the V2
+# audit. These surface internal pipeline state (fee_snapshots freshness,
+# onchain verifier cursor, RPC provider liveness, mempool bloom filter
+# size) so the V2 OPERATIONS tab can show real status instead of just
+# "running" / "gated" heuristics.
+# ---------------------------------------------------------------------------
+
+
+@app.get("/api/ops/fee-snapshots/status")
+async def api_ops_fee_snapshots_status():
+    """Fee-snapshot pipeline freshness.
+
+    The economic gate in src/economics/gates.py rejects every
+    FOLLOW/FADE decision unless a fresh (< 24h) fee_snapshot exists
+    for the (market_id, token_id). This endpoint surfaces whether
+    the snapshot pipeline is keeping up.
+
+    Returns: counts per source, latest captured_at, age in hours.
+    Cached 30s — fee_snapshots only get rebuilt every few hours.
+    """
+    async def _build():
+        async with _pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                SELECT
+                    COUNT(*)::int                                   AS total,
+                    COUNT(DISTINCT market_id)::int                  AS unique_markets,
+                    COUNT(DISTINCT (market_id, token_id))::int      AS unique_tokens,
+                    MAX(captured_at)                                AS latest_captured_at,
+                    EXTRACT(EPOCH FROM (NOW() - MAX(captured_at)))::int AS age_seconds
+                FROM fee_snapshots
+                """
+            )
+            sources = await conn.fetch(
+                """
+                SELECT source, COUNT(*)::int AS n, MAX(captured_at) AS latest
+                FROM fee_snapshots GROUP BY source ORDER BY n DESC
+                """
+            )
+        age_s = int(row["age_seconds"] or 0) if row else 0
+        # Stale = older than the gate's max_fee_age (24h)
+        stale = age_s > 24 * 3600
+        return {
+            "total": int(row["total"] or 0) if row else 0,
+            "unique_markets": int(row["unique_markets"] or 0) if row else 0,
+            "unique_tokens": int(row["unique_tokens"] or 0) if row else 0,
+            "latest_captured_at": (
+                row["latest_captured_at"].isoformat()
+                if row and row["latest_captured_at"] else None
+            ),
+            "age_seconds": age_s,
+            "age_hours": round(age_s / 3600, 2),
+            "stale": stale,
+            "by_source": [
+                {
+                    "source": r["source"],
+                    "count": int(r["n"] or 0),
+                    "latest": r["latest"].isoformat() if r["latest"] else None,
+                }
+                for r in sources
+            ],
+        }
+    return await _cached_helper("ops_fee_snapshots", _build)
+
+
+@app.get("/api/ops/chain-sync")
+async def api_ops_chain_sync():
+    """Onchain verifier (R6) cursor + lag.
+
+    The `chain_sync_state` singleton tracks where the verifier mode
+    onchain daemon is in the Polygon chain. We expose:
+      - last_processed_block
+      - last_updated_at + age
+      - blocks_behind_at_write
+      - extra metadata (decoded event types, etc.)
+    """
+    async def _build():
+        async with _pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                SELECT last_processed_block, last_updated_at,
+                       blocks_behind_at_write, metadata
+                FROM chain_sync_state
+                WHERE id = 'singleton'
+                """
+            )
+        if row is None:
+            return {"present": False, "message": "no chain_sync_state row yet — onchain verifier may not have produced a cursor"}
+        age_s = (
+            int((datetime.now(timezone.utc) - row["last_updated_at"]).total_seconds())
+            if row["last_updated_at"] else None
+        )
+        return {
+            "present": True,
+            "last_processed_block": int(row["last_processed_block"] or 0),
+            "last_updated_at": (
+                row["last_updated_at"].isoformat() if row["last_updated_at"] else None
+            ),
+            "age_seconds": age_s,
+            "stale": (age_s or 0) > 300,  # > 5min idle = suspicious
+            "blocks_behind_at_write": int(row["blocks_behind_at_write"] or 0)
+                if row["blocks_behind_at_write"] is not None else None,
+            "metadata": dict(row["metadata"] or {}),
+        }
+    return await _cached_helper("ops_chain_sync", _build)
+
+
+@app.get("/api/ops/rpc-health")
+async def api_ops_rpc_health():
+    """RPC provider liveness (alchemy / quicknode / local_erigon).
+
+    Reads the most recent `rpc_health_history` row per provider with
+    a quick aggregate of success rate over the last hour. Surfaces:
+      - per-provider availability + circuit state
+      - latency_ms (latest)
+      - success rate 1h
+    """
+    async def _build():
+        async with _pool.acquire() as conn:
+            providers = await conn.fetch(
+                """
+                SELECT DISTINCT ON (provider)
+                    provider, observed_at, available,
+                    latency_ms, circuit_state, detail
+                FROM rpc_health_history
+                ORDER BY provider, observed_at DESC
+                """
+            )
+            rates = await conn.fetch(
+                """
+                SELECT provider,
+                       COUNT(*) FILTER (WHERE available)::float / NULLIF(COUNT(*), 0) AS success_rate_1h,
+                       COUNT(*)::int AS samples_1h,
+                       AVG(latency_ms)::float AS avg_latency_ms_1h
+                FROM rpc_health_history
+                WHERE observed_at >= NOW() - INTERVAL '1 hour'
+                GROUP BY provider
+                """
+            )
+            rates_map = {
+                r["provider"]: {
+                    "success_rate_1h": float(r["success_rate_1h"] or 0),
+                    "samples_1h": int(r["samples_1h"] or 0),
+                    "avg_latency_ms_1h": float(r["avg_latency_ms_1h"] or 0),
+                }
+                for r in rates
+            }
+        out = []
+        for p in providers:
+            stat = rates_map.get(p["provider"], {})
+            out.append({
+                "provider": p["provider"],
+                "latest_observed_at": (
+                    p["observed_at"].isoformat() if p["observed_at"] else None
+                ),
+                "available": bool(p["available"]),
+                "latency_ms": int(p["latency_ms"] or 0) if p["latency_ms"] is not None else None,
+                "circuit_state": p["circuit_state"],
+                "success_rate_1h": stat.get("success_rate_1h"),
+                "samples_1h": stat.get("samples_1h", 0),
+                "avg_latency_ms_1h": stat.get("avg_latency_ms_1h"),
+                "detail": dict(p["detail"] or {}),
+            })
+        return {"providers": out, "total_providers": len(out)}
+    return await _cached_helper("ops_rpc_health", _build)
+
+
+@app.get("/api/mempool/wallet-index")
+async def api_mempool_wallet_index():
+    """R7 mempool bloom-filter inspector.
+
+    The mempool daemon maintains a Bloom filter of watched wallets
+    (see src/mempool/wallet_index.py). We can't introspect the
+    in-memory filter from a different process, but we CAN compute
+    the universe size (what the filter SHOULD have) by counting
+    the same wallets the daemon refreshes from.
+
+    Returns: target size + last refresh hint via Redis key if set.
+    """
+    async def _build():
+        async with _pool.acquire() as conn:
+            n = await conn.fetchval(
+                "SELECT COUNT(*) FROM wallet_universe"
+            )
+        # The wallet_index daemon may publish freshness via Redis.
+        # We expose what's there — None if it doesn't.
+        last_refresh = None
+        wallet_count = None
+        try:
+            if _redis is not None:
+                lr = await _redis.get("mempool:wallet_index:last_refresh_at")
+                wc = await _redis.get("mempool:wallet_index:wallet_count")
+                last_refresh = lr if lr else None
+                wallet_count = int(wc) if wc and str(wc).isdigit() else None
+        except Exception:
+            pass
+        target_size = int(n or 0)
+        return {
+            "target_size": target_size,
+            "wallet_count_in_filter": wallet_count,
+            "last_refresh_at": last_refresh,
+            "gap": (
+                (target_size - wallet_count)
+                if wallet_count is not None else None
+            ),
+        }
+    return await _cached_helper("ops_mempool_wallet_index", _build)
+
+
 @app.get("/api/inspector/snapshot")
 async def api_inspector_snapshot(limit: int = Query(80, ge=10, le=500)):
-    """Pipeline observability snapshot for the INSPECTOR dashboard tab."""
+    """Pipeline observability snapshot for the INSPECTOR dashboard tab.
+
+    Cached 3s — the underlying queries (with parallel asyncio.gather
+    inside queries.inspector_snapshot) still take 3-5s due to the
+    LEFT JOIN markets × trades_observed. Caching at 3s aligns with
+    the V2 ExecutionInspector poll interval and gives near-instant
+    response on warm cache.
+    """
+    if limit == 80:
+        async def _build():
+            async with _pool.acquire() as conn:
+                return await queries.inspector_snapshot(conn, redis_client=_redis, limit=80)
+        return await _cached_helper("inspector_snapshot", _build)
     async with _pool.acquire() as conn:
         return await queries.inspector_snapshot(conn, redis_client=_redis, limit=limit)
 
@@ -3094,7 +3349,21 @@ async def api_intelligence_causal_instruments():
 @app.get("/api/wallet/universe")
 async def api_wallet_universe(limit: int = 200):
     """R6 wallet_universe browser. Joins on depth_tier + strategy_class
-    where available."""
+    where available.
+
+    Cached 30s when called with the default V2 limit (500) so the
+    Wallet Lab → Universe sub-tab + the V2 sidebar both share one
+    DB roundtrip per 30s window.
+    """
+    if limit == 500:
+        return await _cached_helper(
+            "wallet_universe_500",
+            lambda: _api_wallet_universe_uncached(500),
+        )
+    return await _api_wallet_universe_uncached(limit)
+
+
+async def _api_wallet_universe_uncached(limit: int = 200):
     try:
         limit = max(1, min(int(limit), 1000))
         async with _pool.acquire() as conn:

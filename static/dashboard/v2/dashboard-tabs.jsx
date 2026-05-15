@@ -1659,8 +1659,115 @@ const RiskKnob = ({ label, value }) => (
 const OperationsHealth = () => {
   const { data: health, loading } = useApi('/api/data-quality', { interval: 10000 });
   const { data: daemons } = useApi('/api/system', { interval: 5000 });
+  // New OPS endpoints (Phase 2 V2 audit) — fee_snapshots freshness,
+  // chain sync cursor, RPC provider liveness, mempool bloom filter
+  // status. Each cached server-side so the polling cost is minimal.
+  const { data: feeSnapshots } = useApi('/api/ops/fee-snapshots/status', { interval: 30000 });
+  const { data: chainSync }    = useApi('/api/ops/chain-sync', { interval: 10000 });
+  const { data: rpcHealth }    = useApi('/api/ops/rpc-health', { interval: 15000 });
+  const { data: walletIndex }  = useApi('/api/mempool/wallet-index', { interval: 15000 });
+  // /api/snapshot/health surfaces the background snapshot rebuilder
+  // (Phase 2 of the V1 audit). When status="degraded" or
+  // consecutive_failures > 0, the dashboard's KPIs may be stale.
+  const { data: snapshotHealth } = useApi('/api/snapshot/health', { interval: 5000 });
+
   return (
     <div style={{ padding: 'var(--section-padding)', display: 'flex', flexDirection: 'column', gap: 'var(--grid-gap)' }}>
+      {/* --- New: PIPELINE HEALTH STRIP (5 KPIs at top of Operations/Health) */}
+      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(5, 1fr)', gap: 'var(--grid-gap)' }}>
+        <div style={{ background: T.bg.input, padding: 12, borderRadius: 'var(--radius-md)' }}>
+          <div style={{ fontSize: 'var(--font-size-xs)', color: T.text.tertiary, textTransform: 'uppercase', letterSpacing: 'var(--letter-spacing-wide)' }}>SNAPSHOT</div>
+          <div style={{ fontSize: 18, fontWeight: 600, color: snapshotHealth?.status === 'ok' ? T.status.ok : T.status.warn, marginTop: 4 }}>
+            {(snapshotHealth?.status || '—').toUpperCase()}
+          </div>
+          <div style={{ fontSize: 'var(--font-size-xs)', color: T.text.tertiary, marginTop: 4, fontFamily: 'var(--font-mono)' }}>
+            {snapshotHealth?.staleness_s != null ? `${snapshotHealth.staleness_s.toFixed(1)}s` : '—'} stale · {snapshotHealth?.last_duration_ms ? `${(snapshotHealth.last_duration_ms / 1000).toFixed(1)}s` : '—'} build
+          </div>
+        </div>
+        <div style={{ background: T.bg.input, padding: 12, borderRadius: 'var(--radius-md)' }}>
+          <div style={{ fontSize: 'var(--font-size-xs)', color: T.text.tertiary, textTransform: 'uppercase', letterSpacing: 'var(--letter-spacing-wide)' }}>FEE SNAPSHOTS</div>
+          <div style={{ fontSize: 18, fontWeight: 600, color: feeSnapshots?.stale ? T.status.err : T.status.ok, marginTop: 4 }}>
+            {feeSnapshots?.total ?? '—'}
+          </div>
+          <div style={{ fontSize: 'var(--font-size-xs)', color: T.text.tertiary, marginTop: 4, fontFamily: 'var(--font-mono)' }}>
+            {feeSnapshots?.age_hours != null ? `${feeSnapshots.age_hours.toFixed(1)}h` : '—'} age · {feeSnapshots?.stale ? 'STALE' : 'OK'}
+          </div>
+        </div>
+        <div style={{ background: T.bg.input, padding: 12, borderRadius: 'var(--radius-md)' }}>
+          <div style={{ fontSize: 'var(--font-size-xs)', color: T.text.tertiary, textTransform: 'uppercase', letterSpacing: 'var(--letter-spacing-wide)' }}>CHAIN SYNC (R6)</div>
+          <div style={{ fontSize: 18, fontWeight: 600, color: chainSync?.stale ? T.status.warn : T.status.ok, marginTop: 4 }}>
+            {chainSync?.present
+              ? (chainSync?.last_processed_block != null ? `#${chainSync.last_processed_block.toLocaleString()}` : '—')
+              : 'idle'}
+          </div>
+          <div style={{ fontSize: 'var(--font-size-xs)', color: T.text.tertiary, marginTop: 4, fontFamily: 'var(--font-mono)' }}>
+            {chainSync?.age_seconds != null ? `${chainSync.age_seconds}s` : '—'} ago
+          </div>
+        </div>
+        <div style={{ background: T.bg.input, padding: 12, borderRadius: 'var(--radius-md)' }}>
+          <div style={{ fontSize: 'var(--font-size-xs)', color: T.text.tertiary, textTransform: 'uppercase', letterSpacing: 'var(--letter-spacing-wide)' }}>RPC PROVIDERS</div>
+          <div style={{ fontSize: 18, fontWeight: 600, color: T.text.primary, marginTop: 4 }}>
+            {rpcHealth?.total_providers ?? '—'}
+          </div>
+          <div style={{ fontSize: 'var(--font-size-xs)', color: T.text.tertiary, marginTop: 4, fontFamily: 'var(--font-mono)' }}>
+            {rpcHealth?.providers?.filter(p => p.available).length ?? 0} up / {rpcHealth?.total_providers ?? 0}
+          </div>
+        </div>
+        <div style={{ background: T.bg.input, padding: 12, borderRadius: 'var(--radius-md)' }}>
+          <div style={{ fontSize: 'var(--font-size-xs)', color: T.text.tertiary, textTransform: 'uppercase', letterSpacing: 'var(--letter-spacing-wide)' }}>WATCHED WALLETS</div>
+          <div style={{ fontSize: 18, fontWeight: 600, color: T.text.primary, marginTop: 4 }}>
+            {walletIndex?.target_size ?? '—'}
+          </div>
+          <div style={{ fontSize: 'var(--font-size-xs)', color: T.text.tertiary, marginTop: 4, fontFamily: 'var(--font-mono)' }}>
+            R7 bloom filter target
+          </div>
+        </div>
+      </div>
+
+      {/* RPC provider liveness table */}
+      {rpcHealth?.providers?.length > 0 && (
+        <Panel title="RPC PROVIDERS — last hour">
+          <DataTable
+            dense
+            columns={[
+              { key: 'provider', label: 'PROVIDER' },
+              {
+                key: 'available',
+                label: 'STATUS',
+                render: (v, row) => <StatusPill
+                  status={v ? 'ok' : 'err'}
+                  label={`${v ? 'UP' : 'DOWN'} · ${row.circuit_state}`}
+                />,
+              },
+              {
+                key: 'success_rate_1h',
+                label: 'SUCCESS 1H',
+                align: 'right',
+                render: v => v != null ? `${(v * 100).toFixed(1)}%` : '—',
+              },
+              {
+                key: 'avg_latency_ms_1h',
+                label: 'AVG LATENCY',
+                align: 'right',
+                render: v => v ? `${Math.round(v)}ms` : '—',
+              },
+              {
+                key: 'samples_1h',
+                label: 'SAMPLES 1H',
+                align: 'right',
+              },
+              {
+                key: 'latest_observed_at',
+                label: 'LATEST',
+                render: v => v ? new Date(v).toLocaleTimeString('en-GB') : '—',
+              },
+            ]}
+            rows={rpcHealth.providers}
+            rowKey={r => r.provider}
+          />
+        </Panel>
+      )}
+
       <Panel title="DAEMON REGISTRY">
         {daemons?.daemons?.length ? (
           <DataTable
