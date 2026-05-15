@@ -235,6 +235,33 @@ class ConfidenceEngine:
             )
             return None
 
+        # Liquidity gate: skip markets with no realized volume in the
+        # last 24h. Backtest (24h decisions) showed 62% of FOLLOWs were
+        # on illiquid markets with NO follow-up trade activity — useless
+        # for trading even if all other gates pass. Threshold $5k matches
+        # the maintenance loop's coverage tier.
+        try:
+            async with get_db() as conn:
+                vol_row = await conn.fetchrow(
+                    "SELECT volume_24h FROM markets WHERE market_id = $1",
+                    market_id,
+                )
+            market_volume = float(vol_row["volume_24h"] or 0) if vol_row else 0.0
+        except Exception:
+            market_volume = 0.0
+        if market_volume < 5000.0:
+            await self._log_decision(
+                wallet,
+                market_id,
+                "skip",
+                0.0,
+                0.0,
+                0.0,
+                market_volume,
+                f"low_market_liquidity|vol24h={market_volume:.0f}",
+            )
+            return None
+
         readiness = await self._get_readiness(wallet)
         # Use adaptive thresholds (refreshed periodically by the engine
         # scheduler) so cold-start gates relax automatically once the
@@ -1380,38 +1407,95 @@ class ConfidenceEngine:
             return None
 
     async def _load_book_snapshot(self, market_id: str, token_id: str) -> BookSnapshotRef | None:
+        """Read book:last cache, fall back to just-in-time CLOB fetch.
+
+        The maintenance loop refreshes top-1500 markets every 2 min. For
+        markets outside that set (which leaders trade often), the cache
+        is empty. Rather than rejecting with `missing_book_snapshot`,
+        we do a synchronous CLOB book fetch (1-2s) so the gate passes
+        for the long tail. This sub-routine is also what populates the
+        cache for the next decision on the same market.
+        """
         if self._redis is None:
             return None
         try:
             raw = await self._redis.get(f"book:last:{market_id}:{token_id}")
         except Exception as exc:
             logger.warning(f"Live book lookup failed for {market_id}/{token_id}: {exc}")
-            return None
-        if not raw:
-            return None
+            raw = None
+
+        if raw:
+            try:
+                payload = json.loads(raw) if isinstance(raw, str) else dict(raw)
+                best_bid = payload.get("best_bid")
+                best_ask = payload.get("best_ask")
+                if best_bid is not None and best_ask is not None:
+                    observed = (
+                        payload.get("captured_at")
+                        or payload.get("observed_at")
+                        or payload.get("observed_ts")
+                        or payload.get("source_timestamp")
+                    )
+                    return BookSnapshotRef(
+                        market_id=market_id,
+                        token_id=token_id,
+                        best_bid=Decimal(str(best_bid)),
+                        best_ask=Decimal(str(best_ask)),
+                        captured_at=self._parse_dt_value(observed),
+                        source=str(payload.get("source", "redis_book_last")),
+                        reference=payload,
+                    )
+            except Exception as exc:
+                logger.warning(f"Invalid live book snapshot ignored for {market_id}/{token_id}: {exc}")
+
+        # Just-in-time fallback: fetch from CLOB and cache.
         try:
-            payload = json.loads(raw) if isinstance(raw, str) else dict(raw)
-            best_bid = payload.get("best_bid")
-            best_ask = payload.get("best_ask")
-            if best_bid is None or best_ask is None:
+            import aiohttp
+            import time as _time
+            headers = {"User-Agent": "polymarket-leader-bot/1.0"}
+            url = f"https://clob.polymarket.com/book?token_id={token_id}"
+            timeout = aiohttp.ClientTimeout(total=3)
+            async with aiohttp.ClientSession(headers=headers, timeout=timeout) as session:
+                async with session.get(url) as resp:
+                    if resp.status != 200:
+                        return None
+                    data = await resp.json()
+            bids = data.get("bids") or []
+            asks = data.get("asks") or []
+            if not bids or not asks:
                 return None
-            observed = (
-                payload.get("captured_at")
-                or payload.get("observed_at")
-                or payload.get("observed_ts")
-                or payload.get("source_timestamp")
-            )
+            best_bid = str(bids[0].get("price"))
+            best_ask = str(asks[0].get("price"))
+            now_ts = _time.time()
+            payload = {
+                "market_id": market_id,
+                "token_id": token_id,
+                "best_bid": best_bid,
+                "best_ask": best_ask,
+                "observed_ts": now_ts,
+                "captured_at": now_ts,
+                "source": "jit_fetch",
+            }
+            # Cache for the next decision
+            try:
+                await self._redis.set(
+                    f"book:last:{market_id}:{token_id}",
+                    json.dumps(payload),
+                    ex=600,
+                )
+            except Exception:
+                pass
             return BookSnapshotRef(
                 market_id=market_id,
                 token_id=token_id,
-                best_bid=Decimal(str(best_bid)),
-                best_ask=Decimal(str(best_ask)),
-                captured_at=self._parse_dt_value(observed),
-                source=str(payload.get("source", "redis_book_last")),
+                best_bid=Decimal(best_bid),
+                best_ask=Decimal(best_ask),
+                captured_at=datetime.fromtimestamp(now_ts, tz=timezone.utc),
+                source="jit_fetch",
                 reference=payload,
             )
         except Exception as exc:
-            logger.warning(f"Invalid live book snapshot ignored for {market_id}/{token_id}: {exc}")
+            logger.debug(f"JIT book fetch failed for {market_id}/{token_id}: {exc}")
             return None
 
     async def _record_signal_rejection(self, reason: str, decision: Decision) -> None:
