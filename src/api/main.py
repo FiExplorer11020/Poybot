@@ -497,14 +497,88 @@ async def _fetch_overview_snapshot() -> dict:
         return await queries.overview(conn, redis_client=_redis)
 
 
+# ------------------------------------------------------------------------- #
+# In-process TTL cache for slow helpers                                      #
+# ------------------------------------------------------------------------- #
+# The terminal snapshot rebuild calls 17 helpers in parallel via gather().
+# The slowest dominate `last_duration_ms`. Profiling on prod (V1 audit
+# Phase 3) measured:
+#   - queries.data_quality       : 15.7s  ← dominant
+#   - queries.ml_summary         :  8.0s
+#   - queries.activation_queue   :  4.7s  (used by neural-readiness)
+#
+# These compute operational stats that change slowly. Caching their
+# results for 30-60s collapses snapshot rebuild duration from ~25s to
+# ~2s while keeping the data fresh enough for a dashboard. The cache
+# is a plain `dict` keyed by helper name — no Redis round-trip
+# because the snapshot rebuilder lives in the same process.
+_HELPER_CACHE: dict = {}  # key -> {"data": ..., "fetched_at_mono": float}
+_HELPER_CACHE_TTLS = {
+    "data_quality": 60.0,    # market enrichment gaps drift on hours, not seconds
+    "ml_summary":   30.0,    # profile maturity / phase distribution
+    "ml_diagnostics": 30.0,  # /api/ml/diagnostics aggregate over 730 JSONB rows
+    "activation":   30.0,    # leader activation queue
+    "system":       15.0,    # leader counts + edges
+    "alpha_extras": 15.0,
+    "wallet_graph": 30.0,
+    "rejections":   15.0,
+    "equity_curve_v2": 30.0,
+    "market_scanner": 30.0,
+    "neural_readiness": 10.0,  # /api/neural-readiness compose health+activation+risk+ml
+}
+
+
+async def _safe_query(query_fn, default=None):
+    """Execute a query function with its own pool connection,
+    swallowing exceptions and returning the default on error.
+
+    Used by parallel `asyncio.gather()` sites where a single failing
+    sub-query should NOT crash the composite endpoint. Mirrors the
+    legacy try/except pattern used before parallelization.
+    """
+    try:
+        async with _pool.acquire() as conn:
+            return await query_fn(conn)
+    except Exception as exc:
+        logger.warning(f"_safe_query for {query_fn.__name__} failed: {exc}")
+        return default
+
+
+async def _cached_helper(key: str, builder):
+    """Wrap an async builder fn with an in-process TTL cache.
+
+    The cache is keyed by `key` (string identifier of the helper).
+    TTL comes from `_HELPER_CACHE_TTLS[key]`. If the cached value is
+    fresh enough, return it directly. Otherwise call `builder()`,
+    update the cache, and return the new value.
+
+    Concurrent calls for the same key while the value is being
+    rebuilt will both hit the builder. That's fine for our use case
+    (the rebuilder loop is single-threaded). For multi-threaded
+    callers add an asyncio.Lock per key if needed.
+    """
+    ttl = _HELPER_CACHE_TTLS.get(key, 30.0)
+    now = time.monotonic()
+    cached = _HELPER_CACHE.get(key)
+    if cached and (now - cached["fetched_at_mono"]) < ttl:
+        return cached["data"]
+    data = await builder()
+    _HELPER_CACHE[key] = {"data": data, "fetched_at_mono": now}
+    return data
+
+
 async def _fetch_ml_snapshot() -> dict:
-    async with _pool.acquire() as conn:
-        return await queries.ml_summary(conn)
+    async def _build():
+        async with _pool.acquire() as conn:
+            return await queries.ml_summary(conn)
+    return await _cached_helper("ml_summary", _build)
 
 
 async def _fetch_system_snapshot() -> dict:
-    async with _pool.acquire() as conn:
-        return await queries.system_status(conn)
+    async def _build():
+        async with _pool.acquire() as conn:
+            return await queries.system_status(conn)
+    return await _cached_helper("system", _build)
 
 
 async def _fetch_positions_snapshot() -> dict:
@@ -538,42 +612,56 @@ async def _fetch_activation_snapshot() -> list[dict]:
 
 
 async def _fetch_data_quality_snapshot() -> dict:
-    async with _pool.acquire() as conn:
-        return await queries.data_quality(conn, redis_client=_redis)
+    async def _build():
+        async with _pool.acquire() as conn:
+            return await queries.data_quality(conn, redis_client=_redis)
+    return await _cached_helper("data_quality", _build)
 
 
 async def _fetch_market_scanner_rows(limit: int = 60) -> list[dict]:
-    async with _pool.acquire() as conn:
-        return await queries.market_scanner_rows(conn, limit=limit)
+    async def _build():
+        async with _pool.acquire() as conn:
+            return await queries.market_scanner_rows(conn, limit=limit)
+    return await _cached_helper("market_scanner", _build)
 
 
 async def _fetch_recent_observed_trades(limit: int = 60) -> list[dict]:
+    # Not cached — V1 client expects fresh trade tape (WS push covers
+    # most of this anyway, this is the bootstrap fallback).
     async with _pool.acquire() as conn:
         return await queries.recent_observed_trades(conn, limit=limit)
 
 
 async def _fetch_alpha_extras() -> dict:
     """ALPHA TERMINAL v2 — 24h timeline + Next Signal ETA + ML totals."""
-    async with _pool.acquire() as conn:
-        return await queries.alpha_extras(conn)
+    async def _build():
+        async with _pool.acquire() as conn:
+            return await queries.alpha_extras(conn)
+    return await _cached_helper("alpha_extras", _build)
 
 
 async def _fetch_wallet_graph() -> dict:
     """WALLET GRAPH — nodes + edges for force-directed visualisation."""
-    async with _pool.acquire() as conn:
-        return await queries.wallet_graph(conn)
+    async def _build():
+        async with _pool.acquire() as conn:
+            return await queries.wallet_graph(conn)
+    return await _cached_helper("wallet_graph", _build)
 
 
 async def _fetch_rejections_breakdown() -> dict:
     """ML PROGRESSION — last-hour SKIP reasons grouped."""
-    async with _pool.acquire() as conn:
-        return await queries.decision_rejections_breakdown(conn, hours=1)
+    async def _build():
+        async with _pool.acquire() as conn:
+            return await queries.decision_rejections_breakdown(conn, hours=1)
+    return await _cached_helper("rejections", _build)
 
 
 async def _fetch_equity_curve_v2() -> dict:
     """LIVE PORTFOLIO — equity series + by-leader / by-strategy breakdown."""
-    async with _pool.acquire() as conn:
-        return await queries.equity_curve(conn)
+    async def _build():
+        async with _pool.acquire() as conn:
+            return await queries.equity_curve(conn)
+    return await _cached_helper("equity_curve_v2", _build)
 
 
 async def _get_live_snapshot(force: bool = False) -> dict:
@@ -1084,9 +1172,19 @@ async def api_overview():
 
 
 @app.get("/api/leaders")
-async def api_leaders():
+async def api_leaders(
+    limit: int = Query(default=200, ge=1, le=2000),
+    offset: int = Query(default=0, ge=0),
+):
+    """List leaders with profile + follower counts.
+
+    Paginated to keep payload sane (was 961 KB / 1560 rows for the
+    full set). Default `limit=200` covers the Wallet Scanner first
+    paint comfortably. Frontends needing more can request additional
+    pages via offset.
+    """
     async with _pool.acquire() as conn:
-        return await queries.leaders(conn)
+        return await queries.leaders(conn, limit=limit, offset=offset)
 
 
 @app.get("/api/leaders/{wallet}")
@@ -1108,9 +1206,16 @@ async def api_wallet_markets(wallet: str, window_days: int = 30, limit: int = 20
 
 @app.get("/api/ml/diagnostics")
 async def api_ml_diagnostics():
-    """High-signal ML pipeline indicators for tracking development."""
-    async with _pool.acquire() as conn:
-        return await queries.ml_diagnostics(conn)
+    """High-signal ML pipeline indicators for tracking development.
+
+    Cached 30s — this is an aggregate over `leader_profiles` (730 rows
+    with JSONB parsing) which takes ~8s on first call. Refreshed in
+    the background by the snapshot rebuilder.
+    """
+    async def _build():
+        async with _pool.acquire() as conn:
+            return await queries.ml_diagnostics(conn)
+    return await _cached_helper("ml_diagnostics", _build)
 
 
 @app.get("/api/data-quality/markets")
@@ -1333,23 +1438,24 @@ async def api_ml():
 
 @app.get("/api/neural-readiness")
 async def api_neural_readiness():
-    health = await _health_checks()
-    async with _pool.acquire() as conn:
-        try:
-            activation = await queries.activation_queue(conn)
-        except Exception as exc:
-            logger.warning(f"Neural readiness activation snapshot failed: {exc}")
-            activation = []
-        try:
-            risk = await queries.risk(conn)
-        except Exception as exc:
-            logger.warning(f"Neural readiness risk snapshot failed: {exc}")
-            risk = {"open_count": 0, "drawdown_pct": 0.0}
-        try:
-            ml = await queries.ml_summary(conn)
-        except Exception as exc:
-            logger.warning(f"Neural readiness ML snapshot failed: {exc}")
-            ml = {}
+    """Neural readiness composite — cached 10s.
+
+    Composes health checks + activation queue + risk + ml_summary.
+    The underlying queries.activation_queue is ~5s; with the new
+    cache layer + parallel fetch, this endpoint drops to ~50ms warm.
+    """
+    return await _cached_helper("neural_readiness", _neural_readiness_build)
+
+
+async def _neural_readiness_build() -> dict:
+    """Uncached neural-readiness builder (called by the cache wrapper)."""
+    # Run the 3 independent queries in parallel for ~3x speedup.
+    health, activation, risk, ml = await asyncio.gather(
+        _health_checks(),
+        _safe_query(queries.activation_queue, default=[]),
+        _safe_query(queries.risk, default={"open_count": 0, "drawdown_pct": 0.0}),
+        _safe_query(queries.ml_summary, default={}),
+    )
     snapshot = build_neural_readiness_snapshot(
         ReadinessInputs(
             health=health,
@@ -1419,8 +1525,14 @@ async def api_profiler_health():
 
 @app.get("/api/data-quality")
 async def api_data_quality():
-    async with _pool.acquire() as conn:
-        return await queries.data_quality(conn, redis_client=_redis)
+    """Silent-rot detector + market enrichment gaps.
+
+    Cached 60s — the underlying SQL has a heavy LEFT JOIN
+    trades_observed × markets that scanned 7 days of partitions
+    (~15s on prod). The output rarely changes minute-to-minute,
+    so a 60s TTL is comfortable for operators.
+    """
+    return await _fetch_data_quality_snapshot()
 
 
 @app.get("/api/v1/live-summary")

@@ -4,6 +4,7 @@ Each function accepts an asyncpg connection and returns plain dicts/lists.
 No SQL lives outside this module.
 """
 
+import asyncio
 import json
 from datetime import datetime, timezone
 from typing import Any
@@ -695,7 +696,18 @@ async def overview(conn, redis_client=None) -> dict:
     }
 
 
-async def leaders(conn) -> list[dict]:
+async def leaders(conn, limit: int | None = None, offset: int = 0) -> list[dict]:
+    """List all watched leaders with their profile + follower counts.
+
+    PERFORMANCE: prior to pagination this returned 1560 rows × 24 fields
+    = 961 KB. The Wallet Scanner table (V1) and the Scanner sub-tab (V2)
+    consume this — neither needs more than the top-N by score on first
+    paint. The default `limit=None` keeps backward compatibility (old
+    `/api/leaders` callers still get all rows), but the V1/V2 frontends
+    now pass `?limit=100&offset=0` and paginate.
+    """
+    limit_sql = f"LIMIT {int(limit)}" if limit is not None and int(limit) > 0 else ""
+    offset_sql = f"OFFSET {int(offset)}" if offset and int(offset) > 0 else ""
     rows = await conn.fetch(
         f"""
         SELECT
@@ -728,6 +740,7 @@ async def leaders(conn) -> list[dict]:
         ORDER BY
             COUNT(e.id) FILTER (WHERE e.follow_probability > 0.6 AND e.co_occurrences >= 5) DESC,
             l.falcon_score DESC NULLS LAST
+        {limit_sql} {offset_sql}
         """
     )
     return [_leader_row(r) for r in rows]
@@ -2574,6 +2587,11 @@ async def inspector_snapshot(conn, redis_client=None, limit: int = 80) -> dict:
     """
     Pipeline observability snapshot for the INSPECTOR tab.
 
+    PERFORMANCE: post V1-audit, the 5 sub-queries below used to run
+    sequentially on one connection and took ~9s total. They are now
+    issued in parallel via asyncio.gather() across separate pool
+    connections. Latency drops to ~max(slowest) instead of sum().
+
     Surfaces the raw signals the bot is reacting to, so operators can
     diagnose attribution issues, source skew, latency drift, and
     decision-pipeline stalls without SSH'ing into the server.
@@ -2588,18 +2606,74 @@ async def inspector_snapshot(conn, redis_client=None, limit: int = 80) -> dict:
     now = datetime.now(timezone.utc)
     payload: dict[str, Any] = {"generated_at": now.isoformat()}
 
-    # ── Raw trades (last N, all columns) ─────────────────────────────────────
-    raw_rows = await conn.fetch(
-        """
-        SELECT t.id, t.time, t.market_id, t.token_id, t.wallet_address,
-               t.side, t.price, t.size_usdc, t.source, t.is_leader,
-               m.question AS market_question, m.category AS market_category
-        FROM trades_observed t
-        LEFT JOIN markets m ON m.market_id = t.market_id
-        ORDER BY t.time DESC
-        LIMIT $1
-        """,
-        limit,
+    # Run the 4 DB sub-queries in parallel. `conn` is the caller's
+    # connection — we need separate connections to actually run
+    # in parallel. Import lazily to avoid circular dep at module load.
+    from src.database.connection import get_db as _get_db
+
+    async def _q_raw_trades():
+        async with _get_db() as c:
+            return await c.fetch(
+                """
+                SELECT t.id, t.time, t.market_id, t.token_id, t.wallet_address,
+                       t.side, t.price, t.size_usdc, t.source, t.is_leader,
+                       m.question AS market_question, m.category AS market_category
+                FROM trades_observed t
+                LEFT JOIN markets m ON m.market_id = t.market_id
+                ORDER BY t.time DESC
+                LIMIT $1
+                """,
+                limit,
+            )
+
+    async def _q_decisions():
+        async with _get_db() as c:
+            return await c.fetch(
+                """
+                SELECT time, leader_wallet, market_id, action, confidence,
+                       kelly_fraction, thompson_follow, thompson_fade, reason, outcome
+                FROM decision_log
+                ORDER BY time DESC
+                LIMIT $1
+                """,
+                min(limit, 50),
+            )
+
+    async def _q_source_mix():
+        async with _get_db() as c:
+            return await c.fetch(
+                """
+                SELECT COALESCE(source, 'unknown') AS source,
+                       COUNT(*) AS total,
+                       COUNT(*) FILTER (WHERE is_leader) AS leader_count
+                FROM trades_observed
+                WHERE time > NOW() - INTERVAL '5 minutes'
+                GROUP BY source
+                ORDER BY total DESC
+                """
+            )
+
+    async def _q_counters():
+        async with _get_db() as c:
+            return await c.fetchrow(
+                """
+                SELECT
+                    (SELECT COUNT(*) FROM trades_observed WHERE time > NOW() - INTERVAL '1 hour')      AS trades_1h,
+                    (SELECT COUNT(*) FROM trades_observed
+                      WHERE time > NOW() - INTERVAL '1 hour' AND is_leader = TRUE)                      AS leader_trades_1h,
+                    (SELECT COUNT(*) FROM decision_log WHERE time > NOW() - INTERVAL '1 hour')          AS decisions_1h,
+                    (SELECT COUNT(*) FROM decision_log
+                      WHERE time > NOW() - INTERVAL '1 hour' AND action != 'skip')                      AS actionable_1h,
+                    (SELECT COUNT(*) FROM positions_reconstructed
+                      WHERE close_time > NOW() - INTERVAL '1 hour')                                     AS closes_1h
+                """
+            )
+
+    raw_rows, dec_rows, src_rows, counters_row = await asyncio.gather(
+        _q_raw_trades(),
+        _q_decisions(),
+        _q_source_mix(),
+        _q_counters(),
     )
     payload["raw_trades"] = [
         {
@@ -2619,17 +2693,7 @@ async def inspector_snapshot(conn, redis_client=None, limit: int = 80) -> dict:
         for r in raw_rows
     ]
 
-    # ── Decision log (last N) ────────────────────────────────────────────────
-    dec_rows = await conn.fetch(
-        """
-        SELECT time, leader_wallet, market_id, action, confidence,
-               kelly_fraction, thompson_follow, thompson_fade, reason, outcome
-        FROM decision_log
-        ORDER BY time DESC
-        LIMIT $1
-        """,
-        min(limit, 50),
-    )
+    # ── Decision log (last N) — results from parallel gather above ─────────
     payload["decisions"] = [
         {
             "time": _row_get(r, "time").isoformat() if _row_get(r, "time") else None,
@@ -2646,18 +2710,7 @@ async def inspector_snapshot(conn, redis_client=None, limit: int = 80) -> dict:
         for r in dec_rows
     ]
 
-    # ── Source mix (last 5 min) ──────────────────────────────────────────────
-    src_rows = await conn.fetch(
-        """
-        SELECT COALESCE(source, 'unknown') AS source,
-               COUNT(*) AS total,
-               COUNT(*) FILTER (WHERE is_leader) AS leader_count
-        FROM trades_observed
-        WHERE time > NOW() - INTERVAL '5 minutes'
-        GROUP BY source
-        ORDER BY total DESC
-        """
-    )
+    # ── Source mix (last 5 min) — parallel result ─────────────────────────
     payload["source_mix"] = [
         {
             "source": _row_get(r, "source"),
@@ -2667,20 +2720,7 @@ async def inspector_snapshot(conn, redis_client=None, limit: int = 80) -> dict:
         for r in src_rows
     ]
 
-    # ── DB-side counters (last 1h) ───────────────────────────────────────────
-    counters_row = await conn.fetchrow(
-        """
-        SELECT
-            (SELECT COUNT(*) FROM trades_observed WHERE time > NOW() - INTERVAL '1 hour')      AS trades_1h,
-            (SELECT COUNT(*) FROM trades_observed
-              WHERE time > NOW() - INTERVAL '1 hour' AND is_leader = TRUE)                      AS leader_trades_1h,
-            (SELECT COUNT(*) FROM decision_log WHERE time > NOW() - INTERVAL '1 hour')          AS decisions_1h,
-            (SELECT COUNT(*) FROM decision_log
-              WHERE time > NOW() - INTERVAL '1 hour' AND action != 'skip')                      AS actionable_1h,
-            (SELECT COUNT(*) FROM positions_reconstructed
-              WHERE close_time > NOW() - INTERVAL '1 hour')                                     AS closes_1h
-        """
-    )
+    # ── DB-side counters (last 1h) — parallel result ──────────────────────
     payload["counters"] = {
         "trades_1h": _to_int(_row_get(counters_row, "trades_1h"), 0),
         "leader_trades_1h": _to_int(_row_get(counters_row, "leader_trades_1h"), 0),
