@@ -485,18 +485,15 @@ class ConfidenceEngine:
         penalty_multiplier = max(0.20, 1.0 - context_penalty)
         kelly_fraction = round(kelly_fraction * penalty_multiplier, 4)
         size_usdc = round(size_usdc * penalty_multiplier, 2)
+        # Instead of skipping when size dips below MIN after penalty,
+        # floor to MIN — the gate is "trade at least the min" not
+        # "don't trade". This keeps cold-start outcomes flowing into
+        # the Thompson posterior so the bot can learn. Skipping here
+        # was the dominant SKIP reason for non-extreme-price FOLLOWs
+        # and was starving the learning loop.
         if 0.0 < size_usdc < settings.MIN_POSITION_USDC:
-            await self._log_decision(
-                wallet,
-                market_id,
-                "skip",
-                thompson_follow,
-                thompson_fade,
-                0.0,
-                confidence,
-                "context_penalty_below_min_size",
-            )
-            return None
+            size_usdc = float(settings.MIN_POSITION_USDC)
+            kelly_fraction = settings.MIN_POSITION_USDC / settings.PAPER_CAPITAL_USDC
 
         reason_suffix = f"risk={context_penalty:.2f}"
         if selected_codes:
