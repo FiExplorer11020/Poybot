@@ -1843,19 +1843,40 @@ async def graph_top_edges(conn, limit: int = 30) -> dict:
         limit,
     )
     edges = []
+    nodes_set: dict[str, str] = {}  # wallet → role (leader|follower|both)
     for r in rows:
+        hawkes = _to_float(_row_get(r, "hawkes_alpha_mu"), 0.0)
+        prob = _to_float(_row_get(r, "follow_probability"), 0.0)
+        cooc = _to_int(_row_get(r, "co_occurrences"), 0)
+        # `is_confirmed` mirrors the R9 spec definition: the edge is a
+        # confirmed follower link when the Hawkes excitation ratio
+        # exceeds 1 (causal evidence) AND the Beta posterior crosses
+        # the 60% follow_probability threshold with at least 5
+        # co-occurrences (sample-size guard). The V2 graph view filters
+        # by this flag — without it set, all edges were silently
+        # dropped, leaving the graph empty.
+        is_confirmed = (hawkes > 1.0) and (prob > 0.6) and (cooc >= 5)
+        leader_w = _row_get(r, "leader_wallet")
+        follower_w = _row_get(r, "follower_wallet")
+        # Track all wallets appearing in any edge so the frontend can
+        # render nodes without inferring them client-side.
+        if leader_w:
+            nodes_set[leader_w] = "both" if nodes_set.get(leader_w) == "follower" else "leader"
+        if follower_w:
+            nodes_set[follower_w] = "both" if nodes_set.get(follower_w) == "leader" else "follower"
         edges.append(
             {
-                "leader_wallet": _row_get(r, "leader_wallet"),
-                "follower_wallet": _row_get(r, "follower_wallet"),
-                "hawkes_alpha_mu": _to_float(_row_get(r, "hawkes_alpha_mu"), 0.0),
-                "follow_probability": _to_float(_row_get(r, "follow_probability"), 0.0),
+                "leader_wallet": leader_w,
+                "follower_wallet": follower_w,
+                "hawkes_alpha_mu": hawkes,
+                "follow_probability": prob,
                 "beta_a": _to_float(_row_get(r, "follow_beta_a"), 0.0),
                 "beta_b": _to_float(_row_get(r, "follow_beta_b"), 0.0),
-                "co_occurrences": _to_int(_row_get(r, "co_occurrences"), 0),
+                "co_occurrences": cooc,
                 "avg_delay_s": _to_float(_row_get(r, "avg_delay_s"), 0.0),
                 "same_direction_rate": _to_float(_row_get(r, "same_direction_rate"), 0.0),
                 "trapped_rate": _to_float(_row_get(r, "trapped_rate"), 0.0),
+                "is_confirmed": is_confirmed,
                 "last_observed": _row_get(r, "last_observed").isoformat()
                 if _row_get(r, "last_observed")
                 else None,
@@ -1864,6 +1885,10 @@ async def graph_top_edges(conn, limit: int = 30) -> dict:
                 else None,
             }
         )
+    nodes = [
+        {"wallet_address": w, "role": role}
+        for w, role in nodes_set.items()
+    ]
     totals = await conn.fetchrow(
         """
         SELECT
@@ -1876,6 +1901,7 @@ async def graph_top_edges(conn, limit: int = 30) -> dict:
     )
     return {
         "edges": edges,
+        "nodes": nodes,
         "totals": {
             "confirmed": _to_int(_row_get(totals, "confirmed"), 0),
             "hawkes_strong": _to_int(_row_get(totals, "hawkes_strong"), 0),

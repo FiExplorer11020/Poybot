@@ -3373,11 +3373,24 @@ async def _api_wallet_universe_uncached(limit: int = 200):
         async with _pool.acquire() as conn:
             stats_row = await conn.fetchrow(
                 """
-                SELECT COUNT(*)::int AS total,
-                       COUNT(*) FILTER (WHERE depth_tier = 0)::int AS tier_0,
-                       COUNT(*) FILTER (WHERE depth_tier = 1)::int AS tier_1,
-                       COUNT(*) FILTER (WHERE depth_tier = 2)::int AS tier_2,
-                       MAX(last_active) AS last_crawl_at
+                SELECT
+                    COUNT(*)::int                                  AS total,
+                    COUNT(*) FILTER (WHERE depth_tier = 0)::int    AS tier_0,
+                    COUNT(*) FILTER (WHERE depth_tier = 1)::int    AS tier_1,
+                    COUNT(*) FILTER (WHERE depth_tier = 2)::int    AS tier_2,
+                    MAX(last_active)                               AS last_crawl_at,
+                    -- Activity context — V2 audit found "23k wallets but
+                    -- 0 trade signal" was a UX trap because Tier 2 are
+                    -- depth crawl results, not active leaders. Surfacing
+                    -- the trade-side counts makes the dashboard tell the
+                    -- truth: only N wallets actually trade in 24h.
+                    (SELECT COUNT(DISTINCT wallet_address)::int FROM trades_observed
+                     WHERE time >= NOW() - INTERVAL '24 hours')   AS active_traders_24h,
+                    (SELECT COUNT(DISTINCT wallet_address)::int FROM trades_observed
+                     WHERE time >= NOW() - INTERVAL '24 hours'
+                       AND is_leader = TRUE)                       AS active_leaders_24h,
+                    (SELECT COUNT(*)::int FROM leaders
+                     WHERE on_watchlist = TRUE AND excluded = FALSE) AS leaders_on_watchlist
                 FROM wallet_universe
                 """
             )
@@ -3386,6 +3399,9 @@ async def _api_wallet_universe_uncached(limit: int = 200):
             tier_1 = int(stats_row["tier_1"] or 0) if stats_row else 0
             tier_2 = int(stats_row["tier_2"] or 0) if stats_row else 0
             last_crawl_at = stats_row["last_crawl_at"] if stats_row else None
+            active_traders_24h = int(stats_row["active_traders_24h"] or 0) if stats_row else 0
+            active_leaders_24h = int(stats_row["active_leaders_24h"] or 0) if stats_row else 0
+            leaders_on_watchlist = int(stats_row["leaders_on_watchlist"] or 0) if stats_row else 0
             rows = await conn.fetch(
                 """
                 SELECT wu.wallet_address,
@@ -3422,6 +3438,9 @@ async def _api_wallet_universe_uncached(limit: int = 200):
             "tier_0": tier_0,
             "tier_1": tier_1,
             "tier_2": tier_2,
+            "active_traders_24h": active_traders_24h,
+            "active_leaders_24h": active_leaders_24h,
+            "leaders_on_watchlist": leaders_on_watchlist,
             "last_crawl_at": _v2_fmt_iso(last_crawl_at),
             "wallets": wallets,
             "limit": limit,
@@ -3433,6 +3452,9 @@ async def _api_wallet_universe_uncached(limit: int = 200):
             "tier_0": 0,
             "tier_1": 0,
             "tier_2": 0,
+            "active_traders_24h": 0,
+            "active_leaders_24h": 0,
+            "leaders_on_watchlist": 0,
             "last_crawl_at": None,
             "wallets": [],
             "limit": limit,

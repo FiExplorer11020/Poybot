@@ -635,12 +635,17 @@ const WalletUniverse = ({ setTab }) => {
   const [sortDir, setSortDir] = useState('desc');
   const { data: universe, loading } = useApi('/api/wallet/universe?limit=500', { interval: 30000 });
 
+  // KPI strip — V2 audit fix: surface the truth that out of 23k crawled
+  // wallets, only a tiny fraction actually trades. Tier-2 (depth crawl)
+  // dominates the universe count but contributes near-zero signal.
   const kpis = [
-    { label: 'UNIVERSE SIZE',  value: universe?.total ?? 0, loading },
-    { label: 'TIER-0 WHALES',  value: universe?.tier_0 ?? 0, color: T.accent.amber, loading },
-    { label: 'TIER-1 TOP',     value: universe?.tier_1 ?? 0, loading },
-    { label: 'TIER-2 DEPTH',   value: universe?.tier_2 ?? 0, color: T.text.tertiary, loading },
-    { label: 'LAST CRAWL',     value: universe?.last_crawl_at || '—', loading },
+    { label: 'UNIVERSE SIZE',     value: universe?.total ?? 0, loading },
+    { label: 'ACTIVE TRADERS 24H',value: universe?.active_traders_24h ?? 0, color: T.status.ok, loading },
+    { label: 'LEADERS (FALCON)',  value: universe?.leaders_on_watchlist ?? 0, color: T.accent.amber, loading },
+    { label: 'ACTIVE LEADERS 24H',value: universe?.active_leaders_24h ?? 0, color: T.accent.violet, loading },
+    { label: 'TIER-0 WHALES',     value: universe?.tier_0 ?? 0, color: T.accent.amber, loading },
+    { label: 'TIER-1 TOP',        value: universe?.tier_1 ?? 0, loading },
+    { label: 'LAST CRAWL',        value: universe?.last_crawl_at ? new Date(universe.last_crawl_at).toLocaleString('en-GB', { month: 'short', day: '2-digit', hour: '2-digit', minute: '2-digit' }) : '—', loading },
   ];
 
   const allClasses = ['directional','momentum','contrarian','arb_2way','arb_3way','market_maker','structural_bot','info_leak','social_driven'];
@@ -881,11 +886,26 @@ const WalletGraphFull = () => {
 const WalletScanner = ({ setTab }) => {
   const [search, setSearch] = useState('');
   const [phaseFilter, setPhaseFilter] = useState('all');
-  const [sortKey, setSortKey] = useState('readiness');
+  const [activeOnly, setActiveOnly] = useState(true);  // new: hide 0-trade ghosts by default
+  const [sortKey, setSortKey] = useState('trades_observed');  // default to activity sort
   const [sortDir, setSortDir] = useState('desc');
   const { data: scanner, loading } = useApi('/api/leaders?limit=200', { interval: 30000 });
 
-  const leaders = (scanner?.leaders || [])
+  // BUG FIX: the backend /api/leaders endpoint returns a raw array,
+  // not { leaders: [...] }. The previous code read scanner?.leaders
+  // which was always undefined → 0 leaders shown despite 200 returned.
+  // We accept both shapes for future-proofing.
+  const rawLeaders = Array.isArray(scanner) ? scanner : (scanner?.leaders || []);
+
+  // Map the backend's `error_model_phase` field to the `phase` filter
+  // used in the UI (1 / 2 / 3 / 0=cold).
+  const enriched = rawLeaders.map(l => ({
+    ...l,
+    phase: l.phase ?? l.error_model_phase ?? 0,
+  }));
+
+  const leaders = enriched
+    .filter(l => !activeOnly || (l.trades_observed ?? 0) > 0)
     .filter(l => phaseFilter === 'all' || String(l.phase) === phaseFilter)
     .filter(l => !search || l.wallet_address.toLowerCase().includes(search.toLowerCase()))
     .slice()
@@ -897,12 +917,19 @@ const WalletScanner = ({ setTab }) => {
       return sortDir === 'asc' ? cmp : -cmp;
     });
 
+  // KPI strip — top counts now correctly reflect the data the dashboard
+  // is showing. "ACTIVE" surfaces the only number that matters for the
+  // operator: how many of the watched leaders are currently producing
+  // observable trade signal.
+  const activeCount = enriched.filter(l => (l.trades_observed ?? 0) > 0).length;
+  const withFollowers = enriched.filter(l => (l.confirmed_followers ?? 0) > 0).length;
   const kpis = [
-    { label: 'LEADERS',          value: scanner?.leaders?.length ?? 0, loading },
-    { label: 'PHASE 1',          value: (scanner?.leaders || []).filter(l => l.phase === 1).length, color: T.chart.c1, loading },
-    { label: 'PHASE 2',          value: (scanner?.leaders || []).filter(l => l.phase === 2).length, color: T.chart.c2, loading },
-    { label: 'PHASE 3',          value: (scanner?.leaders || []).filter(l => l.phase === 3).length, color: T.chart.c3, loading },
-    { label: 'WIN RATE MEDIAN',  value: scanner?.win_rate_median ? fmtPct(scanner.win_rate_median * 100, 1) : '—', loading },
+    { label: 'LEADERS TOTAL',    value: enriched.length, loading },
+    { label: 'ACTIVE (trades>0)',value: activeCount, color: T.status.ok, loading },
+    { label: 'WITH FOLLOWERS',   value: withFollowers, color: T.accent.violet, loading },
+    { label: 'PHASE 1',          value: enriched.filter(l => l.phase === 1).length, color: T.chart.c1, loading },
+    { label: 'PHASE 2',          value: enriched.filter(l => l.phase === 2).length, color: T.chart.c2, loading },
+    { label: 'PHASE 3',          value: enriched.filter(l => l.phase === 3).length, color: T.chart.c3, loading },
     { label: 'FILTERED RESULTS', value: leaders.length, loading },
   ];
 
@@ -929,8 +956,13 @@ const WalletScanner = ({ setTab }) => {
       <div style={{ padding: 'var(--section-padding)' }}>
         <Panel
           title="WALLET SCANNER"
+          subtitle={`${activeCount} active leaders observed trading · ${enriched.length} total · ${withFollowers} with confirmed followers`}
           action={
-            <div style={{ display: 'flex', gap: 8 }}>
+            <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+              <label style={{ display: 'inline-flex', alignItems: 'center', gap: 6, color: T.text.secondary, fontSize: 'var(--font-size-sm)', cursor: 'pointer' }}>
+                <input type="checkbox" checked={activeOnly} onChange={e => setActiveOnly(e.target.checked)} />
+                Active only
+              </label>
               <input
                 type="search"
                 placeholder="Search wallet…"
@@ -949,23 +981,30 @@ const WalletScanner = ({ setTab }) => {
         >
           <DataTable
             loading={loading}
-            emptyMessage="No leaders match. Try clearing filters."
+            emptyMessage="No leaders match. Try clearing filters or unchecking 'Active only'."
             columns={[
               { key: 'wallet_address', label: 'WALLET',
                 render: (v) => <WalletCell wallet={v} onClick={() => {
                   window.location.hash = `wallet/profile?w=${v}`;
                   setTab && setTab({ id: 'wallet', subTab: 'profile' });
                 }} /> },
-              { key: 'phase',          label: sortableHeader('phase', 'PHASE', 'center'), align: 'center', color: T.accent.amber },
-              { key: 'falcon_score',   label: sortableHeader('falcon_score', 'FALCON', 'right'), align: 'right',
+              { key: 'phase', label: sortableHeader('phase', 'PHASE', 'center'), align: 'center', color: T.accent.amber },
+              { key: 'falcon_score', label: sortableHeader('falcon_score', 'FALCON', 'right'), align: 'right',
                 render: v => v != null ? Number(v).toFixed(2) : '—' },
-              { key: 'trades_24h',     label: sortableHeader('trades_24h', 'TRADES 24H', 'right'), align: 'right' },
-              { key: 'win_rate',       label: sortableHeader('win_rate', 'WIN %', 'right'), align: 'right',
+              { key: 'trades_observed', label: sortableHeader('trades_observed', 'TRADES', 'right'), align: 'right',
+                render: v => v != null ? Number(v).toLocaleString() : '0' },
+              { key: 'positions_resolved', label: sortableHeader('positions_resolved', 'RESOLVED', 'right'), align: 'right',
+                render: v => v != null ? Number(v).toLocaleString() : '0' },
+              { key: 'confirmed_followers', label: sortableHeader('confirmed_followers', 'FOLLOWERS', 'right'), align: 'right',
+                render: v => (v ?? 0) > 0
+                  ? <span style={{ color: T.accent.violet, fontWeight: 600 }}>{v}</span>
+                  : '0' },
+              { key: 'follow_learning_win_rate', label: sortableHeader('follow_learning_win_rate', 'FOLLOW WIN', 'right'), align: 'right',
                 render: v => v != null ? fmtPct(v * 100, 1) : '—' },
-              { key: 'pnl_30d',        label: sortableHeader('pnl_30d', 'PNL 30D', 'right'), align: 'right',
-                render: v => fmtPnl(v) },
-              { key: 'readiness',      label: sortableHeader('readiness', 'READINESS', 'right'), align: 'right',
-                render: v => v != null ? Number(v).toFixed(2) : '—' },
+              { key: 'profile_maturity', label: sortableHeader('profile_maturity', 'MATURITY', 'right'), align: 'right',
+                render: v => v != null ? Number(v).toFixed(3) : '—' },
+              { key: 'strategy', label: 'STRATEGY',
+                render: v => v && v !== '—' ? <span style={{ color: T.accent.violet }}>{v}</span> : '—' },
             ]}
             rows={leaders}
             rowKey={r => r.wallet_address}
