@@ -290,10 +290,10 @@ class GraphEngine:
                          avg_delay_s, same_direction_rate, last_observed)
                     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,NOW())
                     ON CONFLICT (leader_wallet, follower_wallet) DO UPDATE SET
-                        co_occurrences      = EXCLUDED.co_occurrences,
+                        co_occurrences      = GREATEST(follower_edges.co_occurrences, EXCLUDED.co_occurrences),
                         follow_probability  = EXCLUDED.follow_probability,
-                        follow_beta_a       = EXCLUDED.follow_beta_a,
-                        follow_beta_b       = EXCLUDED.follow_beta_b,
+                        follow_beta_a       = GREATEST(follower_edges.follow_beta_a, EXCLUDED.follow_beta_a),
+                        follow_beta_b       = GREATEST(follower_edges.follow_beta_b, EXCLUDED.follow_beta_b),
                         avg_delay_s         = EXCLUDED.avg_delay_s,
                         same_direction_rate = EXCLUDED.same_direction_rate,
                         last_observed       = EXCLUDED.last_observed
