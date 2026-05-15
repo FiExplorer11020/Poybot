@@ -23,15 +23,19 @@ async def main():
     await initialize_pool(dsn=DB_URL, min_size=1, max_size=4)
 
     pool = await asyncpg.create_pool(DB_URL, min_size=1, max_size=2)
+    # Threshold via env var (default 30 — lowered from 100 to capture
+    # short-horizon leaders whose position_tracker can't keep up).
+    min_resolved = int(os.environ.get("MIN_RESOLVED_FOR_UPGRADE", "30"))
     eligible = []
     async with pool.acquire() as conn:
         rows = await conn.fetch(
             """
             SELECT wallet_address, positions_resolved
             FROM leader_profiles
-            WHERE positions_resolved >= 100 AND error_model_phase = 1
+            WHERE positions_resolved >= $1 AND error_model_phase = 1
             ORDER BY positions_resolved DESC
-            """
+            """,
+            min_resolved,
         )
         for r in rows:
             eligible.append((r["wallet_address"], r["positions_resolved"]))
