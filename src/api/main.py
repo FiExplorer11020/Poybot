@@ -525,11 +525,15 @@ _HELPER_CACHE_TTLS = {
     "equity_curve_v2": 30.0,
     "market_scanner": 30.0,
     "neural_readiness": 10.0,  # /api/neural-readiness compose health+activation+risk+ml
-    # Phase 1 V2 audit — slow endpoints with high poll frequency:
-    "decisions_200": 5.0,       # /api/decisions?limit=200, 407 KB payload, V2 polls 5s
-    "wallet_universe_500": 30.0, # /api/wallet/universe?limit=500, 94 KB, V2 polls 30s
-    "leaders_200": 30.0,         # /api/leaders?limit=200, 124 KB, V2 polls 30s
-    "inspector_snapshot": 3.0,   # /api/inspector/snapshot, 55 KB, V2 polls 3s, query 5-11s
+    # Phase 1 V2 audit — slow endpoints with high poll frequency.
+    # NOTE on TTLs: a TTL shorter than the rebuild duration means the
+    # cache "expires before it is written" — every poll triggers a
+    # fresh rebuild. Inspector takes 5-11s to build, so a 3s TTL was
+    # useless. We size TTL ≥ 3× max rebuild duration.
+    "decisions_200": 10.0,       # /api/decisions?limit=200 (~500ms build), V2 polls 5s
+    "wallet_universe_500": 30.0, # /api/wallet/universe?limit=500 (~500ms build), V2 polls 30s
+    "leaders_200": 30.0,         # /api/leaders?limit=200 (~1.5s build), V2 polls 30s
+    "inspector_snapshot": 30.0,  # /api/inspector/snapshot (~5-11s build), V2 polls 3s
     # Phase 2 V2 audit — OPS endpoints filling the R6/R7 gaps:
     "ops_fee_snapshots": 30.0,
     "ops_chain_sync": 10.0,
