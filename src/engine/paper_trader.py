@@ -327,58 +327,49 @@ class PaperTrader:
             await self._record_equity_sample()
 
     async def _check_open_positions(self) -> None:
-        """Evaluate each open position for auto-close conditions."""
+        """Evaluate each open position for auto-close conditions.
+
+        Realistic-fill model: mark-to-market uses the bid (the price we
+        could SELL at right now), not the mid. Take-profit / stop-loss
+        thresholds therefore fire on the netable exit price, eliminating
+        the "phantom PnL" effect where mid-price moves wide of the spread
+        triggered closes against an ask we couldn't reach.
+        """
         now = datetime.now(tz=timezone.utc)
         for trade in list(self._open_trades):
+            exit_price = await self._exit_bid(
+                trade.market_id, trade.token_id, trade.entry_price
+            )
+
             # --- FIX 9: Timeout ---
             if trade.opened_at and (now - trade.opened_at) > timedelta(days=TIMEOUT_DAYS):
-                price = (
-                    await self._get_current_price(trade.market_id, trade.token_id)
-                    or trade.entry_price
-                )
-                await self.close_trade(trade.id, price, "timeout")
+                await self.close_trade(trade.id, exit_price, "timeout")
                 continue
 
             # --- FIX 9: Market resolved ---
-            resolved = await self._is_market_resolved(trade.market_id)
-            if resolved:
-                price = (
-                    await self._get_current_price(trade.market_id, trade.token_id)
-                    or trade.entry_price
-                )
-                await self.close_trade(trade.id, price, "market_resolved")
+            if await self._is_market_resolved(trade.market_id):
+                await self.close_trade(trade.id, exit_price, "market_resolved")
                 continue
 
             # --- FIX 9: Leader exit (FOLLOW only) ---
             if trade.strategy == "follow":
-                leader_exited = await self._leader_exited_recently(
-                    trade.leader_wallet, trade.market_id
-                )
-                if leader_exited:
-                    price = (
-                        await self._get_current_price(trade.market_id, trade.token_id)
-                        or trade.entry_price
-                    )
-                    await self.close_trade(trade.id, price, "leader_exit")
+                if await self._leader_exited_recently(trade.leader_wallet, trade.market_id):
+                    await self.close_trade(trade.id, exit_price, "leader_exit")
                     continue
 
-            current_price = await self._get_current_price(trade.market_id, trade.token_id)
-            if current_price is None:
-                continue
-
-            # --- FIX 3: Direction-aware PnL ---
+            # --- FIX 3: Direction-aware PnL — mark to bid for realism ---
             if trade.direction == "yes":
-                pnl_pct = (current_price - trade.entry_price) / trade.entry_price
+                pnl_pct = (exit_price - trade.entry_price) / trade.entry_price
             else:
-                pnl_pct = (trade.entry_price - current_price) / trade.entry_price
+                pnl_pct = (trade.entry_price - exit_price) / trade.entry_price
 
             stop = STOP_LOSS_FADE if trade.strategy == "fade" else STOP_LOSS_FOLLOW
             take = TAKE_PROFIT_FADE if trade.strategy == "fade" else TAKE_PROFIT_FOLLOW
 
             if pnl_pct <= -stop:
-                await self.close_trade(trade.id, current_price, "stop_loss")
+                await self.close_trade(trade.id, exit_price, "stop_loss")
             elif pnl_pct >= take:
-                await self.close_trade(trade.id, current_price, "take_profit")
+                await self.close_trade(trade.id, exit_price, "take_profit")
 
     async def open_trade(self, decision: dict) -> int | None:
         """Open a paper trade from a decision dict. Returns trade ID or None."""
@@ -483,16 +474,20 @@ class PaperTrader:
                 return None
 
         # --- FIX 3 + FIX 5: Direction and price ---
+        # Realistic slippage: BUY pays best_ask, not mid/last-trade.
         if strategy == "follow":
             direction = "yes"
             actual_token_id = token_id
-            entry_price = await self._get_current_price(market_id, token_id) or 0.5
+            mid_fallback = await self._get_current_price(market_id, token_id) or 0.5
+            entry_price = await self._entry_ask(market_id, actual_token_id, mid_fallback)
         else:
             direction = "no"
             opposite_token = await self._get_opposite_token(market_id, token_id)
             actual_token_id = opposite_token or token_id
-            leader_price = await self._get_current_price(market_id, token_id) or 0.5
-            entry_price = max(0.01, 1.0 - leader_price)  # FIX 5
+            # FADE = take the OTHER side. Use the opposite token's ask.
+            leader_mid = await self._get_current_price(market_id, token_id) or 0.5
+            fade_fallback = max(0.01, 1.0 - leader_mid)
+            entry_price = await self._entry_ask(market_id, actual_token_id, fade_fallback)
 
         strategy_track = (
             trade_context.get("strategy_track")
@@ -795,9 +790,48 @@ class PaperTrader:
         )
         return True
 
+    async def _get_book_quote(self, market_id: str, token_id: str) -> tuple[float, float] | None:
+        """Return (best_bid, best_ask) from book:last cache if fresh.
+
+        Returns None when the cache is missing or malformed. Callers use
+        this to compute realistic entry/exit prices (BUY at ask, SELL at
+        bid) instead of last-trade mid.
+        """
+        if self._redis is None:
+            return None
+        try:
+            raw = await self._redis.get(f"book:last:{market_id}:{token_id}")
+        except Exception:
+            return None
+        if not raw:
+            return None
+        try:
+            payload = json.loads(raw) if isinstance(raw, str) else dict(raw)
+            best_bid = float(payload.get("best_bid"))
+            best_ask = float(payload.get("best_ask"))
+            if best_bid <= 0 or best_ask <= 0 or best_bid >= best_ask:
+                return None
+            return best_bid, best_ask
+        except Exception:
+            return None
+
     async def _get_current_price(self, market_id: str, token_id: str) -> float | None:
-        """Get latest price: Redis cache first (FIX 7), then DB fallback."""
-        # FIX 7: Try Redis price cache set by trade_observer
+        """Get latest price for mark-to-market.
+
+        Preference order:
+          1. book:last mid (best_bid + best_ask) / 2 — most current
+          2. price:{market}:{token} cache from observer
+          3. trades_observed last price (DB)
+
+        For trade open/close we use _entry_ask / _exit_bid instead, which
+        model realistic slippage. This function is the mark-to-market price
+        used by the monitor loop for take-profit / stop-loss thresholds.
+        """
+        quote = await self._get_book_quote(market_id, token_id)
+        if quote is not None:
+            best_bid, best_ask = quote
+            return (best_bid + best_ask) / 2.0
+
         if self._redis is not None:
             try:
                 cached = await self._redis.get(f"price:{market_id}:{token_id}")
@@ -805,7 +839,6 @@ class PaperTrader:
                     return float(cached)
             except Exception:
                 pass
-        # DB fallback
         try:
             async with get_db() as conn:
                 row = await conn.fetchrow(
@@ -820,6 +853,24 @@ class PaperTrader:
                 return float(row["price"]) if row else None
         except Exception:
             return None
+
+    async def _entry_ask(self, market_id: str, token_id: str, fallback: float) -> float:
+        """Realistic entry price: best_ask if available (BUY pays the ask).
+
+        Falls back to mid/last when book is missing. Floor at 0.01 to avoid
+        zero-divisor in pnl calculations.
+        """
+        quote = await self._get_book_quote(market_id, token_id)
+        if quote is not None:
+            return max(0.01, quote[1])
+        return max(0.01, fallback)
+
+    async def _exit_bid(self, market_id: str, token_id: str, fallback: float) -> float:
+        """Realistic exit price: best_bid if available (SELL hits the bid)."""
+        quote = await self._get_book_quote(market_id, token_id)
+        if quote is not None:
+            return max(0.01, quote[0])
+        return max(0.01, fallback)
 
     async def _get_fee_rate(self, market_id: str) -> float:
         """Fetch fee rate for a market from DB. Returns 0.0 if unavailable."""

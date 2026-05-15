@@ -207,6 +207,34 @@ class ConfidenceEngine:
             )
             return None
 
+        # Reject HIGH-price FOLLOW entries (entry > 0.85). When the
+        # market has already moved into the high-probability zone, the
+        # leader's edge is captured by price. Upside is bounded at +18%
+        # (to 1.0) while downside is up to -99%. We saw 4 trades lose
+        # ~$550 total at entry 0.99 → exit 0.01.
+        #
+        # We DO allow low-price entries (≤ 0.15) — they offer asymmetric
+        # upside (BTC trade #2: 0.002 → 0.59 = +29,400% return). If a
+        # leader buys NO at 0.05, we follow. If the market resolves NO,
+        # we gain massively; if it resolves YES, we lose only the
+        # premium we paid.
+        try:
+            entry_price = float(trade.get("price") or 0.5)
+        except (TypeError, ValueError):
+            entry_price = 0.5
+        if entry_price >= 0.85:
+            await self._log_decision(
+                wallet,
+                market_id,
+                "skip",
+                0.0,
+                0.0,
+                0.0,
+                entry_price,
+                f"high_price_follow_blocked|p={entry_price:.3f}",
+            )
+            return None
+
         readiness = await self._get_readiness(wallet)
         # Use adaptive thresholds (refreshed periodically by the engine
         # scheduler) so cold-start gates relax automatically once the
@@ -1458,6 +1486,12 @@ class ConfidenceEngine:
                 f"market={decision.market_id} token={decision.token_id}: {exc}"
             )
 
+        # max_book_age_s relaxed from 10s → 180s. Polymarket book moves
+        # slowly between trades (most prediction markets see < 1 update/
+        # min). The maintenance loop refreshes top 1500 markets every
+        # 2 min, so a 3-min book staleness window matches the refresh
+        # cadence with a safety margin. The strict 10s was designed for
+        # latency-sensitive HFT, not the leader-following swing strategy.
         audit = evaluate_signal_gate(
             strategy_track=StrategyTrack.LEADER_SWING,
             market_id=decision.market_id,
@@ -1465,6 +1499,7 @@ class ConfidenceEngine:
             token_map_ok=token_map_ok,
             fee_snapshot=fee_snapshot,
             book_snapshot=book_snapshot,
+            max_book_age_s=180.0,
         )
         payload = audit.to_metadata()
         payload["economic_model_version"] = ECONOMIC_MODEL_VERSION

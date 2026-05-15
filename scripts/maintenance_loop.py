@@ -306,9 +306,11 @@ async def trim_runaway_streams(redis_client) -> dict:
 
 
 async def refresh_book_cache(redis_client) -> int:
-    """For markets where book:last is missing/stale, fetch fresh quotes
-    from Polymarket CLOB orderbook endpoint and SET them with a fresh
-    observed_ts. Caps at top 200 markets by volume to keep load low.
+    """For all liquid markets, fetch fresh quotes from CLOB orderbook
+    endpoint and write to book:last cache.
+
+    Parallelized with bounded concurrency so 1500 markets × 2 tokens =
+    3000 HTTP calls complete in tens of seconds, not minutes.
     """
     pool = await asyncpg.create_pool(DB_URL, min_size=1, max_size=2, command_timeout=30)
     try:
@@ -318,55 +320,74 @@ async def refresh_book_cache(redis_client) -> int:
                 SELECT market_id, token_yes, token_no, volume_24h
                 FROM markets
                 WHERE active = TRUE AND end_date > NOW()
-                  AND volume_24h > 1000
+                  AND volume_24h > 500
                   AND token_yes IS NOT NULL AND token_no IS NOT NULL
                 ORDER BY volume_24h DESC
-                LIMIT 200
+                LIMIT 1500
                 """
             )
     finally:
         await pool.close()
 
+    # Build flat list of (market_id, token_id) pairs.
+    targets = []
+    for row in rows:
+        for token in (row["token_yes"], row["token_no"]):
+            if token:
+                targets.append((row["market_id"], str(token)))
+
+    sem = asyncio.Semaphore(30)  # 30 concurrent requests max
     refreshed = 0
-    async with aiohttp.ClientSession(headers={"User-Agent": USER_AGENT}) as session:
-        for row in rows:
-            for token in (row["token_yes"], row["token_no"]):
-                try:
-                    # Polymarket CLOB orderbook endpoint
-                    url = f"https://clob.polymarket.com/book?token_id={token}"
-                    async with session.get(url, timeout=8) as resp:
-                        if resp.status != 200:
-                            continue
-                        data = await resp.json()
-                except Exception:
-                    continue
-                bids = data.get("bids") or []
-                asks = data.get("asks") or []
-                if not bids or not asks:
-                    continue
-                try:
-                    best_bid = str(bids[0].get("price"))
-                    best_ask = str(asks[0].get("price"))
-                except Exception:
-                    continue
-                if not best_bid or not best_ask:
-                    continue
-                now_ts = time.time()
-                payload = json.dumps({
-                    "market_id": row["market_id"],
-                    "token_id": str(token),
-                    "best_bid": best_bid,
-                    "best_ask": best_ask,
-                    "observed_ts": now_ts,
-                    "captured_at": now_ts,
-                    "source": "maintenance_loop",
-                })
-                key = f"book:last:{row['market_id']}:{token}"
-                try:
-                    await redis_client.set(key, payload, ex=BOOK_CACHE_TTL_S)
+    refreshed_lock = asyncio.Lock()
+
+    async def fetch_one(session, market_id, token_id):
+        nonlocal refreshed
+        async with sem:
+            try:
+                url = f"https://clob.polymarket.com/book?token_id={token_id}"
+                async with session.get(url, timeout=aiohttp.ClientTimeout(total=4)) as resp:
+                    if resp.status != 200:
+                        return
+                    data = await resp.json()
+            except Exception:
+                return
+            bids = data.get("bids") or []
+            asks = data.get("asks") or []
+            if not bids or not asks:
+                return
+            try:
+                best_bid = str(bids[0].get("price"))
+                best_ask = str(asks[0].get("price"))
+            except Exception:
+                return
+            if not best_bid or not best_ask:
+                return
+            now_ts = time.time()
+            payload = json.dumps({
+                "market_id": market_id,
+                "token_id": token_id,
+                "best_bid": best_bid,
+                "best_ask": best_ask,
+                "observed_ts": now_ts,
+                "captured_at": now_ts,
+                "source": "maintenance_loop",
+            })
+            key = f"book:last:{market_id}:{token_id}"
+            try:
+                await redis_client.set(key, payload, ex=BOOK_CACHE_TTL_S)
+                async with refreshed_lock:
                     refreshed += 1
-                except Exception:
-                    pass
+            except Exception:
+                pass
+
+    connector = aiohttp.TCPConnector(limit=60, limit_per_host=30, force_close=False)
+    async with aiohttp.ClientSession(
+        headers={"User-Agent": USER_AGENT},
+        connector=connector,
+    ) as session:
+        tasks = [fetch_one(session, mid, tid) for mid, tid in targets]
+        await asyncio.gather(*tasks, return_exceptions=True)
+
     return refreshed
 
 
@@ -408,14 +429,19 @@ async def main():
     prof_n = await run_with_recovery("profiles", reconcile_profiles, pool) or 0
     _log(f"[startup] profiles updated={prof_n}")
 
-    graph_t, graph_c = (
-        await run_with_recovery("graph", rebuild_follower_graph, pool, days=7)
-        or (0, 0)
-    )
-    _log(f"[startup] follower_edges total={graph_t} confirmed={graph_c}")
-
+    # Skip graph rebuild on startup — it can take 5-10 min and stalls
+    # the loop. Existing edges in DB are fine; the periodic 6h rebuild
+    # picks up new ones. Run book/fee refresh first so paper trades can
+    # fire immediately.
     book_n = await run_with_recovery("book", refresh_book_cache, redis_client) or 0
     _log(f"[startup] book:last refreshed={book_n}")
+
+    # Graph rebuild in background — don't block startup, but log eventual result.
+    async def _bg_graph():
+        t, c = (await run_with_recovery("graph", rebuild_follower_graph, pool, days=7)
+                or (0, 0))
+        _log(f"[bg startup] follower_edges total={t} confirmed={c}")
+    asyncio.create_task(_bg_graph())
 
     # background schedule
     last_run = {
@@ -450,11 +476,15 @@ async def main():
             last_run["profiles"] = now
 
         if now - last_run["graph"] > GRAPH_REBUILD_INTERVAL_S:
-            t, c = (
-                await run_with_recovery("graph", rebuild_follower_graph, pool, days=7)
-                or (0, 0)
-            )
-            _log(f"graph: total={t} confirmed={c}")
+            # Run in a separate task so it doesn't block the maintenance
+            # loop if the rebuild SQL stalls (10+ min on a busy DB).
+            async def _bg_graph():
+                t, c = (
+                    await run_with_recovery("graph", rebuild_follower_graph, pool, days=7)
+                    or (0, 0)
+                )
+                _log(f"graph: total={t} confirmed={c}")
+            asyncio.create_task(_bg_graph())
             last_run["graph"] = now
 
         if now - last_run["book"] > BOOK_CACHE_REFRESH_INTERVAL_S:
