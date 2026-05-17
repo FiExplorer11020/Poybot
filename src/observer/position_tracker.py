@@ -418,6 +418,7 @@ class PositionTracker:
                             WHERE market_id = $1
                               AND token_id = $2
                               AND time < $3
+                              AND source IS DISTINCT FROM 'onchain'
                             ORDER BY time DESC
                             LIMIT 10
                         ) recent

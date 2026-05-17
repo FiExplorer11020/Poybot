@@ -74,6 +74,7 @@ async def _trade_times(
         SELECT EXTRACT(EPOCH FROM time) AS ts
         FROM trades_observed
         WHERE wallet_address = $1 AND time >= $2
+          AND source IS DISTINCT FROM 'onchain'
         ORDER BY time ASC
         """,
         wallet,

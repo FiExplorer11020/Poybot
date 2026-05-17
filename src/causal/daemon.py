@@ -316,6 +316,7 @@ class CausalDaemon:
                     FROM trades_observed
                     WHERE wallet_address = $1
                       AND time >= $2 AND time < $3
+                      AND source IS DISTINCT FROM 'onchain'
                     ORDER BY time
                     """,
                     leader_wallet,
@@ -329,11 +330,13 @@ class CausalDaemon:
                     LEFT JOIN leaders l ON l.wallet_address = t.wallet_address
                     WHERE t.time >= $1 AND t.time < $2
                       AND t.wallet_address <> $3
+                      AND t.source IS DISTINCT FROM 'onchain'
                       AND t.market_id IN (
                           SELECT DISTINCT market_id
                           FROM trades_observed
                           WHERE wallet_address = $3
                             AND time >= $1 AND time < $2
+                            AND source IS DISTINCT FROM 'onchain'
                       )
                       AND COALESCE(
                           l.classification_json->'strategy_fingerprint'->>'primary_strategy',

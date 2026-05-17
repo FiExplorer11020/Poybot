@@ -155,6 +155,7 @@ class AdaptiveDepth:
                           COUNT(*)       AS trades_30d
                      FROM trades_observed
                     WHERE time > NOW() - INTERVAL '30 days'
+                      AND source IS DISTINCT FROM 'onchain'
                     GROUP BY wallet_address
                ) t USING (wallet_address);
 
@@ -183,6 +184,11 @@ class AdaptiveDepth:
             Per-tier wallet counts AFTER the sweep.
         """
         # Step 1 — single roll-up across wallet_universe × trades_observed.
+        # Exclude source='onchain' rows: their `market_id = token_id`
+        # placeholder and price=0 (CLAUDE.md § 15, pending Wave-3
+        # economic decoder) skew the 30-day volume estimate that drives
+        # the FULL / PERIODIC / LIGHT tier promotion. Older rows
+        # without a source value still flow through.
         select_sql = """
             SELECT wu.wallet_address,
                    wu.depth_tier,
@@ -195,6 +201,7 @@ class AdaptiveDepth:
                          COUNT(*)       AS trades_30d
                     FROM trades_observed
                    WHERE time > NOW() - INTERVAL '30 days'
+                     AND source IS DISTINCT FROM 'onchain'
                    GROUP BY wallet_address
               ) t USING (wallet_address)
         """

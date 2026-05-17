@@ -688,3 +688,72 @@ async def test_eth_subscribe_filter_has_contract_address_and_trade_topics():
     assert isinstance(f["topics"][0], list)
     assert EVENT_TOPICS["OrderFilled"] in f["topics"][0]
     assert EVENT_TOPICS["OrdersMatched"] in f["topics"][0]
+
+
+# ---------------------------------------------------------------------------
+# 16. Markets stub is INSERTED BEFORE the trades_observed insert
+#
+# The on-chain decoder uses `market_id = token_id` as a provisional
+# identifier pending Wave-3's economic decoder (CLAUDE.md § 15). Every
+# `_insert_trade` call must seed a placeholder markets row first so the
+# downstream LEFT JOINs in the ML / feature pipeline see a real row
+# (with `category='unknown'`) instead of NULL.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_inserts_market_stub_before_trade_insert():
+    """Sample efficiency fix: every onchain trade must come with a
+    `markets` upsert (`ON CONFLICT DO NOTHING`) issued strictly BEFORE
+    the `trades_observed` insert. Order matters because the FK shape /
+    LEFT JOIN category lookup downstream assumes the markets row exists
+    by the time the ML pipeline reads the trade.
+    """
+    rpc = _make_rpc_mock([_build_order_filled()])
+    conn = _make_conn()
+    insert_sequence: list[str] = []
+
+    async def _execute(sql, *args, **kw):
+        if "INSERT INTO markets" in sql:
+            insert_sequence.append("markets")
+        elif "INSERT INTO trades_observed" in sql:
+            insert_sequence.append("trades_observed")
+        return "INSERT 0 1"
+
+    conn.execute = AsyncMock(side_effect=_execute)
+
+    listener = _make_listener(rpc)
+    with _patch_get_db(conn):
+        await listener.start()
+        for _ in range(20):
+            await asyncio.sleep(0.01)
+            if "trades_observed" in insert_sequence:
+                break
+        await listener.stop()
+
+    # Both inserts fired.
+    assert "markets" in insert_sequence
+    assert "trades_observed" in insert_sequence
+
+    # Strict ordering: markets stub BEFORE the trade row, so the FK /
+    # LEFT JOIN target exists by the time the trade is committed.
+    markets_idx = insert_sequence.index("markets")
+    trades_idx = insert_sequence.index("trades_observed")
+    assert markets_idx < trades_idx, (
+        "markets stub must INSERT before trades_observed; got "
+        f"sequence={insert_sequence}"
+    )
+
+    # The markets stub uses the idempotent ON CONFLICT DO NOTHING form
+    # (re-running the listener on the same log must not flap the row).
+    markets_calls = [
+        c for c in conn.execute.await_args_list
+        if "INSERT INTO markets" in c.args[0]
+    ]
+    assert len(markets_calls) >= 1
+    markets_sql = markets_calls[0].args[0]
+    assert "ON CONFLICT" in markets_sql
+    assert "DO NOTHING" in markets_sql
+    # The placeholder row carries category='unknown' so dashboards /
+    # category-stratified models route it correctly.
+    assert "'unknown'" in markets_sql

@@ -527,3 +527,123 @@ class TestDecisionEmission:
             "missing_fee_snapshot",
             1,
         )
+
+
+# ---------------------------------------------------------------------------
+# Sample efficiency: the readiness COUNT must EXCLUDE source='onchain' rows.
+#
+# Why: ~14.5K trades_observed rows are written by the on-chain CLOB
+# listener with placeholder ``market_id = token_id``, hard-coded
+# ``price=0`` and ``side='buy'`` pending the Wave-3 economic decoder
+# (CLAUDE.md § 15). Counting them as "trades observed" inflates the
+# FOLLOW readiness gate (FOLLOW_MIN_TRADES default 50) and causes the
+# engine to fire FOLLOWs on leaders with effectively zero real trade
+# history — the dominant contributor to the 7.4% win rate.
+#
+# The filter uses ``IS DISTINCT FROM`` so older rows with NULL source
+# (legacy backfill, pre-source-column) still flow through.
+# ---------------------------------------------------------------------------
+
+
+class TestReadinessFiltersOnchainSource:
+    @pytest.mark.asyncio
+    async def test_readiness_query_filters_onchain_source(self):
+        """Static SQL contract: ``_get_readiness`` must contain
+        ``source IS DISTINCT FROM 'onchain'`` in the ``trades_observed``
+        COUNT subquery. Captures the SQL text the engine issues against
+        the DB.
+        """
+        captured_sql: list[str] = []
+
+        async def _fetchrow(sql, *args, **kwargs):
+            captured_sql.append(sql)
+            # Return a realistic-shape row so the readiness path completes.
+            return {
+                "trades_observed": 1,
+                "positions_resolved": 0,
+                "confirmed_followers": 0,
+                "external_resolved_count": 0,
+                "external_wins": 0,
+                "external_losses": 0,
+                "falcon_score": 0.0,
+            }
+
+        engine = make_engine()
+        patcher, _ = _mock_get_db(fetchrow_mock=AsyncMock(side_effect=_fetchrow))
+
+        with patcher:
+            await engine._get_readiness("0xLeader")
+
+        assert captured_sql, "expected _get_readiness to issue a fetchrow"
+        readiness_sql = next(
+            (s for s in captured_sql if "FROM trades_observed" in s),
+            None,
+        )
+        assert readiness_sql is not None, (
+            f"no trades_observed query captured; got SQLs: "
+            f"{[s[:60] for s in captured_sql]}"
+        )
+        # Filter contract — exact phrase that downstream agents grep for.
+        assert "source IS DISTINCT FROM 'onchain'" in readiness_sql, (
+            "_get_readiness's trades_observed COUNT subquery must exclude "
+            "source='onchain' placeholder rows pending Wave-3 decoder. "
+            f"Got SQL:\n{readiness_sql}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_readiness_count_excludes_onchain_row_in_simulated_db(self):
+        """End-to-end behaviour check at the row-counting layer: simulate
+        a DB that materialises the filter and returns only the non-onchain
+        rows. With 1 onchain + 1 normal row in the table, the readiness
+        count must be 1.
+
+        We can't run real SQL here (no DB in unit tests), so we model the
+        filter the way the DB would: a tiny in-memory fixture that obeys
+        ``source IS DISTINCT FROM 'onchain'`` and ``wallet_address = $1``.
+        The test passes only if the readiness path correctly relies on
+        that filter (i.e., reads the COUNT through the fetchrow mock).
+        """
+        # The two rows the fixture knows about.
+        fixture_rows = [
+            {"wallet_address": "0xLeader", "source": "onchain"},
+            {"wallet_address": "0xLeader", "source": "websocket"},
+        ]
+
+        async def _simulated_fetchrow(sql, *args, **kwargs):
+            # We only need to handle the readiness shape. Wallet from $1.
+            wallet = args[0]
+            if "FROM trades_observed" not in sql:
+                return None
+            # Validate the filter is in the SQL the engine sent; otherwise
+            # this test should have failed at the static-SQL assertion.
+            assert "source IS DISTINCT FROM 'onchain'" in sql
+            # Materialise the filter the way Postgres would.
+            count = sum(
+                1
+                for r in fixture_rows
+                if r["wallet_address"] == wallet
+                and r["source"] != "onchain"
+            )
+            return {
+                "trades_observed": count,
+                "positions_resolved": 0,
+                "confirmed_followers": 0,
+                "external_resolved_count": 0,
+                "external_wins": 0,
+                "external_losses": 0,
+                "falcon_score": 0.0,
+            }
+
+        engine = make_engine()
+        patcher, _ = _mock_get_db(
+            fetchrow_mock=AsyncMock(side_effect=_simulated_fetchrow),
+        )
+
+        with patcher:
+            readiness = await engine._get_readiness("0xLeader")
+
+        # Only the websocket row counts — the onchain placeholder is excluded.
+        assert readiness["trades_observed"] == 1, (
+            "readiness must EXCLUDE source='onchain' rows; expected 1 "
+            f"(only the websocket row), got {readiness['trades_observed']}"
+        )

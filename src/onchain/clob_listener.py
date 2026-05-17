@@ -504,6 +504,23 @@ class CLOBChainListener:
         else:
             trade_time = datetime.now(tz=timezone.utc)
 
+        # Markets stub: insert a placeholder markets row BEFORE the
+        # trades_observed insert. The on-chain decoder uses
+        # `market_id = token_id` as a provisional identifier pending
+        # the Wave-3 economic decoder (see CLAUDE.md § 15). Without
+        # this stub, every trades_observed row points at a missing
+        # markets row, which causes LEFT JOINs across the ML / feature
+        # pipeline to resolve to NULL category and breaks downstream
+        # `sync_markets` / `data_quality` accounting. The stub keeps
+        # the FK shape intact; the Wave-3 work will refine the row
+        # (real question, real category) once the asset_id → market
+        # mapping ships.
+        await conn.execute(
+            "INSERT INTO markets (market_id, question, category) "
+            "VALUES ($1, $2, 'unknown') ON CONFLICT (market_id) DO NOTHING",
+            market_id, f"Market {market_id[:30]}…",
+        )
+
         await conn.execute(
             """
             INSERT INTO trades_observed

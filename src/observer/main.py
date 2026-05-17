@@ -149,6 +149,7 @@ async def _load_db_subscriptions(conn, *, wallet_limit: int = 400, token_limit: 
             FROM trades_observed
             WHERE time >= NOW() - INTERVAL '24 hours'
               AND NULLIF(token_id, '') IS NOT NULL
+              AND source IS DISTINCT FROM 'onchain'
             LIMIT $1
             """,
             token_limit,

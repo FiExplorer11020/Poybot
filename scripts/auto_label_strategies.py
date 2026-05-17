@@ -153,6 +153,7 @@ async def fetch_trade_frequencies(
         FROM trades_observed
         WHERE wallet_address = ANY($1)
           AND time >= $2
+          AND source IS DISTINCT FROM 'onchain'
         GROUP BY wallet_address
         """,
         wallets,

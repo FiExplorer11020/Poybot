@@ -304,6 +304,7 @@ class LeaderFeatureExtractor:
                 WHERE t.wallet_address = $1
                   AND t.time >= $2
                   AND t.time <= $3
+                  AND t.source IS DISTINCT FROM 'onchain'
                 ORDER BY t.time ASC
                 """,
                 wallet_address,

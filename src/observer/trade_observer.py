@@ -1920,6 +1920,7 @@ class TradeObserver:
                             SELECT market_id, MAX(time) AS last_seen
                             FROM trades_observed
                             WHERE is_leader = TRUE
+                              AND source IS DISTINCT FROM 'onchain'
                             GROUP BY market_id
                             ORDER BY last_seen DESC
                             LIMIT $1
@@ -1943,6 +1944,7 @@ class TradeObserver:
                         SELECT market_id, MAX(time) AS last_seen
                         FROM trades_observed
                         WHERE is_leader = TRUE
+                          AND source IS DISTINCT FROM 'onchain'
                         GROUP BY market_id
                         ORDER BY last_seen DESC
                         LIMIT $1

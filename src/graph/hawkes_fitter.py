@@ -281,6 +281,7 @@ class HawkesFitter:
                     """
                     SELECT time FROM trades_observed
                     WHERE wallet_address = $1 AND time >= $2
+                      AND source IS DISTINCT FROM 'onchain'
                     ORDER BY time
                     """,
                     leader_wallet,
@@ -294,6 +295,7 @@ class HawkesFitter:
                     """
                     SELECT time FROM trades_observed
                     WHERE wallet_address = $1 AND time >= $2
+                      AND source IS DISTINCT FROM 'onchain'
                     ORDER BY time
                     """,
                     follower_wallet,

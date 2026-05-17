@@ -67,6 +67,7 @@ class RelatedMarketResolver(Detector):
                         SELECT DISTINCT wallet_address, market_id
                         FROM trades_observed
                         WHERE time >= $1
+                          AND source IS DISTINCT FROM 'onchain'
                     ),
                     pairs AS (
                         SELECT

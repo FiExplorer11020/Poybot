@@ -7,6 +7,15 @@ error_model) never sees backfilled rows. Result: 1.2M observed trades, but
 only ~2k positions, ~200 edges, all profiles stuck at insufficient_data /
 phase 1.
 
+REPLAY SCOPE (post-2026-05-17 sample-efficiency cleanup): the chunked
+stream EXCLUDES rows where ``source='onchain'``. Those rows carry a
+placeholder ``market_id = token_id`` and hardcoded ``price=0, side='buy'``
+(CLAUDE.md §15, pending Wave-3 economic decoder) that would poison every
+downstream signal — Beta posteriors, Hawkes MLE, follower edges,
+accuracy aggregates. They will be reattributed once Wave-3 ships; until
+then the replay is INTENTIONALLY incomplete on that source. Pre-flight
+``COUNT(*)`` lines still show raw totals so operators can see the gap.
+
 The pipeline is **subscription-driven**:
 
   trade_observer → trades:observed (pub/sub) → position_tracker
@@ -230,7 +239,12 @@ async def promote_top_wallets_to_leaders(
     AGG_TIMEOUT_S = 600.0  # 10 min — GROUP BY over 1.2M rows can be slow.
     async with get_db() as conn:
         await conn.execute("SET statement_timeout = 0")
-        # 1. compute candidate set from trades_observed
+        # 1. compute candidate set from trades_observed. Exclude
+        # source='onchain' rows: they carry placeholder market_id and
+        # price=0 (CLAUDE.md § 15) and would falsely promote wallets
+        # into the leaders watchlist based on noise rather than real
+        # trading volume. Older rows without a source value still flow
+        # through (IS DISTINCT FROM is NULL-safe).
         candidates = await conn.fetch(
             """
             WITH wallet_stats AS (
@@ -239,6 +253,7 @@ async def promote_top_wallets_to_leaders(
                     SUM(size_usdc)::numeric AS total_volume,
                     COUNT(*) AS n_trades
                 FROM trades_observed
+                WHERE source IS DISTINCT FROM 'onchain'
                 GROUP BY wallet_address
             )
             SELECT wallet_address, total_volume, n_trades
@@ -264,6 +279,7 @@ async def promote_top_wallets_to_leaders(
                 SELECT COUNT(*) FROM (
                     SELECT wallet_address, SUM(size_usdc) AS v, COUNT(*) AS n
                     FROM trades_observed
+                    WHERE source IS DISTINCT FROM 'onchain'
                     GROUP BY wallet_address
                 ) ws
                 WHERE ws.v >= $1 AND ws.n >= $2
@@ -473,6 +489,7 @@ async def replay_trades(
                     SELECT id, time, market_id, token_id, wallet_address,
                            side, price, size_usdc, is_leader, source, category
                     FROM trades_observed
+                    WHERE source IS DISTINCT FROM 'onchain'
                     ORDER BY time ASC, id ASC
                     LIMIT $1
                     """,
@@ -485,6 +502,7 @@ async def replay_trades(
                            side, price, size_usdc, is_leader, source, category
                     FROM trades_observed
                     WHERE (time, id) > ($1, $2)
+                      AND source IS DISTINCT FROM 'onchain'
                     ORDER BY time ASC, id ASC
                     LIMIT $3
                     """,
@@ -583,6 +601,7 @@ async def run(args: argparse.Namespace) -> int:
                 WITH ws AS (
                     SELECT wallet_address, SUM(size_usdc) AS v, COUNT(*) AS n
                     FROM trades_observed
+                    WHERE source IS DISTINCT FROM 'onchain'
                     GROUP BY wallet_address
                 )
                 SELECT

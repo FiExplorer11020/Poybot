@@ -519,6 +519,7 @@ class ErrorModel:
                                 WHERE t.market_id = pr.market_id
                                   AND t.token_id = pr.token_id
                                   AND t.time < pr.open_time
+                                  AND t.source IS DISTINCT FROM 'onchain'
                                 ORDER BY t.time DESC
                                 LIMIT 10
                             ) recent
@@ -563,6 +564,7 @@ class ErrorModel:
                       AND t.is_leader = TRUE
                       AND t.time >= $2
                       AND t.time <= $3
+                      AND t.source IS DISTINCT FROM 'onchain'
                     ORDER BY t.time ASC, t.id ASC
                     """,
                     wallet,

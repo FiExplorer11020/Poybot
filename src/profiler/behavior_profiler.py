@@ -774,7 +774,17 @@ class BehaviorProfiler:
         }
 
     async def _fetch_leader_trades(self, wallet: str | None = None) -> list[dict]:
-        where_sql = "WHERE t.is_leader = TRUE"
+        # Filter out source='onchain' rows. The on-chain decoder still
+        # writes placeholder rows (market_id = token_id, price = 0,
+        # side = 'buy') pending the Wave-3 economic decoder; including
+        # them here corrupts the rebuild of decision_process state
+        # (flip_rate / scale_in_rate / process_score). Older rows
+        # without a source value still flow through thanks to
+        # IS DISTINCT FROM's NULL-safe semantics.
+        where_sql = (
+            "WHERE t.is_leader = TRUE "
+            "AND t.source IS DISTINCT FROM 'onchain'"
+        )
         params: list = []
         if wallet:
             where_sql += " AND t.wallet_address = $1"

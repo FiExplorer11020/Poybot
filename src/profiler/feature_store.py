@@ -656,6 +656,7 @@ async def get_social_signals_asof(
             WHERE wallet_address = $1
               AND time >= $2
               AND time <= $3
+              AND source IS DISTINCT FROM 'onchain'
             ORDER BY time ASC
             """,
             wallet,
@@ -741,6 +742,7 @@ async def get_cross_market_features_asof(
             WHERE wallet_address = $1
               AND time >= $2
               AND time <= $3
+              AND source IS DISTINCT FROM 'onchain'
             ORDER BY time ASC
             """,
             polymarket_wallet,

@@ -280,6 +280,7 @@ class FollowerVolumeDaemon:
                     SELECT time
                     FROM trades_observed
                     WHERE wallet_address = $1 AND time >= $2
+                      AND source IS DISTINCT FROM 'onchain'
                     ORDER BY time
                     """,
                     leader_wallet,
@@ -303,10 +304,12 @@ class FollowerVolumeDaemon:
                     LEFT JOIN leaders l ON l.wallet_address = t.wallet_address
                     WHERE t.time >= $1
                       AND t.wallet_address <> $2
+                      AND t.source IS DISTINCT FROM 'onchain'
                       AND t.market_id IN (
                           SELECT DISTINCT market_id
                           FROM trades_observed
                           WHERE wallet_address = $2 AND time >= $1
+                            AND source IS DISTINCT FROM 'onchain'
                       )
                     ORDER BY t.time
                     LIMIT 50000
@@ -336,13 +339,25 @@ class FollowerVolumeDaemon:
         result: dict[str, Any],
         pool_classes: list[str],
     ) -> None:
-        """Write the fit result to multivariate_hawkes_fits."""
+        """Write the fit result to multivariate_hawkes_fits.
+
+        2026-05-17 fix: NUMERIC(15,4) columns (log_likelihood / bic_threshold /
+        bic_statistic / beta) reject ``inf`` / ``-inf`` / ``nan`` which the
+        Hawkes solver returns on degenerate inputs (e.g. constant follower
+        rate → singular Hessian → inf log-likelihood). The pre-fix path
+        dropped ~20 % of fits silently. Clamp inf to a large sentinel and
+        coerce nan to None so the row lands but the operator can still
+        spot the degenerate case in downstream queries.
+        """
+        import math
+
         # Serialize α/μ/accepted with string keys so JSONB round-trip is
         # clean (tuples are not JSON-serialisable).
         alpha_json = {
-            f"({i}, {j})": float(v) for (i, j), v in result["alpha_matrix"].items()
+            f"({i}, {j})": _safe_float_for_json(v)
+            for (i, j), v in result["alpha_matrix"].items()
         }
-        mu_json = {str(i): float(v) for i, v in result["mu_vector"].items()}
+        mu_json = {str(i): _safe_float_for_json(v) for i, v in result["mu_vector"].items()}
         accepted_json = {
             f"({i}, {j})": bool(v)
             for (i, j), v in result["accepted_couplings"].items()
@@ -369,10 +384,10 @@ class FollowerVolumeDaemon:
                     ",".join(pool_classes),
                     json.dumps(alpha_json),
                     json.dumps(mu_json),
-                    float(result["beta"]),
-                    float(result["log_likelihood"]),
-                    float(result["bic_threshold"]),
-                    float(result["bic_statistic"]),
+                    _clamp_numeric(result["beta"]),
+                    _clamp_numeric(result["log_likelihood"]),
+                    _clamp_numeric(result["bic_threshold"]),
+                    _clamp_numeric(result["bic_statistic"]),
                     json.dumps(accepted_json),
                     int(result.get("n_events_total", 0)),
                     str(result["convergence"]),
@@ -382,6 +397,51 @@ class FollowerVolumeDaemon:
                 f"FollowerVolumeDaemon: persist_fit failed for "
                 f"{leader_wallet[:10]}: {exc}"
             )
+
+
+# --------------------------------------------------------------------------- #
+# Numeric sanitization helpers — protect NUMERIC(15,4) columns from inf/nan.
+# Sentinel choice: ±1e10 is well inside NUMERIC(15,4) range (max ~ 9.99e10)
+# and far outside any plausible log-likelihood or BIC value, so callers
+# inspecting persisted rows can still flag "this was a degenerate fit".
+# --------------------------------------------------------------------------- #
+_NUMERIC_SENTINEL = 1e10
+
+
+def _clamp_numeric(value: Any) -> float | None:
+    """Return a value safe for INSERT into a NUMERIC(15,4) column.
+
+    * ``nan``       → ``None`` (the column is nullable; NULL is honest).
+    * ``+inf``      → ``+_NUMERIC_SENTINEL``.
+    * ``-inf``      → ``-_NUMERIC_SENTINEL``.
+    * finite value  → ``float(value)`` (unchanged).
+    """
+    import math
+
+    try:
+        f = float(value)
+    except (TypeError, ValueError):
+        return None
+    if math.isnan(f):
+        return None
+    if math.isinf(f):
+        return _NUMERIC_SENTINEL if f > 0 else -_NUMERIC_SENTINEL
+    return f
+
+
+def _safe_float_for_json(value: Any) -> float:
+    """Return a JSON-safe float for JSONB serialisation. inf/nan → sentinel."""
+    import math
+
+    try:
+        f = float(value)
+    except (TypeError, ValueError):
+        return 0.0
+    if math.isnan(f):
+        return 0.0
+    if math.isinf(f):
+        return _NUMERIC_SENTINEL if f > 0 else -_NUMERIC_SENTINEL
+    return f
 
 
 # --------------------------------------------------------------------------- #

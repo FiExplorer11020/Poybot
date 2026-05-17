@@ -186,6 +186,26 @@ async def bulk_insert(conn: asyncpg.Connection, rows: list[tuple]) -> int:
     inserted = 0
     for start in range(0, len(rows), INSERT_BATCH):
         chunk = rows[start : start + INSERT_BATCH]
+
+        # Markets stub: ensure a markets row exists for every market_id
+        # referenced by this chunk BEFORE we try to insert the trades.
+        # `_normalize_trade` returns a 10-tuple with market_id at
+        # index 1. Without this stub, fresh markets seen only via the
+        # data-api backfill have no row in `markets` and every
+        # downstream LEFT JOIN on category collapses to NULL — which
+        # silently degrades the profiler's Dirichlet posteriors, the
+        # strategy classifier features, and the dashboard category
+        # mix. The stub is a placeholder (`category='unknown'`); the
+        # next `sync_markets` cycle in the registry refines it with
+        # the real Falcon / Gamma metadata.
+        unique_market_ids = {row[1] for row in chunk if row[1]}
+        if unique_market_ids:
+            await conn.executemany(
+                "INSERT INTO markets (market_id, question, category) "
+                "VALUES ($1, $2, 'unknown') ON CONFLICT DO NOTHING",
+                [(mid, f"Market {mid[:30]}…") for mid in unique_market_ids],
+            )
+
         params: list = []
         placeholders: list[str] = []
         for i, row in enumerate(chunk):

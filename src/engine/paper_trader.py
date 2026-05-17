@@ -1431,6 +1431,7 @@ class PaperTrader:
                     """
                     SELECT price FROM trades_observed
                     WHERE market_id=$1 AND token_id=$2
+                      AND source IS DISTINCT FROM 'onchain'
                     ORDER BY time DESC LIMIT 1
                     """,
                     market_id,
@@ -1666,6 +1667,7 @@ class PaperTrader:
                                SELECT MAX(t.time)
                                FROM trades_observed t
                                WHERE t.market_id = $1
+                                 AND t.source IS DISTINCT FROM 'onchain'
                            ) AS last_trade_time
                     FROM markets m
                     WHERE m.market_id = $1

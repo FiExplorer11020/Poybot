@@ -96,6 +96,7 @@ class GraphEngine:
                     SELECT time, market_id, wallet_address, side, is_leader
                     FROM trades_observed
                     WHERE time >= $1
+                      AND source IS DISTINCT FROM 'onchain'
                     ORDER BY time ASC
                     """,
                     cutoff,

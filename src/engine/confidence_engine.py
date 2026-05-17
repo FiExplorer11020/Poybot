@@ -302,13 +302,21 @@ class ConfidenceEngine:
                 if vol_row and vol_row["volume_24h"]:
                     market_volume = float(vol_row["volume_24h"] or 0)
                 if market_volume <= 0.0:
-                    # Fallback: trades_observed last 24h.
+                    # Fallback: trades_observed last 24h. Exclude
+                    # source='onchain' rows: their price=0 placeholder
+                    # is harmless here (we only sum size_usdc) but the
+                    # `market_id = token_id` placeholder means the
+                    # row would match a different liquidity pool than
+                    # the real market — yielding inflated, attribution-
+                    # less volume. Older rows without a source value
+                    # still flow through (IS DISTINCT FROM is NULL-safe).
                     obs_row = await conn.fetchrow(
                         """
                         SELECT COALESCE(SUM(size_usdc), 0) AS vol
                         FROM trades_observed
                         WHERE market_id = $1
                           AND time >= NOW() - INTERVAL '24 hours'
+                          AND source IS DISTINCT FROM 'onchain'
                         """,
                         market_id,
                     )
@@ -1529,6 +1537,7 @@ class ConfidenceEngine:
                         WHERE market_id = $1
                           AND token_id = $2
                           AND time < $3
+                          AND source IS DISTINCT FROM 'onchain'
                         ORDER BY time DESC
                         LIMIT 10
                     ) recent
@@ -1751,7 +1760,8 @@ class ConfidenceEngine:
                     """
                     SELECT
                         (SELECT COUNT(*) FROM trades_observed t
-                         WHERE t.wallet_address = $1) AS trades_observed,
+                         WHERE t.wallet_address = $1
+                           AND t.source IS DISTINCT FROM 'onchain') AS trades_observed,
                         COALESCE(lp.positions_resolved, 0) AS positions_resolved,
                         (SELECT COUNT(*) FROM follower_edges fe
                          WHERE fe.leader_wallet = $1
