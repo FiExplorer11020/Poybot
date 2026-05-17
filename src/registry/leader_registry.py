@@ -124,12 +124,43 @@ class LeaderRegistry:
         )
         selected_wallets = [wallet for wallet, _ in rows]
         if selected_wallets:
+            # 2026-05-17 strategy round 2: preserve tier-eligible leaders
+            # from being demoted by the Falcon-top-N watchlist refresh.
+            # Without this preservation, the periodic refresh wipes the
+            # 2,000+ leaders auto-promoted by the maintenance loop's
+            # ``auto_promote_to_watchlist`` job (based on Falcon prior +
+            # internal-resolved + confirmed-follower-count). The intent
+            # of refresh_leaderboard is to keep the Falcon-top-N on the
+            # watchlist — not to demote everyone else; the demotion
+            # heuristic was correct when only Falcon ranking mattered
+            # but tier-based gating made it wrong.
             await conn.execute(
                 """
-                UPDATE leaders
+                UPDATE leaders l
                 SET on_watchlist = FALSE
-                WHERE on_watchlist = TRUE
-                  AND NOT (wallet_address = ANY($1::text[]))
+                WHERE l.on_watchlist = TRUE
+                  AND NOT (l.wallet_address = ANY($1::text[]))
+                  -- preserve any leader with non-trivial Falcon Score
+                  AND COALESCE(l.falcon_score, 0) < 20
+                  -- preserve tier-eligible leaders (internal-resolved OR
+                  -- external-resolved threshold)
+                  AND NOT EXISTS (
+                    SELECT 1 FROM leader_profiles lp
+                    WHERE lp.wallet_address = l.wallet_address
+                      AND (
+                        lp.external_resolved_count >= 30
+                        OR lp.positions_resolved >= 30
+                      )
+                  )
+                  -- preserve leaders with confirmed follower clusters
+                  AND NOT EXISTS (
+                    SELECT 1
+                    FROM follower_edges fe
+                    WHERE fe.leader_wallet = l.wallet_address
+                      AND fe.co_occurrences >= 5
+                    GROUP BY fe.leader_wallet
+                    HAVING COUNT(*) >= 3
+                  )
                 """,
                 selected_wallets,
             )

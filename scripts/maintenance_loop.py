@@ -4,7 +4,10 @@ Runs forever, executing these jobs on a schedule:
   - every 60 min: bootstrap fee_snapshots from markets + Gamma refresh
   - every 60 min: refresh markets.end_date + volume_24h from Gamma
   - every 10 min: leader_profiles.trades_observed reconciliation
+  - every 10 min: close orphan open positions for resolved markets
+  - every 30 min: backfill markets.resolved_outcome from Gamma
   - every 6 hours: rebuild follower_edges (full graph)
+  - every 6 hours: auto-promote follower-rich leaders to on_watchlist
   - every 30 min: book:last cache refresh for top liquid markets
 
 Designed as a long-running container/daemon. Stop with SIGTERM.
@@ -13,6 +16,11 @@ This script is the SAFETY NET for known stale-data failure modes:
   - markets.end_date stays current (was NULL silently for all rows)
   - fee_snapshots stays fresh (gate requires < 24h)
   - follower_edges stays populated (was being wiped on engine restart)
+  - position_tracker_state never holds open rows for markets that
+    actually resolved (would otherwise lock per-direction terminal
+    PnL out of positions_reconstructed)
+  - high-influence leaders flip to ``on_watchlist`` once the follower
+    graph confirms them, even if Falcon never picked them up
 
 Idempotent and safe to run alongside the live engine.
 """
@@ -43,8 +51,48 @@ GAMMA_REFRESH_INTERVAL_S = 3600           # 1 h
 PROFILES_RECONCILE_INTERVAL_S = 600       # 10 min
 GRAPH_REBUILD_INTERVAL_S = 21600          # 6 h
 BOOK_CACHE_REFRESH_INTERVAL_S = 120       # 2 min — must be < BOOK_CACHE_TTL_S
-BOOK_CACHE_TTL_S = 600                    # 10 min TTL (>> refresh interval)
+BOOK_CACHE_TTL_S = 240                    # 4 min TTL — paper_trader has its own
+                                          # 60s staleness gate; this is defense
+                                          # in depth so a market dropped from
+                                          # the refresh query (resolved or
+                                          # low-volume) ages out 5x faster.
 STREAM_TRIM_INTERVAL_S = 300              # 5 min
+RESOLUTION_BACKFILL_INTERVAL_S = 1800     # 30 min — backfill markets.resolved_outcome
+                                          # from Gamma closed-market endpoint so
+                                          # paper_trader can close resolved
+                                          # positions at terminal value instead
+                                          # of deferring indefinitely.
+ORPHAN_CLOSE_INTERVAL_S = 600             # 10 min — sweep position_tracker_state
+                                          # for opens on markets Gamma reports
+                                          # closed and publish market_resolved
+                                          # envelopes so the in-process tracker
+                                          # closes them at terminal value.
+PROMOTE_WATCHLIST_INTERVAL_S = 21600      # 6 h — auto-promote leaders with ≥5
+                                          # confirmed follower edges to
+                                          # on_watchlist so the observer's
+                                          # bootstrap UNION picks them up.
+FULL_BACKFILL_INTERVAL_S = 21600          # 6 h — Lever A aggressive sweep. The
+                                          # 30-min ORPHAN_CLOSE job only publishes
+                                          # Redis envelopes; if the observer was
+                                          # down at the time, those publishes are
+                                          # dropped. This job does the
+                                          # INSERT/DELETE in-band against the DB
+                                          # so a long observer outage doesn't
+                                          # strand thousands of opens.
+FULL_BACKFILL_DAYS = 14                   # Cover the last 14 days incrementally
+                                          # on the recurring schedule; the
+                                          # one-shot 2026-05-17 backfill seeds
+                                          # the 90-day history.
+REFRESH_EVENT_TIMES_INTERVAL_S = 1800     # 30 min — refresh markets.is_live_match
+                                          # so a sport market that became live in
+                                          # the last 30m flips True and the
+                                          # confidence engine's `live_match_blocked`
+                                          # gate kicks in immediately. Tier 1 fix #1
+                                          # of docs/autonomous_session_2026_05_17_strategy
+                                          # /02_STRUCTURAL_FIX_PLAN.md (the bug that
+                                          # cost 9 paper trades at -97% on 2026-05-17).
+
+REDIS_MARKET_RESOLVED_CHANNEL = "market:resolved"
 
 _running = True
 
@@ -189,6 +237,318 @@ async def refresh_gamma_markets(pool: asyncpg.Pool, *, max_pages: int = 30) -> t
             if len(markets) < 100:
                 break
     return updated, inserted
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Job: markets.resolved_outcome backfill
+# ──────────────────────────────────────────────────────────────────────
+
+async def _fetch_gamma_closed_page(session, offset, limit=500):
+    """Paginate Gamma closed markets. Returns [] on any failure so the
+    caller can log + skip without crashing the loop."""
+    params = {
+        "limit": limit, "offset": offset,
+        "closed": "true", "active": "false",
+    }
+    try:
+        async with session.get(
+            GAMMA_URL, params=params,
+            timeout=aiohttp.ClientTimeout(total=30),
+        ) as resp:
+            if resp.status != 200:
+                return []
+            return await resp.json()
+    except (aiohttp.ClientError, asyncio.TimeoutError):
+        return []
+
+
+async def backfill_resolved_outcomes(
+    pool: asyncpg.Pool, session: aiohttp.ClientSession,
+) -> tuple[int, int]:
+    """Populate markets.resolved_outcome from Gamma closed-market data.
+
+    Without this, paper_trader's resolved-market close path defers
+    indefinitely (up to a 30-day timeout) because it can't read a
+    terminal value for the YES/NO outcome. We mirror Gamma's
+    `outcomePrices[0]` → "yes" if > 0.5 else "no".
+
+    Only UPSERT where resolved_outcome IS NULL — preserves manual
+    operator overrides. Idempotent and hot-deploy safe.
+    """
+    fetched = 0
+    resolved = 0
+    offset = 0
+    limit = 500
+    # Hard cap on pages so a Gamma misbehavior can't stall the loop.
+    max_pages = 50
+
+    for _ in range(max_pages):
+        markets = await _fetch_gamma_closed_page(session, offset=offset, limit=limit)
+        if not markets:
+            break
+        fetched += len(markets)
+
+        async with pool.acquire() as conn:
+            for m in markets:
+                if not m.get("closed"):
+                    continue
+                cid = m.get("conditionId") or m.get("condition_id")
+                if not cid:
+                    continue
+                prices = m.get("outcomePrices")
+                if isinstance(prices, str):
+                    with suppress(Exception):
+                        prices = json.loads(prices)
+                if not isinstance(prices, list) or len(prices) < 1:
+                    continue
+                try:
+                    yes_terminal = float(prices[0])
+                except (TypeError, ValueError):
+                    continue
+                outcome = "yes" if yes_terminal > 0.5 else "no"
+                res = await conn.execute(
+                    """
+                    UPDATE markets
+                    SET resolved_outcome = $2::varchar,
+                        updated_at = NOW()
+                    WHERE market_id = $1::varchar
+                      AND resolved_outcome IS NULL
+                    """,
+                    cid, outcome,
+                )
+                if res and not res.endswith("0"):
+                    resolved += 1
+
+        if len(markets) < limit:
+            break
+        offset += limit
+
+    return fetched, resolved
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Job: orphan-resolved-position sweep
+# ──────────────────────────────────────────────────────────────────────
+
+
+async def close_orphan_resolved_positions(
+    pool: asyncpg.Pool,
+    redis_client,
+    session: aiohttp.ClientSession,
+) -> tuple[int, int]:
+    """Close per-market opens in ``position_tracker_state`` whose markets
+    Gamma already reports as ``closed=true``.
+
+    The websocket ``market_resolved`` dispatch is the primary path
+    (observer/main.py publishes envelopes; PositionTracker subscribes
+    and closes). This job is the SAFETY NET for two failure modes:
+
+      1. The observer container restarted between the resolution and
+         the next backfill — the WS frame is gone and nobody publishes.
+      2. Polymarket's WS never shipped a ``market_resolved`` frame for
+         this market (it happens occasionally on edge resolutions).
+
+    We query Gamma's closed-market endpoint, intersect with rows in
+    ``position_tracker_state``, and republish a normalised envelope on
+    ``REDIS_MARKET_RESOLVED_CHANNEL`` for each orphan. The PositionTracker
+    handler is idempotent — closing a market with no open positions is
+    a no-op, so a redundant publish from this sweep is harmless.
+
+    Returns ``(markets_checked, envelopes_published)``.
+    """
+    # Step 1: list distinct (market_id) with open state rows.
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT DISTINCT market_id
+            FROM position_tracker_state
+            WHERE shares_remaining > 0
+            """
+        )
+    open_markets = {str(r["market_id"]) for r in rows if r["market_id"]}
+    if not open_markets:
+        return (0, 0)
+
+    # Step 2: walk Gamma closed markets; only act on intersecting IDs.
+    # Reuses the same paginator as backfill_resolved_outcomes for cache
+    # affinity (Gamma is OK with this volume).
+    offset = 0
+    limit = 500
+    max_pages = 50
+    published = 0
+    seen = set()
+
+    for _ in range(max_pages):
+        markets = await _fetch_gamma_closed_page(session, offset=offset, limit=limit)
+        if not markets:
+            break
+        for m in markets:
+            if not m.get("closed"):
+                continue
+            cid = m.get("conditionId") or m.get("condition_id")
+            if not cid or cid not in open_markets or cid in seen:
+                continue
+            seen.add(cid)
+            prices = m.get("outcomePrices")
+            if isinstance(prices, str):
+                with suppress(Exception):
+                    prices = json.loads(prices)
+            if not isinstance(prices, list) or not prices:
+                continue
+            try:
+                yes_terminal = float(prices[0])
+            except (TypeError, ValueError):
+                continue
+            outcome = "yes" if yes_terminal > 0.5 else "no"
+            envelope = json.dumps(
+                {
+                    "market_id": cid,
+                    "outcome": outcome,
+                    "source": "maintenance_orphan_sweep",
+                }
+            )
+            try:
+                await redis_client.publish(
+                    REDIS_MARKET_RESOLVED_CHANNEL, envelope
+                )
+                published += 1
+            except Exception as exc:
+                _log(
+                    f"[orphan_close] publish failed for market={cid}: {exc}"
+                )
+        if len(markets) < limit:
+            break
+        offset += limit
+
+    return (len(open_markets), published)
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Job: full backfill of Gamma resolutions (Lever A — recurring sweep)
+# ──────────────────────────────────────────────────────────────────────
+
+
+async def full_backfill_resolutions(
+    pool: asyncpg.Pool,
+    redis_client,
+    session: aiohttp.ClientSession,
+    *,
+    days: int = FULL_BACKFILL_DAYS,
+) -> dict:
+    """Recurring incremental wrapper around the one-shot
+    ``scripts/backfill_gamma_resolutions_2026_05_17`` script.
+
+    The 30-min ``RESOLUTION_BACKFILL_INTERVAL_S`` job populates
+    ``markets.resolved_outcome`` only. The 10-min ``ORPHAN_CLOSE_INTERVAL_S``
+    job publishes Redis envelopes for the in-process tracker to close
+    open state rows, but those publishes only land if the observer is
+    running at that moment. When the observer was down for any window
+    (deploy, OOM, restart) the open rows accumulate.
+
+    This 6-h job runs the full DB-side close path (INSERT
+    positions_reconstructed + DELETE position_tracker_state + publish
+    ``positions:closed``) for every market Gamma reports closed in the
+    last ``days`` window. Idempotent — already-closed positions are
+    filtered by ``shares_remaining > 0`` and the markets UPDATE skips
+    rows already settled.
+    """
+    # Local import keeps the maintenance loop's startup time small —
+    # the backfill script pulls in argparse + logger config that we
+    # don't need until the first 6-h tick.
+    from scripts import backfill_gamma_resolutions_2026_05_17 as backfill_script
+
+    summary = await backfill_script.run_backfill(
+        pool=pool,
+        redis_client=redis_client,
+        session=session,
+        days=days,
+        batch_size=100,
+        dry_run=False,
+    )
+    return summary.as_dict()
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Job: refresh markets.event_start_time / is_live_match (Tier 1 fix #1)
+# ──────────────────────────────────────────────────────────────────────
+
+
+async def refresh_event_times(
+    pool: asyncpg.Pool,
+    session: aiohttp.ClientSession,
+) -> dict:
+    """Re-pull Gamma `gameStartTime` for every active sport market and
+    recompute the `is_live_match` flag.
+
+    `is_live_match` is a wall-clock derivative (TRUE iff event_start
+    within ±2h of NOW) so even an unchanged event_start_time row
+    flips True / False over the day. Running this every 30 min keeps
+    the confidence engine's hot-path gate accurate without forcing
+    it to compare timestamps inline.
+
+    The actual enrichment logic lives in the import script — we just
+    invoke its top-level orchestrator. Idempotent and hot-deploy
+    safe; if the import script is mid-run when this fires, the second
+    run no-ops on already-correct rows.
+
+    Returns the summary dict so the scheduler can log it.
+    """
+    # Local import keeps the maintenance loop startup small — the
+    # import script pulls in pydantic, which is a non-trivial cost
+    # we don't need until the first 30-min tick.
+    from scripts import import_gamma_event_times_2026_05_17 as event_times_script
+
+    summary = await event_times_script.run_import(
+        pool=pool,
+        session=session,
+        category="sports",
+        dry_run=False,
+    )
+    return summary.as_dict()
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Job: auto-promote follower-rich leaders to on_watchlist
+# ──────────────────────────────────────────────────────────────────────
+
+
+async def auto_promote_to_watchlist(pool: asyncpg.Pool) -> int:
+    """Flip ``on_watchlist=TRUE`` for leaders the follower graph already
+    confirmed but the observer bootstrap might skip.
+
+    Selection criterion (matches the bootstrap UNION query in
+    ``src/observer/main.py``): a wallet with ≥5 follower_edges entries
+    where ``co_occurrences >= 5``. Once promoted, the next observer
+    bootstrap UNION picks the wallet up in the falcon-score branch
+    (because ``excluded=FALSE AND on_watchlist=TRUE`` already qualifies).
+
+    Excluded wallets are NOT promoted — exclusion is a deliberate signal
+    from leader_registry (bot/structural detection) and must be respected.
+    Returns the number of wallets newly promoted.
+    """
+    async with pool.acquire() as conn:
+        # We use UPDATE … WHERE on_watchlist=FALSE so the row count
+        # reflects "newly promoted" rather than "already on_watchlist".
+        res = await conn.execute(
+            """
+            UPDATE leaders
+            SET on_watchlist = TRUE
+            WHERE excluded = FALSE
+              AND on_watchlist = FALSE
+              AND wallet_address IN (
+                  SELECT leader_wallet
+                  FROM follower_edges
+                  WHERE co_occurrences >= 5
+                  GROUP BY leader_wallet
+                  HAVING COUNT(*) >= 5
+              )
+            """
+        )
+    try:
+        promoted = int(res.split()[-1])
+    except (IndexError, ValueError):
+        promoted = 0
+    return promoted
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -410,6 +770,10 @@ async def main():
 
     pool = await asyncpg.create_pool(DB_URL, min_size=1, max_size=4, command_timeout=600)
     redis_client = redis_async.from_url(REDIS_URL, decode_responses=True)
+    # Shared HTTP session for jobs that hit Gamma/CLOB on the cadence
+    # path (refresh_gamma_markets builds its own internally for back-compat
+    # — only backfill_resolved_outcomes uses this one for now).
+    http_session = aiohttp.ClientSession(headers={"User-Agent": USER_AGENT})
 
     _log("maintenance_loop: started")
 
@@ -426,8 +790,44 @@ async def main():
     )
     _log(f"[startup] gamma updated={gamma_u} inserted={gamma_i}")
 
+    # First-tick backfill so historical resolutions get populated quickly
+    # — paper_trader's resolved-close path needs this to avoid the 30d
+    # defer-until-timeout failure mode.
+    res_fetched, res_resolved = (
+        await run_with_recovery(
+            "resolutions", backfill_resolved_outcomes, pool, http_session,
+        )
+        or (0, 0)
+    )
+    _log(
+        f"[startup] resolutions fetched={res_fetched} populated={res_resolved}"
+    )
+
     prof_n = await run_with_recovery("profiles", reconcile_profiles, pool) or 0
     _log(f"[startup] profiles updated={prof_n}")
+
+    # Startup pass for the orphan-close sweep — covers any markets that
+    # resolved while the observer container was down.
+    orphan_checked, orphan_pub = (
+        await run_with_recovery(
+            "orphan_close",
+            close_orphan_resolved_positions,
+            pool, redis_client, http_session,
+        )
+        or (0, 0)
+    )
+    _log(
+        f"[startup] orphan_close open_markets={orphan_checked} "
+        f"published={orphan_pub}"
+    )
+
+    promoted = (
+        await run_with_recovery(
+            "promote_watchlist", auto_promote_to_watchlist, pool,
+        )
+        or 0
+    )
+    _log(f"[startup] promote_watchlist newly_promoted={promoted}")
 
     # Skip graph rebuild on startup — it can take 5-10 min and stalls
     # the loop. Existing edges in DB are fine; the periodic 6h rebuild
@@ -451,6 +851,14 @@ async def main():
         "graph": time.monotonic(),
         "book": time.monotonic(),
         "trim": time.monotonic(),
+        "resolutions": time.monotonic(),
+        "orphan_close": time.monotonic(),
+        "promote_watchlist": time.monotonic(),
+        "full_backfill": time.monotonic(),
+        # Initialise at 0 so the first tick happens within 30s of
+        # daemon start — sport markets that became live during a
+        # restart get flagged immediately.
+        "event_times": 0.0,
     }
 
     while _running:
@@ -497,7 +905,75 @@ async def main():
             _log(f"stream_trim: {res}")
             last_run["trim"] = now
 
+        if now - last_run["resolutions"] > RESOLUTION_BACKFILL_INTERVAL_S:
+            f, r = (
+                await run_with_recovery(
+                    "resolutions", backfill_resolved_outcomes,
+                    pool, http_session,
+                )
+                or (0, 0)
+            )
+            _log(f"resolutions: fetched={f} populated={r}")
+            last_run["resolutions"] = now
+
+        if now - last_run["orphan_close"] > ORPHAN_CLOSE_INTERVAL_S:
+            checked, published = (
+                await run_with_recovery(
+                    "orphan_close",
+                    close_orphan_resolved_positions,
+                    pool, redis_client, http_session,
+                )
+                or (0, 0)
+            )
+            _log(f"orphan_close: open_markets={checked} published={published}")
+            last_run["orphan_close"] = now
+
+        if now - last_run["promote_watchlist"] > PROMOTE_WATCHLIST_INTERVAL_S:
+            promoted = (
+                await run_with_recovery(
+                    "promote_watchlist", auto_promote_to_watchlist, pool,
+                )
+                or 0
+            )
+            _log(f"promote_watchlist: newly_promoted={promoted}")
+            last_run["promote_watchlist"] = now
+
+        if now - last_run["event_times"] > REFRESH_EVENT_TIMES_INTERVAL_S:
+            # Tier 1 fix #1: keep is_live_match accurate vs wall-clock.
+            # Run in a background task so a slow Gamma sweep doesn't
+            # stall the maintenance loop (2.5k sport markets × ~15
+            # concurrency → ~30s typical, ~3min worst-case).
+            async def _bg_event_times():
+                summary = (
+                    await run_with_recovery(
+                        "event_times",
+                        refresh_event_times,
+                        pool, http_session,
+                    )
+                    or {}
+                )
+                _log(f"event_times: {summary}")
+            asyncio.create_task(_bg_event_times())
+            last_run["event_times"] = now
+
+        if now - last_run["full_backfill"] > FULL_BACKFILL_INTERVAL_S:
+            # Don't block the maintenance loop on a multi-minute scan
+            # of 14 days of Gamma history — defer to a background task.
+            async def _bg_full_backfill():
+                summary = (
+                    await run_with_recovery(
+                        "full_backfill",
+                        full_backfill_resolutions,
+                        pool, redis_client, http_session,
+                    )
+                    or {}
+                )
+                _log(f"full_backfill: {summary}")
+            asyncio.create_task(_bg_full_backfill())
+            last_run["full_backfill"] = now
+
     _log("maintenance_loop: shutting down")
+    await http_session.close()
     await pool.close()
     await redis_client.aclose()
 

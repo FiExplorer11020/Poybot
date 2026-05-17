@@ -264,6 +264,7 @@ def test_format_help_lists_all_commands():
         "/status",
         "/pnl",
         "/positions",
+        "/summary",
         "/mode",
         "/killswitch",
         "/pause",
@@ -271,3 +272,91 @@ def test_format_help_lists_all_commands():
         "/help",
     ):
         assert cmd in out
+
+
+# --------------------------------------------------------------------------- #
+# /summary                                                                     #
+# --------------------------------------------------------------------------- #
+
+
+def test_format_summary_full_payload():
+    out = formatters.format_summary(
+        {
+            "trades_closed_today": 12,
+            "trades_open": 3,
+            "wins": 4,
+            "losses": 8,
+            "avg_win": 45.20,
+            "avg_loss": -87.30,
+            "net_today": -518.00,
+            "cum_realized": 41560.00,
+            "unrealized": -23.50,
+            "by_reason": [
+                {"reason": "market_resolved", "count": 6, "avg_pnl": -95.20},
+                {"reason": "stop_loss", "count": 4, "avg_pnl": -12.40},
+                {"reason": "take_profit", "count": 2, "avg_pnl": 38.00},
+            ],
+            "by_strategy": [
+                {"strategy": "follow", "count": 10, "wins": 2, "losses": 8},
+                {"strategy": "fade", "count": 2, "wins": 2, "losses": 0},
+            ],
+        }
+    )
+    assert "TODAY'S SUMMARY" in out
+    assert "12 closed, 3 open" in out
+    assert "wins: 4 (avg +45.20$)" in out
+    assert "losses: 8 (avg -87.30$)" in out
+    assert "net realized: -518.00$ (today)" in out
+    assert "cum realized: +41560.00$ (lifetime)" in out
+    assert "unrealized: -23.50$ (3 open)" in out
+    assert "by close reason:" in out
+    assert "market_resolved: 6 (avg -95.20$)" in out
+    assert "stop_loss: 4 (avg -12.40$)" in out
+    assert "take_profit: 2 (avg +38.00$)" in out
+    assert "by strategy:" in out
+    assert "follow: 10 (2W 8L)" in out
+    assert "fade: 2 (2W 0L)" in out
+
+
+def test_format_summary_empty_day():
+    out = formatters.format_summary(
+        {
+            "trades_closed_today": 0,
+            "trades_open": 0,
+            "wins": 0,
+            "losses": 0,
+            "net_today": 0.0,
+            "cum_realized": 0.0,
+            "unrealized": 0.0,
+            "by_reason": [],
+            "by_strategy": [],
+        }
+    )
+    assert "0 closed, 0 open" in out
+    assert "wins: 0" in out
+    assert "losses: 0" in out
+    # When no breakdowns exist, the sections must be omitted to keep the
+    # message tight on mobile.
+    assert "by close reason:" not in out
+    assert "by strategy:" not in out
+
+
+def test_format_summary_handles_none_unrealized():
+    """If the paper trader can't price (DB / Redis hiccup), unrealized is
+    None and the line must render gracefully without a crash."""
+    out = formatters.format_summary(
+        {
+            "trades_closed_today": 0,
+            "trades_open": 0,
+            "wins": 0,
+            "losses": 0,
+            "net_today": 0.0,
+            "cum_realized": None,
+            "unrealized": None,
+            "by_reason": [],
+            "by_strategy": [],
+        }
+    )
+    # cum_realized + unrealized rows are skipped when value is None.
+    assert "cum realized" not in out
+    assert "unrealized" not in out

@@ -85,6 +85,155 @@ ALLOWED_KEYS: dict[str, str] = {
         "ATE for the (leader, pool) pair does not exclude zero "
         "positively. Boolean, default False (shadow phase)."
     ),
+    # Strategy upgrade 2026-05-17 — Phase 3 cohort selection knobs.
+    # These wire backtest-confirmed filters into the live decision flow
+    # so the operator can tune them from the dashboard.
+    "min_entry_price": (
+        "Strategy 2026-05-17: minimum entry_ask (BUY price). Trades on "
+        "tokens below this floor lose money on average per backtest. "
+        "Default 0.40, applies to both FOLLOW and FADE."
+    ),
+    "max_entry_price": (
+        "Strategy 2026-05-17: maximum entry_ask. Trades above this "
+        "ceiling have asymmetric downside. Default 0.92."
+    ),
+    "max_holding_period_s": (
+        "Strategy 2026-05-17: hard close on any open trade past this "
+        "holding period. Default 86400 (24h) — the win-rate cliff in "
+        "the backtest data."
+    ),
+    # Strategy upgrade 2026-05-17 — sport-specific safety net (Tier 1 #4+#5).
+    # Sport markets resolve in minutes (not hours); the generic 12h cap
+    # holds positions through the entire match and into the resolution
+    # wipe. Tighter cap + tighter stop = exit-time safety net for any
+    # sport trade that slipped past the open-time live-match filter.
+    "sport_max_holding_s": (
+        "Strategy 2026-05-17 (Tier 1 #4): hard close on any sport trade "
+        "past this holding period. Default 1800 (30 min) vs 43200 (12h) "
+        "for non-sport. Catches positions that opened before the live-"
+        "match filter deployed or slipped past it. Force-closes at the "
+        "current bid with reason holding_cap_sport."
+    ),
+    "stop_loss_sport": (
+        "Strategy 2026-05-17 (Tier 1 #5): stop-loss threshold for "
+        "category='sports' trades. Default 0.03 (3%) vs 0.08 (8%) for "
+        "non-sport. Sport prices move 5-15% in seconds during the event; "
+        "the legacy 8% gives too much room for catastrophic resolution "
+        "loss. Applies to BOTH FOLLOW and FADE on sport markets."
+    ),
+    "category_whitelist": (
+        "Strategy 2026-05-17: comma-separated allowed market categories. "
+        "Default 'sports,crypto,macro' — the cohorts with positive "
+        "edge per backtest. politics and unknown are blocked."
+    ),
+    # Strategy upgrade 2026-05-17 — live-match detector (Tier 1 #2+#3).
+    # Master gate + volume-spike threshold for src/economics/
+    # live_match_detector.is_live_match. The predicate is consulted by
+    # BOTH confidence_engine.evaluate AND paper_trader.open_trade (defense
+    # in depth). Flipping the master gate to False keeps the predicate
+    # running (dashboard counters still tally) but stops it from
+    # short-circuiting trades.
+    "live_match_block_enabled": (
+        "Strategy 2026-05-17 (Tier 1 #2+#3): master gate for the "
+        "live-match detector. When True, signals on markets matching "
+        "is_live_match() are rejected from BOTH confidence_engine.evaluate "
+        "and paper_trader.open_trade with reason "
+        "live_match_blocked|signal=<reason>. Default True."
+    ),
+    "live_match_volume_threshold": (
+        "Strategy 2026-05-17 (Tier 1 #3): USDC threshold for the volume-"
+        "spike heuristic inside the live-match detector. Only applied "
+        "when category='sports'. Default 50000."
+    ),
+    # Strategy upgrade 2026-05-17 round 3 (quick-win patch) — book-wall
+    # guard. Reject open_trade when (best_ask - best_bid) >= this value.
+    # Post-mortem evidence: the 11 -97% losses all opened on books with
+    # spread >= 0.50 (binary pre-resolution wall). Default 0.50, runtime-
+    # tunable so the operator can tighten during incident response.
+    "book_wall_max_spread": (
+        "Strategy 2026-05-17 round 3 (quick-win): maximum allowed bid-ask "
+        "spread (in price units, 0..1) for open_trade. Rejects entries "
+        "into pre-resolution binary walls. Default 0.50."
+    ),
+    # Strategy upgrade 2026-05-17 round 3 (quick-win patch) — cold-start
+    # floor. Hard floor on (internal_resolved + external_resolved) before
+    # ANY signal from a leader is accepted. Catches zero-history leaders
+    # that slipped past tier-specific gates. Default 5.
+    "min_leader_total_resolved": (
+        "Strategy 2026-05-17 round 3 (quick-win): minimum combined "
+        "(internal + external) resolved positions for a leader before any "
+        "FOLLOW/FADE signal fires. Default 5."
+    ),
+    "min_leader_resolved_for_follow": (
+        "Strategy 2026-05-17: minimum positions_resolved on a leader "
+        "before FOLLOW signals are accepted. Default 30."
+    ),
+    "min_leader_resolved_for_fade": (
+        "Strategy 2026-05-17: minimum positions_resolved on a leader "
+        "before FADE signals are accepted. Default 30."
+    ),
+    "min_leader_winrate_for_follow": (
+        "Strategy 2026-05-17: minimum posterior win-rate (Beta mean of "
+        "accuracy.overall) for FOLLOW to fire. Default 0.55. Does NOT "
+        "apply to FADE (which intentionally targets losing leaders)."
+    ),
+    # Strategy upgrade 2026-05-17 round 2 — Falcon prior + tiers.
+    # Lever B: discount applied to externally-reported (Falcon Wallet
+    # 360) winning_trades / losing_trades / total_trades counts when
+    # they get fused into the Bayesian gate. 0.5 = trust internal 2×
+    # more than external. Lower values lean on internal observations
+    # (matures slower); higher values lean on Falcon (faster cold-start
+    # at the cost of reporting bias).
+    "falcon_external_discount": (
+        "Strategy 2026-05-17 round 2: discount applied to Falcon Wallet "
+        "360 winning_trades / losing_trades when fused into the "
+        "effective_resolved/effective_winrate posterior. Default 0.5 "
+        "(internal 2× weight)."
+    ),
+    # Lever C: tier-specific gates. Tier A leaders (Falcon-validated)
+    # trade earlier with a softer winrate floor; Tier C (no
+    # validation) keeps the existing strict gate.
+    "tier_a_min_resolved": (
+        "Strategy 2026-05-17 round 2: minimum effective_resolved for "
+        "Tier A (Falcon-validated) leaders. Default 10."
+    ),
+    "tier_a_min_winrate": (
+        "Strategy 2026-05-17 round 2: minimum effective_winrate for "
+        "Tier A FOLLOW. Default 0.50."
+    ),
+    "tier_b_min_resolved": (
+        "Strategy 2026-05-17 round 2: minimum effective_resolved for "
+        "Tier B leaders. Default 20."
+    ),
+    "tier_b_min_winrate": (
+        "Strategy 2026-05-17 round 2: minimum effective_winrate for "
+        "Tier B FOLLOW. Default 0.55."
+    ),
+    "tier_c_min_resolved": (
+        "Strategy 2026-05-17 round 2: minimum effective_resolved for "
+        "Tier C (cold-start, no validation) leaders. Default 30. This "
+        "mirrors the legacy min_leader_resolved_for_follow knob."
+    ),
+    "tier_c_min_winrate": (
+        "Strategy 2026-05-17 round 2: minimum effective_winrate for "
+        "Tier C FOLLOW. Default 0.55."
+    ),
+    "tier_a_falcon_threshold": (
+        "Strategy 2026-05-17 round 2: minimum falcon_score to qualify "
+        "for Tier A. Default 50.0."
+    ),
+    "tier_b_falcon_threshold": (
+        "Strategy 2026-05-17 round 2: minimum falcon_score to qualify "
+        "for Tier B. Default 20.0."
+    ),
+    "tier_a_follower_count": (
+        "Strategy 2026-05-17 round 2: minimum confirmed_followers (OR "
+        "with falcon_score) to qualify for Tier A. Default 5."
+    ),
+    "tier_b_follower_count": (
+        "Strategy 2026-05-17 round 2: minimum confirmed_followers (OR "
+        "with falcon_score) to qualify for Tier B. Default 3."
+    ),
 }
 
 # Inclusive (min, max) bounds for each editable key. Writes outside the
@@ -111,6 +260,60 @@ BOUNDS: dict[str, tuple[float, float]] = {
     "volume_anticipation_threshold_usdc": (50.0, 1_000_000.0),
     # Round 10 — boolean flag (coerced to {0, 1}).
     "causal_gating_enabled": (0.0, 1.0),
+    # Strategy upgrade 2026-05-17 — Phase 3 cohort filters.
+    "min_entry_price": (0.0, 1.0),
+    "max_entry_price": (0.0, 1.0),
+    # 60s lower bound (so we never close instantly), 30d upper bound (TIMEOUT_DAYS).
+    "max_holding_period_s": (60, 30 * 86_400),
+    # Sport-specific safety net. 60s floor mirrors the non-sport cap
+    # (we never want to close instantly); 6h ceiling matches the FOLLOW
+    # min-runway gate — any sport position held > 6h is by definition
+    # not the live-match scenario this filter targets.
+    "sport_max_holding_s": (60, 6 * 3_600),
+    # 0.5% floor (slippage + fee covers most no-news ticks) to 30% ceiling
+    # (anything wider effectively disables the stop and reintroduces the
+    # pre-fix -97% loss). Default 3% lives mid-range, validated by the
+    # paper-trader audit log on Tier 1 sport losses.
+    "stop_loss_sport": (0.005, 0.30),
+    "min_leader_resolved_for_follow": (0, 10_000),
+    "min_leader_resolved_for_fade": (0, 10_000),
+    "min_leader_winrate_for_follow": (0.0, 1.0),
+    # Strategy upgrade 2026-05-17 round 2 — Falcon prior + tier knobs.
+    # falcon_external_discount in (0, 1] — 0 disables the prior, 1
+    # weights external equal to internal. We bound at 0.0..1.0
+    # (inclusive) so the operator can shut it off entirely.
+    "falcon_external_discount": (0.0, 1.0),
+    # Tier resolved gates have the same envelope as the legacy
+    # min_leader_resolved_* knob; bounds are deliberately wide so the
+    # operator can tighten (50+) or loosen (0) as the data evolves.
+    "tier_a_min_resolved": (0, 10_000),
+    "tier_a_min_winrate": (0.0, 1.0),
+    "tier_b_min_resolved": (0, 10_000),
+    "tier_b_min_winrate": (0.0, 1.0),
+    "tier_c_min_resolved": (0, 10_000),
+    "tier_c_min_winrate": (0.0, 1.0),
+    # Tier-A/B falcon-score thresholds. Falcon scores observed in
+    # production sit in [0, 200] so 1000 is a comfortable upper
+    # bound that catches typos.
+    "tier_a_falcon_threshold": (0.0, 1000.0),
+    "tier_b_falcon_threshold": (0.0, 1000.0),
+    # Confirmed-follower counts. We bound 0..1000; in production the
+    # follower-edge population caps near 200 confirmed per leader.
+    "tier_a_follower_count": (0, 1000),
+    "tier_b_follower_count": (0, 1000),
+    # `category_whitelist` is a STRING — handled separately in
+    # set_overrides (see STRING_KEYS below); no numeric bound to enforce.
+    # Strategy upgrade 2026-05-17 — live-match detector knobs.
+    "live_match_block_enabled": (0.0, 1.0),
+    # Volume threshold: lower bound = 0 (disabling the spike signal),
+    # upper bound = $10M (catches accidental decimal-point typos).
+    "live_match_volume_threshold": (0.0, 10_000_000.0),
+    # Strategy upgrade 2026-05-17 round 3 (quick-win) — book-wall +
+    # cold-start floor. Spread bounds are [0.01, 1.0]: 0.01 still permits
+    # ordinary fills, 1.0 effectively disables the gate. Cold-start floor
+    # bounds [0, 1000]: 0 disables the gate, 1000 is a sanity ceiling.
+    "book_wall_max_spread": (0.01, 1.0),
+    "min_leader_total_resolved": (0, 1000),
 }
 
 # Keys that store booleans (not floats). set_overrides coerces these
@@ -122,11 +325,62 @@ BOOLEAN_KEYS: frozenset[str] = frozenset({
     "volume_anticipation_enabled",
     # Round 10 — causal gating flag.
     "causal_gating_enabled",
+    # Strategy upgrade 2026-05-17 — live-match detector master gate.
+    "live_match_block_enabled",
+})
+
+# Keys that store free-form strings (e.g. CSV lists). set_overrides
+# accepts them as-is after `.strip()`, skipping numeric coercion AND
+# bounds-checking. Whitelist them explicitly so a typo can't silently
+# add a string key under a numeric-only contract.
+STRING_KEYS: frozenset[str] = frozenset({
+    # Strategy upgrade 2026-05-17 — comma-separated category whitelist.
+    "category_whitelist",
+})
+
+# Keys that store integers. set_overrides coerces these via int(v) so a
+# JSON-decoded float (e.g. 30.0 from the dashboard form) lands as 30.
+INTEGER_KEYS: frozenset[str] = frozenset({
+    "max_concurrent_positions",
+    "cooldown_seconds",
+    "max_consecutive_losses",
+    "max_recent_losses_per_market",
+    # Strategy upgrade 2026-05-17 — Phase 3 integer knobs.
+    "max_holding_period_s",
+    # Sport-specific holding cap (Tier 1 #4) — stored as int seconds.
+    "sport_max_holding_s",
+    "min_leader_resolved_for_follow",
+    "min_leader_resolved_for_fade",
+    # Strategy upgrade 2026-05-17 round 2 — tier resolved + follower
+    # gates land as integers (counts).
+    "tier_a_min_resolved",
+    "tier_b_min_resolved",
+    "tier_c_min_resolved",
+    "tier_a_follower_count",
+    "tier_b_follower_count",
+    # Strategy upgrade 2026-05-17 round 3 (quick-win) — cold-start floor
+    # is a count of positions.
+    "min_leader_total_resolved",
 })
 
 REDIS_KEY = "runtime_config:overrides"
+# Legacy / operator-facing hash key. The dashboard API writes the JSON
+# blob under ``REDIS_KEY``; operators editing Redis by hand sometimes
+# reach for a hash (HSET runtime_config:risk <field> <value>). The
+# 2026-05-17 incident (paper_trade #25 opened on sports despite
+# ``category_whitelist=crypto,macro`` being HSET 7 min before) traced
+# to readers ignoring this surface. We now merge it underneath the
+# JSON overrides so whichever surface the operator hits propagates
+# within ``_CACHE_TTL_S`` seconds.
+REDIS_LEGACY_HASH_KEY = "runtime_config:risk"
 REDIS_PUBSUB_CHANNEL = "runtime_config:changed"
-_CACHE_TTL_S = 30.0
+# 2026-05-17 fix: dropped 30 s → 5 s after the incident above. A risk
+# knob change must take effect on the next signal eval, not 30 s later
+# (the bot fires several decisions per minute on a hot leader). The
+# pub/sub push-invalidation still drops latency to <100 ms when the
+# operator uses the dashboard; the 5 s ceiling is the worst-case bound
+# for hand-edited Redis keys that bypass the pub/sub channel.
+_CACHE_TTL_S = 5.0
 
 
 @dataclass
@@ -141,7 +395,13 @@ def _defaults_from_settings() -> dict[str, Any]:
         "max_total_exposure_pct": float(getattr(settings, "MAX_MARKET_EXPOSURE_PCT", 0.25)),
         "kelly_fraction": float(getattr(settings, "KELLY_FRACTION", 0.5)),
         "max_drawdown_stop_pct": float(getattr(settings, "MAX_DRAWDOWN_STOP_PCT", 0.20)),
-        "min_signal_strength": float(getattr(settings, "FADE_MIN_CONFIDENCE", 0.65)),
+        # Strategy upgrade 2026-05-17: dedicated MIN_SIGNAL_STRENGTH
+        # default replaces the FADE_MIN_CONFIDENCE fallback. The two
+        # knobs serve different purposes: FADE_MIN_CONFIDENCE is the
+        # error-model confidence gate for FADE only, while
+        # min_signal_strength is the post-Thompson confidence floor for
+        # BOTH FOLLOW and FADE.
+        "min_signal_strength": float(getattr(settings, "MIN_SIGNAL_STRENGTH", 0.30)),
         "max_concurrent_positions": int(getattr(settings, "MAX_CONCURRENT_POSITIONS", 10)),
         "cooldown_seconds": int(getattr(settings, "PAPER_REENTRY_COOLDOWN_S", 300)),
         "max_consecutive_losses": int(getattr(settings, "MAX_CONSECUTIVE_LOSSES", 5)),
@@ -158,7 +418,120 @@ def _defaults_from_settings() -> dict[str, Any]:
         # Round 10 — default OFF until methodology audit + 60-day A/B
         # passes (spec § 6).
         "causal_gating_enabled": False,
+        # Strategy upgrade 2026-05-17 — Phase 3 cohort filter defaults.
+        "min_entry_price": float(getattr(settings, "MIN_ENTRY_PRICE", 0.40)),
+        "max_entry_price": float(getattr(settings, "MAX_ENTRY_PRICE", 0.92)),
+        "max_holding_period_s": int(getattr(settings, "MAX_HOLDING_PERIOD_S", 86_400)),
+        # Sport-specific safety net (Tier 1 #4+#5). Defaults come from
+        # settings so an operator can pin them via env, but the dashboard
+        # cockpit can also flip them at runtime for incident response.
+        "sport_max_holding_s": int(getattr(settings, "SPORT_MAX_HOLDING_S", 1_800)),
+        "stop_loss_sport": float(getattr(settings, "STOP_LOSS_SPORT", 0.03)),
+        "category_whitelist": str(
+            getattr(settings, "CATEGORY_WHITELIST", "sports,crypto,macro")
+        ),
+        # Strategy upgrade 2026-05-17 — live-match detector defaults.
+        "live_match_block_enabled": bool(
+            getattr(settings, "LIVE_MATCH_BLOCK_ENABLED", True)
+        ),
+        "live_match_volume_threshold": float(
+            getattr(settings, "LIVE_MATCH_VOLUME_THRESHOLD", 50_000.0)
+        ),
+        "min_leader_resolved_for_follow": int(
+            getattr(settings, "MIN_LEADER_RESOLVED_FOR_FOLLOW", 30)
+        ),
+        "min_leader_resolved_for_fade": int(
+            getattr(settings, "MIN_LEADER_RESOLVED_FOR_FADE", 30)
+        ),
+        "min_leader_winrate_for_follow": float(
+            getattr(settings, "MIN_LEADER_WINRATE_FOR_FOLLOW", 0.55)
+        ),
+        # Strategy upgrade 2026-05-17 round 2 — Falcon prior + tiers.
+        "falcon_external_discount": float(
+            getattr(settings, "FALCON_EXTERNAL_DISCOUNT", 0.5)
+        ),
+        "tier_a_min_resolved": int(getattr(settings, "TIER_A_MIN_RESOLVED", 10)),
+        "tier_a_min_winrate": float(getattr(settings, "TIER_A_MIN_WINRATE", 0.50)),
+        "tier_b_min_resolved": int(getattr(settings, "TIER_B_MIN_RESOLVED", 20)),
+        "tier_b_min_winrate": float(getattr(settings, "TIER_B_MIN_WINRATE", 0.55)),
+        "tier_c_min_resolved": int(getattr(settings, "TIER_C_MIN_RESOLVED", 30)),
+        "tier_c_min_winrate": float(getattr(settings, "TIER_C_MIN_WINRATE", 0.55)),
+        "tier_a_falcon_threshold": float(
+            getattr(settings, "TIER_A_FALCON_THRESHOLD", 50.0)
+        ),
+        "tier_b_falcon_threshold": float(
+            getattr(settings, "TIER_B_FALCON_THRESHOLD", 20.0)
+        ),
+        "tier_a_follower_count": int(getattr(settings, "TIER_A_FOLLOWER_COUNT", 5)),
+        "tier_b_follower_count": int(getattr(settings, "TIER_B_FOLLOWER_COUNT", 3)),
+        # Strategy upgrade 2026-05-17 round 3 (quick-win) — book-wall +
+        # cold-start floor defaults sourced from settings so an operator
+        # can pin via env. Dashboard cockpit can flip at runtime.
+        "book_wall_max_spread": float(
+            getattr(settings, "BOOK_WALL_MAX_SPREAD", 0.50)
+        ),
+        "min_leader_total_resolved": int(
+            getattr(settings, "MIN_LEADER_TOTAL_RESOLVED", 5)
+        ),
     }
+
+
+def _coerce_legacy_hash(
+    raw: dict[Any, Any], defaults: dict[str, Any]
+) -> dict[str, Any]:
+    """Convert HGETALL output to a typed overrides dict.
+
+    Redis hash values are always strings (or bytes when ``decode_responses
+    =False``). The dashboard JSON path stores typed values; the legacy
+    hash path needs explicit coercion so an HSET'd ``category_whitelist
+    crypto,macro`` lands as ``str`` and ``max_consecutive_losses 3``
+    lands as ``int`` (matching the dashboard contract).
+
+    Coercion rules (in order):
+      * key not in ``ALLOWED_KEYS`` → DROP + warn (typo guard, same
+        guarantee as ``set_overrides``).
+      * key in ``BOOLEAN_KEYS`` → truthy literals {true, 1, yes, on}.
+      * key in ``STRING_KEYS`` → ``str(v).strip()``.
+      * key in ``INTEGER_KEYS`` → ``int(float(v))`` (tolerates "30.0").
+      * else (numeric / float) → ``float(v)``.
+      * Coercion failure → DROP + warn (never raise — a malformed
+        hand-edit must not break the engine's read path).
+    """
+    out: dict[str, Any] = {}
+    for k_raw, v_raw in raw.items():
+        key = k_raw.decode("utf-8") if isinstance(k_raw, (bytes, bytearray)) else str(k_raw)
+        if key not in ALLOWED_KEYS:
+            logger.warning(
+                f"runtime_config: legacy hash key {key!r} not in "
+                "ALLOWED_KEYS — dropped"
+            )
+            continue
+        if isinstance(v_raw, (bytes, bytearray)):
+            v = v_raw.decode("utf-8")
+        else:
+            v = v_raw
+        try:
+            if key in BOOLEAN_KEYS:
+                if isinstance(v, bool):
+                    coerced: Any = bool(v)
+                elif isinstance(v, (int, float)):
+                    coerced = bool(int(v))
+                else:
+                    coerced = str(v).strip().lower() in {"true", "1", "yes", "on"}
+            elif key in STRING_KEYS:
+                coerced = str(v).strip()
+            elif key in INTEGER_KEYS:
+                coerced = int(float(v))
+            else:
+                coerced = float(v)
+        except (TypeError, ValueError) as exc:
+            logger.warning(
+                f"runtime_config: legacy hash key {key!r} value {v!r} "
+                f"failed coercion ({exc}) — dropped"
+            )
+            continue
+        out[key] = coerced
+    return out
 
 
 class RuntimeConfig:
@@ -202,16 +575,39 @@ class RuntimeConfig:
             if self._cache is not None and (time.monotonic() - self._cache.fetched_at) < _CACHE_TTL_S:
                 return self._cache.values
 
+            # Merge order (highest precedence last):
+            #   1. legacy hash at REDIS_LEGACY_HASH_KEY (HGETALL)
+            #   2. JSON blob at REDIS_KEY (set_overrides)
+            # The dashboard writes to (2); hand-edits via
+            # ``redis-cli HSET runtime_config:risk ...`` land in (1).
+            # See REDIS_LEGACY_HASH_KEY docstring + 2026-05-17 incident.
             values: dict[str, Any] = {}
             if self._redis is not None:
+                # (1) Legacy hash — best-effort, types coerced from
+                # string against the defaults map.
+                try:
+                    hash_raw = await self._redis.hgetall(REDIS_LEGACY_HASH_KEY)
+                    if hash_raw:
+                        legacy = _coerce_legacy_hash(hash_raw, self._defaults)
+                        if legacy:
+                            values.update(legacy)
+                            logger.debug(
+                                f"runtime_config: legacy hash overrides "
+                                f"applied keys={sorted(legacy)}"
+                            )
+                except Exception as exc:
+                    logger.warning(
+                        f"runtime_config: legacy hash load failed: {exc}"
+                    )
+                # (2) JSON blob — dashboard authoritative path.
                 try:
                     raw = await self._redis.get(REDIS_KEY)
                     if raw:
                         if isinstance(raw, bytes):
                             raw = raw.decode("utf-8")
-                        values = json.loads(raw)
-                        if not isinstance(values, dict):
-                            values = {}
+                        parsed = json.loads(raw)
+                        if isinstance(parsed, dict):
+                            values.update(parsed)
                 except Exception as exc:
                     logger.warning(f"runtime_config: redis load failed: {exc}")
             self._cache = _CachedOverrides(values=values, fetched_at=time.monotonic())
@@ -240,17 +636,23 @@ class RuntimeConfig:
                         coerced = v.strip().lower() in {"true", "1", "yes", "on"}
                     else:
                         raise TypeError(f"cannot coerce {v!r} to bool")
-                # Coerce ints and floats.
-                elif k in {"max_concurrent_positions", "cooldown_seconds",
-                         "max_consecutive_losses", "max_recent_losses_per_market"}:
+                # Free-form strings (e.g. category whitelist CSV).
+                elif k in STRING_KEYS:
+                    if not isinstance(v, str):
+                        raise TypeError(f"expected str for {k}, got {type(v).__name__}")
+                    coerced = v.strip()
+                # Coerce ints.
+                elif k in INTEGER_KEYS:
                     coerced = int(v)
+                # Default: float.
                 else:
                     coerced = float(v)
             except (TypeError, ValueError):
                 rejected.append(f"{k}: not numeric ({v!r})")
                 continue
-            # Boolean keys bypass bounds — they're already {0,1}.
-            if k not in BOOLEAN_KEYS:
+            # Boolean keys bypass bounds — they're already {0,1}. String
+            # keys have no numeric bounds.
+            if k not in BOOLEAN_KEYS and k not in STRING_KEYS:
                 lo, hi = BOUNDS[k]
                 if coerced < lo or coerced > hi:
                     rejected.append(f"{k}: {coerced} outside [{lo}, {hi}]")

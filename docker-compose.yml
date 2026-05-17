@@ -49,6 +49,11 @@ services:
   postgres:
     image: postgres:15
     container_name: polymarket_db
+    # Dev default. Prod override in docker-compose.prod.yml raises
+    # max_connections to 500 (2026-05-17): the observer's expanded
+    # subscription pool (MAX_OBSERVER_WS_TOKENS 100→400, wallet_limit
+    # 50→200) combined with 19 docker services each holding an asyncpg
+    # pool saturated the prior 25-connection cap.
     environment:
       POSTGRES_USER: polymarket
       POSTGRES_PASSWORD: polymarket_dev_password
@@ -216,12 +221,24 @@ services:
   # Each daemon degrades gracefully on empty inputs (R8 falls back to
   # the uniform-prior dummy when models/strategy_classifier.pkl is
   # missing; R9 + R10 only run nightly batches and sleep otherwise).
+  #
+  # ── Recommended profile for the LAB cockpit (added 2026-05-17) ─────────
+  # Activate ONLY the daemons that feed the LAB tab's gate-validation
+  # workflow (R7 + R8 + R9 + R10). Skips R11/R12 which have no immediate
+  # activation path:
+  #   docker compose --profile lab up -d --no-deps \
+  #     strategy_classifier follower_volume causal mempool
+  # R11 (book_l3 + microstructure) and R12 (social + crossmarket) remain
+  # under the `sprint3` profile only — not activated by `lab`. They feed
+  # tables that nothing currently consumes (microstructure_features,
+  # social_signals, cross_market_positions). Activate them only when an
+  # R11/R12 consumer ships.
 
   # R8 — The Lens. Periodic strategy classification of tier-0/1 wallets.
   # Refreshes every STRATEGY_CLASSIFIER_REFRESH_INTERVAL_H hours.
   strategy_classifier:
     <<: *app-base
-    profiles: ["sprint2"]
+    profiles: ["sprint2", "lab"]
     container_name: polymarket_strategy_classifier
     command: ["python", "-m", "src.strategy_classifier"]
     # Mount the host's models/ directory so the LightGBM pickle
@@ -241,7 +258,7 @@ services:
   # R9 — The Web. Nightly multivariate Hawkes fit at MVHAWKES_BATCH_HOUR_UTC.
   follower_volume:
     <<: *app-base
-    profiles: ["sprint2"]
+    profiles: ["sprint2", "lab"]
     container_name: polymarket_follower_volume
     command: ["python", "-m", "src.follower_volume"]
     healthcheck:
@@ -255,7 +272,7 @@ services:
   # Shadow mode strict: causal_gating_enabled=false in Sprint 2.
   causal:
     <<: *app-base
-    profiles: ["sprint2"]
+    profiles: ["sprint2", "lab"]
     container_name: polymarket_causal
     command: ["python", "-m", "src.causal"]
     healthcheck:
@@ -360,7 +377,7 @@ services:
   # proves the synthetic-intent path is stable.
   mempool:
     <<: *app-base
-    profiles: ["sprint3"]
+    profiles: ["sprint3", "lab"]
     container_name: polymarket_mempool
     command: ["python", "-m", "src.mempool"]
     environment:

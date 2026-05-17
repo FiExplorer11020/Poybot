@@ -12,11 +12,25 @@ from loguru import logger
 from src.config import settings
 from src.database.connection import close_pool, initialize_pool
 from src.logging_setup import configure_logging
-from src.observer.position_tracker import PositionTracker
+from src.observer.market_events import extract_resolution_outcome
+from src.observer.position_tracker import (
+    REDIS_MARKET_RESOLVED_CHANNEL,
+    PositionTracker,
+)
 from src.observer.trade_observer import TradeObserver
 from src.registry.falcon_client import FalconClient
 
-MAX_OBSERVER_WS_TOKENS = 100
+# Raised from 100 → 600 (2026-05-17 round 2): the tier-based + Falcon-prior
+# upgrade unlocked 2,369 qualifying leaders (vs 80 baseline). The observer
+# needs to subscribe to as many of those as possible to feed the engine.
+# History: tried 800 first (DB pool saturation at max_connections=25), then
+# 400 once max_connections was raised to 500, then 600 with 42/500 (8.4%)
+# utilization observed in prod. 2026-05-17 phase-1 plan target was 800 to
+# cover ~34% of the 2,369 tier-qualifying leader pool. With 8.4% utilization
+# at 600, projection is ~56/500 (11.2%) at 800 — still well below the 80%
+# soft ceiling. Bumping per docs/autonomous_session_2026_05_17_strategy/
+# 00_DIAGNOSIS_AND_PLAN.md §B.8.
+MAX_OBSERVER_WS_TOKENS = 800
 
 
 def _extract_gamma_market_tokens(markets: list[dict[str, Any]]) -> set[str]:
@@ -57,22 +71,34 @@ async def _fetch_active_market_tokens(
         return set()
 
 
-async def _load_db_subscriptions(conn, *, wallet_limit: int = 50, token_limit: int = 250):
+async def _load_db_subscriptions(conn, *, wallet_limit: int = 400, token_limit: int = 250):
     # IMPORTANT: each query is wrapped in its own try/except so a slow / failing
     # query (e.g. GROUP BY full-scan on trades_observed) doesn't void the whole
     # bootstrap — the silent root cause of the "0 leader wallets" bug.
+    #
+    # ``wallet_limit`` raised from 50 → 400 (2026-05-17 diagnosis §B.8):
+    # each UNION branch caps independently, so the union is naturally
+    # smaller than the sum of caps. With three sources the total leader
+    # population subscribed is on the order of 800–1200, matching the
+    # MAX_OBSERVER_WS_TOKENS bump.
     wallets: set[str] = set()
     tokens: set[str] = set()
 
     try:
-        # Mix: top by falcon_score (curated quality) + top by confirmed-
-        # follower count (where the real leader signal lives).
+        # Three-source UNION: curated quality (falcon_score) +
+        # confirmed-follower pool + observed-winrate-from-reconstructed.
+        #
         # The leaderboard ranks wallets by PnL — but the bot's edge is
         # the FOLLOWER POOL the leader excites, not the leader's own
-        # accuracy. So we must include both populations: high-pnl
-        # wallets that have a small but reliable follower cluster
-        # already, AND high-influence wallets we may have missed in
-        # the leaderboard.
+        # accuracy. We must include all three populations:
+        #   1. high-falcon wallets (Falcon's PnL leaderboard);
+        #   2. wallets with a small but reliable follower cluster
+        #      already (caught by follower_edges);
+        #   3. wallets with a measured high winrate in
+        #      positions_reconstructed (caught by us, not Falcon —
+        #      this is the pool the new strategy gate filters on).
+        # Without source #3 the bot misses observed-winners that
+        # Falcon's leaderboard hasn't picked up yet (cold-start gap).
         wallet_rows = await conn.fetch(
             """
             (
@@ -93,6 +119,18 @@ async def _load_db_subscriptions(conn, *, wallet_limit: int = 50, token_limit: i
                 GROUP BY fe.leader_wallet
                 HAVING COUNT(*) >= 5
                 ORDER BY COUNT(*) DESC
+                LIMIT $1
+            )
+            UNION
+            (
+                SELECT wallet_address
+                FROM positions_reconstructed
+                WHERE close_time > NOW() - INTERVAL '30 days'
+                GROUP BY wallet_address
+                HAVING COUNT(*) >= 20
+                   AND COUNT(*) FILTER (WHERE pnl_usdc > 0)::float
+                       / COUNT(*) >= 0.60
+                ORDER BY SUM(pnl_usdc) DESC
                 LIMIT $1
             )
             """,
@@ -184,6 +222,61 @@ async def _bootstrap_subscriptions() -> tuple[set[str], set[str]]:
     return wallets, tokens
 
 
+def _install_market_resolved_dispatcher(
+    observer: TradeObserver, redis_client
+) -> None:
+    """Wrap ``observer._handle_ws_message`` to publish ``market_resolved``
+    frames to ``REDIS_MARKET_RESOLVED_CHANNEL`` for the PositionTracker.
+
+    The trade observer's WS handler already short-circuits unknown event
+    types — it accepts ``market_resolved`` as a "known non-event" but
+    doesn't dispatch it anywhere. Wiring is done here (rather than inside
+    trade_observer) to keep the observer's responsibilities focused on
+    trade ingestion. Wrapping is monotonic: once installed, every WS
+    frame still flows to the original handler; we only add a side-effect
+    publish on ``market_resolved``.
+    """
+    original = observer._handle_ws_message
+
+    async def _dispatcher(msg: dict) -> None:
+        # Always run the original FIRST so existing behavior (book/price
+        # change/heartbeat metrics) is preserved even if the publish
+        # below raises.
+        await original(msg)
+        try:
+            event_type = str(msg.get("event_type") or msg.get("type") or "")
+            if event_type != "market_resolved":
+                return
+            market_id = msg.get("market") or msg.get("market_id")
+            outcome = extract_resolution_outcome(msg)
+            if not market_id or not outcome:
+                logger.debug(
+                    "Observer: market_resolved frame missing market/outcome; "
+                    f"market={market_id!r}, outcome={outcome!r}"
+                )
+                return
+            envelope = json.dumps(
+                {
+                    "market_id": str(market_id),
+                    "outcome": outcome,
+                    "source": "websocket",
+                }
+            )
+            await redis_client.publish(REDIS_MARKET_RESOLVED_CHANNEL, envelope)
+            logger.info(
+                f"Observer: dispatched market_resolved market={market_id} "
+                f"outcome={outcome}"
+            )
+        except Exception as exc:
+            # The publish must never propagate — the WS frame is already
+            # consumed by the original handler.
+            logger.warning(
+                f"Observer: market_resolved dispatch failed: {exc}"
+            )
+
+    observer._handle_ws_message = _dispatcher  # type: ignore[method-assign]
+
+
 async def main() -> None:
     level = configure_logging()
     logger.info(f"Starting Observer (log_level={level})")
@@ -203,6 +296,11 @@ async def main() -> None:
         leader_markets=leader_markets,
     )
     tracker = PositionTracker(redis_client=redis_client)
+    # Install the market_resolved dispatcher AFTER `TradeObserver` is
+    # constructed (it wraps its instance-bound `_handle_ws_message`) but
+    # BEFORE `observer.start()` so the WS client sees the wrapped handler
+    # from the very first frame it receives.
+    _install_market_resolved_dispatcher(observer, redis_client)
     # Phase 2 Task C: hydrate _open_positions from position_tracker_state
     # BEFORE tracker.start() subscribes to trades. Without this, a SELL
     # that lands seconds after restart can't be matched to the OPEN it

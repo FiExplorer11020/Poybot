@@ -174,14 +174,25 @@ class TestDockerignore:
 
 
 class TestCompose:
+    # Updated 2026-05-17: was 7 (sprint-0 only); now 20 to match the live
+    # compose file after R6→R13 daemons landed. R6 spine = onchain +
+    # crawler + falcon_refresher + maintenance; R13 = calibration;
+    # sprint-2 (R8/R9/R10) = strategy_classifier + follower_volume +
+    # causal; sprint-3 (R11/R12/R7) = book_l3 + microstructure + social +
+    # crossmarket + mempool. Sprint-2/3 services are profile-gated, so
+    # they don't spawn on a vanilla `up -d`, but they ARE defined.
     EXPECTED_SERVICES = {
-        "postgres",
-        "redis",
-        "observer",
-        "engine",
-        "registry",
-        "api",
-        "backups",
+        # core
+        "postgres", "redis", "observer", "engine", "registry", "api",
+        "backups", "maintenance",
+        # R6 spine
+        "onchain", "crawler", "falcon_refresher",
+        # R13
+        "calibration",
+        # sprint-2 (R8/R9/R10) — profile-gated
+        "strategy_classifier", "follower_volume", "causal",
+        # sprint-3 (R11/R12/R7) — profile-gated
+        "book_l3", "microstructure", "social", "crossmarket", "mempool",
     }
 
     def test_compose_parses(self, compose):
@@ -254,15 +265,19 @@ class TestCompose:
 
 
 class TestComposeProd:
+    # Updated 2026-05-17: postgres 300→1024M (R6-R13 schema needs bigger
+    # buffers + 500 max_connections), redis 64→160M (R7/R11 streams),
+    # observer 300→350M, engine 600→700M (jax/lightgbm), api 200→300M
+    # (R6-R13 endpoint surface + v2 dashboard SQL).
     @pytest.mark.parametrize(
         "service,limit",
         [
-            ("postgres", "300M"),
-            ("redis", "64M"),
-            ("observer", "300M"),
-            ("engine", "600M"),
+            ("postgres", "1024M"),
+            ("redis", "160M"),
+            ("observer", "350M"),
+            ("engine", "700M"),
             ("registry", "200M"),
-            ("api", "200M"),
+            ("api", "300M"),
             ("backups", "200M"),
         ],
     )

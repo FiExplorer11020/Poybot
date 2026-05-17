@@ -3,7 +3,7 @@ Unit tests for src/engine/paper_trader.py
 """
 
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -25,6 +25,11 @@ def _make_decision(
     confidence: float = 0.8,
     leader_wallet: str = "0xLeader",
 ) -> dict:
+    # `market_category=sports` lives in the default whitelist
+    # ("sports,crypto,macro") so the strategy-upgrade 2026-05-17
+    # `category_not_whitelisted` gate does not reject these synthetic
+    # decisions. Production upstream (confidence_engine.evaluate) always
+    # sets a market_category before publishing to the decisions channel.
     return {
         "action": action,
         "market_id": market_id,
@@ -33,6 +38,7 @@ def _make_decision(
         "confidence": confidence,
         "leader_wallet": leader_wallet,
         "signal_audit": {"accepted": True},
+        "trade_context": {"market_category": "sports"},
     }
 
 
@@ -103,6 +109,8 @@ class TestOpenTrade:
         """Opening a 200 USDC trade reduces capital from 10 000 to 9 800."""
         trader = _make_trader()
         decision = _make_decision(size_usdc=200.0)
+        # Resolution far enough in the future to pass MIN_HOURS_TO_RESOLUTION_FOLLOW.
+        far_future_end = datetime.now(tz=timezone.utc) + timedelta(days=7)
 
         @asynccontextmanager
         async def _multi_cm():
@@ -115,6 +123,8 @@ class TestOpenTrade:
                     return None
                 if "FROM markets m" in sql and "last_trade_time" in sql:
                     return {"end_date": None, "last_trade_time": None}
+                if "SELECT end_date FROM markets" in sql:
+                    return {"end_date": far_future_end}
                 if "FROM trades_observed" in sql:
                     return {"price": 0.55}
                 if "SELECT fee_rate_pct FROM markets" in sql:
@@ -197,12 +207,21 @@ class TestOpenTrade:
         result = await trader.open_trade(decision)
 
         assert result is None
-        redis.hincrby.assert_awaited_once_with(
+        # ``_record_open_trade_refusal`` now bumps BOTH ``:1h`` and ``:24h``
+        # buckets (2026-05-17 diagnosis §A.7). Verify each separately rather
+        # than asserting awaited-once.
+        redis.hincrby.assert_any_call(
             "paper:rejections:1h",
             "missing_accepted_signal_audit",
             1,
         )
-        redis.expire.assert_awaited_once_with("paper:rejections:1h", 3600)
+        redis.hincrby.assert_any_call(
+            "paper:rejections:24h",
+            "missing_accepted_signal_audit",
+            1,
+        )
+        redis.expire.assert_any_call("paper:rejections:1h", 3600)
+        redis.expire.assert_any_call("paper:rejections:24h", 86400)
 
     @pytest.mark.asyncio
     async def test_open_trade_skips_when_matching_open_trade_already_exists(self):

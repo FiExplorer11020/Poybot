@@ -62,9 +62,13 @@ class _StubTrade:
 
 
 class _StubPaperTrader:
-    def __init__(self) -> None:
+    def __init__(self, unrealized: float = -5.5) -> None:
         self.capital = 10500.0
         self.open_trades = [_StubTrade(50.0), _StubTrade(25.0)]
+        self._unrealized = unrealized
+
+    async def compute_unrealized_pnl(self) -> float:
+        return self._unrealized
 
 
 @pytest.fixture
@@ -125,6 +129,39 @@ async def test_pnl_uses_portfolio_state(monkeypatch, ctx):
     assert "+120.00$" in out
 
 
+async def test_pnl_unrealized_uses_mark_to_market(monkeypatch, ctx):
+    """The audit's structural bug: cost-basis unrealized always returns ~0.
+    Verify the new path calls compute_unrealized_pnl on the paper trader
+    and surfaces its signed value instead of the broken formula."""
+    fake_state = type("S", (), {"realized_pnl_cum": 0.0})()
+
+    async def fake_load():
+        return fake_state
+
+    monkeypatch.setattr("src.engine.portfolio_state.load_state", fake_load)
+
+    class _BadDB:
+        async def __aenter__(self):
+            raise RuntimeError("no db in unit tests")
+
+        async def __aexit__(self, *a):
+            return False
+
+    monkeypatch.setattr("src.database.connection.get_db", lambda: _BadDB())
+
+    # Stub paper trader returns +37.42 unrealized — must show up verbatim.
+    ctx.paper_trader = _StubPaperTrader(unrealized=37.42)
+    out = await commands.cmd_pnl(ctx)
+    assert "paper unrealized: +37.42$" in out
+
+    # Negative mark-to-market is the other half of the fix — the broken
+    # formula could never return a meaningful loss when capital had been
+    # debited by the size of open positions.
+    ctx.paper_trader = _StubPaperTrader(unrealized=-128.10)
+    out = await commands.cmd_pnl(ctx)
+    assert "paper unrealized: -128.10$" in out
+
+
 # --------------------------------------------------------------------------- #
 # /positions                                                                   #
 # --------------------------------------------------------------------------- #
@@ -142,6 +179,35 @@ async def test_positions_handles_db_failure_gracefully(monkeypatch, ctx):
     monkeypatch.setattr("src.database.connection.get_db", lambda: _BadDB())
     out = await commands.cmd_positions(ctx)
     assert "(none)" in out
+
+
+# --------------------------------------------------------------------------- #
+# /summary                                                                     #
+# --------------------------------------------------------------------------- #
+
+
+async def test_summary_handles_db_failure_gracefully(monkeypatch, ctx):
+    """If the DB is down, /summary still renders the header + open count
+    from the paper trader, rather than crashing."""
+    fake_state = type("S", (), {"realized_pnl_cum": 0.0})()
+
+    async def fake_load():
+        return fake_state
+
+    monkeypatch.setattr("src.engine.portfolio_state.load_state", fake_load)
+
+    class _BadDB:
+        async def __aenter__(self):
+            raise RuntimeError("db down")
+
+        async def __aexit__(self, *a):
+            return False
+
+    monkeypatch.setattr("src.database.connection.get_db", lambda: _BadDB())
+    out = await commands.cmd_summary(ctx)
+    assert "TODAY'S SUMMARY" in out
+    # Open count + unrealized come from the paper trader, not the DB.
+    assert "0 closed, 2 open" in out
 
 
 # --------------------------------------------------------------------------- #

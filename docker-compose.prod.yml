@@ -28,12 +28,18 @@ services:
     # in R11, JSONB-heavy Hawkes/causal blobs). The previous 300 M cgroup
     # cap caused systemic OOM-kills under load (postgres consistently at
     # 99 % of limit). Bumped to 1 G with proportionally larger buffers.
+    # max_connections raised 25→500 (2026-05-17 strategy session): the
+    # observer's expanded subscription pool (MAX_OBSERVER_WS_TOKENS
+    # 100→400, wallet_limit 50→200) and 19 docker services each holding
+    # an asyncpg pool saturated the prior 25-connection cap. shared_buffers
+    # also bumped 256→384 MB to keep page cache responsive at the higher
+    # connection count.
     command: >
       postgres
-      -c shared_buffers=256MB
+      -c shared_buffers=384MB
       -c work_mem=8MB
       -c maintenance_work_mem=64MB
-      -c max_connections=25
+      -c max_connections=500
       -c effective_cache_size=512MB
       -c checkpoint_completion_target=0.9
     deploy:

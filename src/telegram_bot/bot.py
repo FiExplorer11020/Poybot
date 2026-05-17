@@ -123,6 +123,9 @@ class TelegramBot:
             CommandHandler("positions", self._wrap(commands.cmd_positions))
         )
         self._app.add_handler(
+            CommandHandler("summary", self._wrap(commands.cmd_summary))
+        )
+        self._app.add_handler(
             CommandHandler("mode", self._wrap_with_args(commands.cmd_mode))
         )
         self._app.add_handler(

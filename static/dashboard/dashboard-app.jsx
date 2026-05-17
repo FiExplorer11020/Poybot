@@ -7,7 +7,7 @@ const {
 } = window;
 const { AlphaTerminal, MarketScanner, LivePortfolio, DecisionEngine, RiskConfig, BotHealth, WalletGraph, MLProgression } = window;
 
-const { Inspector } = window;
+const { Inspector, LabGates } = window;
 const NAV = [
   { id: 'alpha',      label: 'ALPHA TERMINAL',  icon: '◈', component: AlphaTerminal },
   { id: 'mlprog',     label: 'ML PROGRESSION',  icon: '◍', component: MLProgression },
@@ -21,6 +21,10 @@ const NAV = [
   { id: 'inspector',  label: 'INSPECTOR',       icon: '✦', component: Inspector || (() => null) },
   { id: 'risk',       label: 'RISK & CONFIG',   icon: '◆', component: RiskConfig    },
   { id: 'health',     label: 'BOT HEALTH',      icon: '◐', component: BotHealth     },
+  // LAB tab — single cockpit for R7/R8/R9/R10 runtime gates. Added 2026-05-17
+  // to surface the V2 features that have backend daemons running but whose
+  // output is gated OFF until shadow-soaks pass + operator validates per gate.
+  { id: 'lab',        label: 'LAB',             icon: '⚗', component: LabGates || (() => null) },
 ];
 
 // ── Sidebar ────────────────────────────────────────────────────────────────────

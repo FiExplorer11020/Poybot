@@ -199,11 +199,53 @@ class ConfidenceEngine:
         if not wallet or not market_id:
             return None
 
+        # ── 2026-05-17 round 3: excluded-leader guard ───────────────────
+        # The leaders.excluded flag is the most authoritative deny signal
+        # in the system — set by `enrich_leaders` for `falcon_no_data`
+        # wallets, by structural-bot detection, by post-mortem operator
+        # action, and (round 3 quick-win) anywhere a wallet is known to
+        # be untradable. Run BEFORE `_trade_age_s` so an excluded wallet
+        # never costs us a downstream fetch or a stale_trade log entry.
+        # The lookup is a single-row query on the small `leaders` table
+        # (PK index lookup, sub-ms). On any DB failure we silently fall
+        # through to the legacy behavior (excluded=False) — the same
+        # defensive default the rest of the engine uses, so a transient
+        # DB blip can't accidentally widen acceptance.
+        gate_state = await self._get_leader_gate_state(wallet)
+        if gate_state.get("excluded"):
+            exclude_reason = (
+                str(gate_state.get("exclude_reason") or "unspecified").strip()
+                or "unspecified"
+            )
+            await self._log_decision(
+                wallet,
+                market_id,
+                "skip",
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                f"leader_excluded|reason={exclude_reason}",
+            )
+            return None
+
         trade_time, trade_age_s = self._trade_age_s(trade)
         if trade_age_s > float(settings.LIVE_DECISION_MAX_TRADE_AGE_S):
-            logger.debug(
-                f"Skipping stale leader trade for {wallet} on {market_id}: "
-                f"age={trade_age_s:.1f}s source={trade.get('source')}"
+            # 2026-05-17 round 2 diagnosis: this gate was silently dropping
+            # 224 of 225 leader trades per hour (99.6%) because the realistic
+            # observer-to-engine latency (api_wallet REST poll cadence +
+            # publish + subscriber callback) is 200-400 s — well above the
+            # original 120 s cap. We log to decision_log now so future
+            # operators can SEE the gate fire instead of silent-skipping.
+            await self._log_decision(
+                wallet,
+                market_id,
+                "skip",
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                f"stale_trade|age={trade_age_s:.0f}s|max={int(settings.LIVE_DECISION_MAX_TRADE_AGE_S)}s",
             )
             return None
 
@@ -240,16 +282,50 @@ class ConfidenceEngine:
         # on illiquid markets with NO follow-up trade activity — useless
         # for trading even if all other gates pass. Threshold $5k matches
         # the maintenance loop's coverage tier.
+        #
+        # Strategy upgrade 2026-05-17: `markets.volume_24h` is often
+        # stale or 0 (the 580 vol24h=0 SKIPs/24h that dominated the
+        # SKIP reasons came from data-freshness, not real zero volume).
+        # Fall back to a query on `trades_observed` (sum of size_usdc
+        # in the last 24h) when `markets.volume_24h` is 0/NULL. If both
+        # sources are zero → keep the SKIP and log the dual-zero case
+        # for debugging.
+        market_volume = 0.0
+        volume_source = "markets.volume_24h"
+        observed_volume = 0.0
         try:
             async with get_db() as conn:
                 vol_row = await conn.fetchrow(
                     "SELECT volume_24h FROM markets WHERE market_id = $1",
                     market_id,
                 )
-            market_volume = float(vol_row["volume_24h"] or 0) if vol_row else 0.0
+                if vol_row and vol_row["volume_24h"]:
+                    market_volume = float(vol_row["volume_24h"] or 0)
+                if market_volume <= 0.0:
+                    # Fallback: trades_observed last 24h.
+                    obs_row = await conn.fetchrow(
+                        """
+                        SELECT COALESCE(SUM(size_usdc), 0) AS vol
+                        FROM trades_observed
+                        WHERE market_id = $1
+                          AND time >= NOW() - INTERVAL '24 hours'
+                        """,
+                        market_id,
+                    )
+                    if obs_row and obs_row["vol"] is not None:
+                        observed_volume = float(obs_row["vol"] or 0)
+                        if observed_volume > 0.0:
+                            market_volume = observed_volume
+                            volume_source = "trades_observed.last_24h"
         except Exception:
             market_volume = 0.0
         if market_volume < 5000.0:
+            if market_volume == 0.0 and observed_volume == 0.0:
+                logger.debug(
+                    f"low_market_liquidity DUAL ZERO market={market_id} "
+                    f"wallet={wallet}: markets.volume_24h=0 AND "
+                    "trades_observed last 24h=0"
+                )
             await self._log_decision(
                 wallet,
                 market_id,
@@ -258,11 +334,43 @@ class ConfidenceEngine:
                 0.0,
                 0.0,
                 market_volume,
-                f"low_market_liquidity|vol24h={market_volume:.0f}",
+                f"low_market_liquidity|vol24h={market_volume:.0f}|src={volume_source}",
             )
             return None
 
         readiness = await self._get_readiness(wallet)
+
+        # ── 2026-05-17 round 3: cold-start floor ─────────────────────────
+        # Hard floor on (internal_resolved + external_resolved) before
+        # any FOLLOW/FADE signal fires. Runs after `_get_readiness` so we
+        # have both counts in hand and before Thompson sampling so a
+        # zero-history wallet never costs us a posterior update. The
+        # tier-specific resolved gates further downstream still apply —
+        # this is a system-wide minimum that catches wallets that slip
+        # past the per-tier knobs (e.g. via FADE-only path or missing
+        # Falcon data). Cheap insurance: one comparison on data we
+        # already have.
+        internal_resolved = int(readiness.get("positions_resolved", 0) or 0)
+        external_resolved = int(readiness.get("external_resolved_count", 0) or 0)
+        cold_start_floor = int(
+            await self._read_min_leader_total_resolved()
+        )
+        if (internal_resolved + external_resolved) < cold_start_floor:
+            await self._log_decision(
+                wallet,
+                market_id,
+                "skip",
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                (
+                    f"cold_start_zero_resolved|internal={internal_resolved}"
+                    f"|external={external_resolved}|min={cold_start_floor}"
+                ),
+            )
+            return None
+
         # Use adaptive thresholds (refreshed periodically by the engine
         # scheduler) so cold-start gates relax automatically once the
         # system has accumulated enough data. Falls back to settings.*
@@ -288,6 +396,237 @@ class ConfidenceEngine:
             return None
 
         profile = await self._get_profile_snapshot(wallet)
+
+        # ── Strategy upgrade 2026-05-17 (Tier 1 fix #2+#3) — live-match gate ─
+        # Reject signals on markets that look like a LIVE sport/eSports
+        # match (resolves in MINUTES, not hours/days). The legacy
+        # `MIN_HOURS_TO_RESOLUTION_FOLLOW=6h` gate is conceptually wrong
+        # here because `markets.end_date` is the dispute-window
+        # expiration, not the moment of resolution. On 2026-05-17 the
+        # bot lost 9 trades at -96/98% by following leaders into IPL /
+        # eSports matches that resolved in MINUTES while the time-to-
+        # end_date filter saw ~169h of runway and waved them through.
+        # The detector combines (1) Agent A's authoritative `markets.
+        # is_live_match` Gamma flag, (2) regex on the question, (3) a
+        # today-date heuristic, and (4) a sports-volume spike. Runs
+        # BEFORE the leader_quality_gate so we don't waste posterior
+        # math on a market that's about to settle. The redundant
+        # paper_trader.open_trade check provides defense in depth in
+        # case the engine is bypassed by a direct router push.
+        try:
+            from src.economics.live_match_detector import (
+                is_live_match,
+                live_match_block_enabled,
+            )
+            live_is, live_reason = await is_live_match(market_id)
+            block_enabled = await live_match_block_enabled()
+        except Exception as exc:
+            logger.debug(
+                f"live_match_detector: predicate failed for "
+                f"market={market_id}: {exc}"
+            )
+            live_is, live_reason, block_enabled = False, "no_match", False
+        if live_is and block_enabled:
+            await self._log_decision(
+                wallet,
+                market_id,
+                "skip",
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                f"live_match_blocked|signal={live_reason}",
+            )
+            return None
+
+        # ── Strategy upgrade 2026-05-17 round 2 — Falcon-prior + tier gate ─
+        # Replaces the prior internal-only `leader_quality_gate`. Two
+        # changes:
+        #   (1) The posterior counts are fused with the Falcon Wallet
+        #       360 track record via `_compute_effective_metrics`. A
+        #       leader Falcon has observed 200 trades on but we only
+        #       reconstructed 5 still passes the resolved gate.
+        #   (2) The resolved + winrate floors are TIER-SPECIFIC
+        #       (`_classify_leader_tier` returns A/B/C from
+        #       `falcon_score` OR `confirmed_followers`). Tier A
+        #       (Falcon-validated) gets the loosest gate; Tier C
+        #       (cold-start, no validation) keeps the legacy strict
+        #       gate so we don't silently widen risk.
+        # FADE intentionally bypasses the winrate gate (it targets
+        # losing leaders by construction) but is still subject to the
+        # tier-specific resolved floor.
+        try:
+            from src.control.runtime_config import get_runtime_config
+            cfg = get_runtime_config()
+            effective_cfg = await cfg.effective()
+
+            min_signal_strength_cfg = float(
+                effective_cfg.get(
+                    "min_signal_strength",
+                    getattr(settings, "MIN_SIGNAL_STRENGTH", 0.30),
+                )
+            )
+            # `kelly_fraction` knob (default 0.50). Previously defined in
+            # runtime_config but never read by the engine; the live path
+            # was effectively running full Kelly (1.0×).
+            kelly_fraction_mul = float(
+                effective_cfg.get(
+                    "kelly_fraction",
+                    getattr(settings, "KELLY_FRACTION", 0.50),
+                )
+            )
+            # Falcon-prior discount + per-tier floors.
+            falcon_discount = float(
+                effective_cfg.get(
+                    "falcon_external_discount",
+                    getattr(settings, "FALCON_EXTERNAL_DISCOUNT", 0.5),
+                )
+            )
+            tier_a_min_resolved = int(
+                effective_cfg.get(
+                    "tier_a_min_resolved",
+                    getattr(settings, "TIER_A_MIN_RESOLVED", 10),
+                )
+            )
+            tier_a_min_winrate = float(
+                effective_cfg.get(
+                    "tier_a_min_winrate",
+                    getattr(settings, "TIER_A_MIN_WINRATE", 0.50),
+                )
+            )
+            tier_b_min_resolved = int(
+                effective_cfg.get(
+                    "tier_b_min_resolved",
+                    getattr(settings, "TIER_B_MIN_RESOLVED", 20),
+                )
+            )
+            tier_b_min_winrate = float(
+                effective_cfg.get(
+                    "tier_b_min_winrate",
+                    getattr(settings, "TIER_B_MIN_WINRATE", 0.55),
+                )
+            )
+            tier_c_min_resolved = int(
+                effective_cfg.get(
+                    "tier_c_min_resolved",
+                    getattr(settings, "TIER_C_MIN_RESOLVED", 30),
+                )
+            )
+            tier_c_min_winrate = float(
+                effective_cfg.get(
+                    "tier_c_min_winrate",
+                    getattr(settings, "TIER_C_MIN_WINRATE", 0.55),
+                )
+            )
+            tier_a_falcon_threshold = float(
+                effective_cfg.get(
+                    "tier_a_falcon_threshold",
+                    getattr(settings, "TIER_A_FALCON_THRESHOLD", 50.0),
+                )
+            )
+            tier_b_falcon_threshold = float(
+                effective_cfg.get(
+                    "tier_b_falcon_threshold",
+                    getattr(settings, "TIER_B_FALCON_THRESHOLD", 20.0),
+                )
+            )
+            tier_a_follower_count = int(
+                effective_cfg.get(
+                    "tier_a_follower_count",
+                    getattr(settings, "TIER_A_FOLLOWER_COUNT", 5),
+                )
+            )
+            tier_b_follower_count = int(
+                effective_cfg.get(
+                    "tier_b_follower_count",
+                    getattr(settings, "TIER_B_FOLLOWER_COUNT", 3),
+                )
+            )
+        except Exception as exc:
+            logger.debug(f"leader_quality_gate: runtime_config read failed: {exc}")
+            min_signal_strength_cfg = float(getattr(settings, "MIN_SIGNAL_STRENGTH", 0.30))
+            kelly_fraction_mul = float(getattr(settings, "KELLY_FRACTION", 0.50))
+            falcon_discount = float(getattr(settings, "FALCON_EXTERNAL_DISCOUNT", 0.5))
+            tier_a_min_resolved = int(getattr(settings, "TIER_A_MIN_RESOLVED", 10))
+            tier_a_min_winrate = float(getattr(settings, "TIER_A_MIN_WINRATE", 0.50))
+            tier_b_min_resolved = int(getattr(settings, "TIER_B_MIN_RESOLVED", 20))
+            tier_b_min_winrate = float(getattr(settings, "TIER_B_MIN_WINRATE", 0.55))
+            tier_c_min_resolved = int(getattr(settings, "TIER_C_MIN_RESOLVED", 30))
+            tier_c_min_winrate = float(getattr(settings, "TIER_C_MIN_WINRATE", 0.55))
+            tier_a_falcon_threshold = float(getattr(settings, "TIER_A_FALCON_THRESHOLD", 50.0))
+            tier_b_falcon_threshold = float(getattr(settings, "TIER_B_FALCON_THRESHOLD", 20.0))
+            tier_a_follower_count = int(getattr(settings, "TIER_A_FOLLOWER_COUNT", 5))
+            tier_b_follower_count = int(getattr(settings, "TIER_B_FOLLOWER_COUNT", 3))
+
+        # Tier classification: Falcon-validated leaders get a faster
+        # path. Tie-break order is A → B → C (Falcon-validated wins).
+        tier = self._classify_leader_tier(
+            falcon_score=readiness.get("falcon_score"),
+            follower_count=readiness.get("confirmed_followers"),
+            tier_a_falcon=tier_a_falcon_threshold,
+            tier_b_falcon=tier_b_falcon_threshold,
+            tier_a_followers=tier_a_follower_count,
+            tier_b_followers=tier_b_follower_count,
+        )
+        if tier == "A":
+            tier_min_resolved = tier_a_min_resolved
+            tier_min_winrate = tier_a_min_winrate
+        elif tier == "B":
+            tier_min_resolved = tier_b_min_resolved
+            tier_min_winrate = tier_b_min_winrate
+        else:
+            tier_min_resolved = tier_c_min_resolved
+            tier_min_winrate = tier_c_min_winrate
+
+        # Bayesian fusion of internal + Falcon-external posteriors.
+        effective_resolved, effective_winrate = self._compute_effective_metrics(
+            profile=profile,
+            readiness=readiness,
+            discount=falcon_discount,
+        )
+
+        follow_gate_passes = (
+            effective_resolved >= tier_min_resolved
+            and effective_winrate >= tier_min_winrate
+        )
+        # FADE bypasses the winrate gate (intentionally targets losers)
+        # but still uses the tier-specific resolved floor.
+        fade_gate_passes = effective_resolved >= tier_min_resolved
+
+        if not follow_gate_passes and not fade_gate_passes:
+            # Both sides fail. The dominant failure is the resolved
+            # floor — if FADE's resolved-only gate also failed,
+            # there's not enough Bayesian evidence for either path.
+            # SKIP reason includes tier + effective for log analysis,
+            # matching the spec format
+            # `leader_resolved_too_low|tier=A|effective=8|min=10`.
+            if effective_resolved < tier_min_resolved:
+                reason = (
+                    f"leader_resolved_too_low|tier={tier}"
+                    f"|effective={effective_resolved}|min={tier_min_resolved}"
+                )
+            else:
+                reason = (
+                    f"leader_winrate_too_low|tier={tier}"
+                    f"|effective={effective_winrate:.3f}|min={tier_min_winrate:.3f}"
+                )
+            await self._log_decision(
+                wallet,
+                market_id,
+                "skip",
+                0.0,
+                0.0,
+                0.0,
+                effective_winrate,
+                reason,
+            )
+            return None
+
+        # Restrict ready-sides downstream to honour the gate result.
+        if not follow_gate_passes:
+            follow_ready = False
+        if not fade_gate_passes:
+            fade_ready = False
 
         if wallet not in self._thompson:
             seeded = await self._seed_thompson_from_cache(wallet)
@@ -492,6 +831,27 @@ class ConfidenceEngine:
                 return None
             confidence = max(0.0, min(1.0, adjusted_follow))
 
+        # ── Strategy upgrade 2026-05-17 — min_signal_strength gate ────
+        # Wire the long-dead `min_signal_strength` knob (defined in
+        # runtime_config since the cockpit was built, but never read by
+        # evaluate()). Reject the decision when post-Thompson confidence
+        # is below the floor. Default 0.30 — still permissive enough that
+        # the bot can learn from edge cases, but high enough to kill the
+        # bottom-decile signals that produced losing trades.
+        if confidence < min_signal_strength_cfg:
+            await self._log_decision(
+                wallet,
+                market_id,
+                "skip",
+                thompson_follow,
+                thompson_fade,
+                0.0,
+                confidence,
+                f"below_min_signal_strength|conf={confidence:.3f}|"
+                f"min={min_signal_strength_cfg:.3f}|action={action}",
+            )
+            return None
+
         state = self._thompson.get(wallet, {})
         alpha, beta_ = state.get(action, [DEFAULT_ALPHA, DEFAULT_BETA])
         entry_price = float(trade.get("price", 0.5) or 0.5)
@@ -501,6 +861,7 @@ class ConfidenceEngine:
             alpha=float(alpha),
             beta_=float(beta_),
             market_price=market_price,
+            kelly_fraction_multiplier=kelly_fraction_mul,
         )
 
         # Floor multiplier at 0.20 so behavior penalties scale size DOWN
@@ -788,6 +1149,139 @@ class ConfidenceEngine:
         weights["primary_strategy"] = primary
         return weights
 
+    # ── Strategy upgrade 2026-05-17 round 2 — Falcon prior + tiers ────
+    # Two pure helpers that fuse the externally-reported Falcon
+    # Wallet 360 track record into the Bayesian gate. Kept as
+    # @staticmethod so the test suite can exercise them without
+    # constructing an engine + mocking the DB.
+
+    @staticmethod
+    def _compute_effective_metrics(
+        profile: dict | None,
+        readiness: dict | None,
+        discount: float,
+    ) -> tuple[int, float]:
+        """Combine internal + Falcon-external posterior counts.
+
+        Returns ``(effective_resolved, effective_winrate)``:
+
+            effective_resolved = MAX(
+                internal_resolved,
+                int(external_resolved * discount)
+            )
+
+            effective_winrate  = (internal_wins
+                                  + discount * external_wins + 1)
+                               / (internal_resolved
+                                  + discount * external_resolved + 2)
+
+        The +1 / +2 in the winrate formula is Laplace smoothing —
+        an empty profile (Beta(1,1) uninformed prior) gives 0.5, the
+        right answer for "no evidence either way".
+
+        The ``MAX`` choice in effective_resolved (vs SUM) is
+        deliberate: a Falcon-validated leader with 100 external
+        trades but only 5 internal should NOT need 30 internal to
+        clear Tier C; conversely a leader with 200 internal already
+        clears the gate and the external evidence is a no-op. SUM
+        would double-count overlapping observations.
+
+        ``profile`` shape: the standard leader_profiles.profile_json
+        dict (``accuracy.overall``, ``accuracy.resolved_count``,
+        ``accuracy.by_category``). Missing keys default to 0/0.5.
+
+        ``readiness`` shape: the dict returned by ``_get_readiness``
+        — must carry the new ``external_*`` keys. Older callers
+        passing a legacy 3-key dict get external=0 and the function
+        degrades to internal-only behaviour.
+        """
+        profile = profile or {}
+        readiness = readiness or {}
+        accuracy = (profile.get("accuracy") or {}) if isinstance(profile, dict) else {}
+
+        internal_resolved = int(readiness.get("positions_resolved", 0) or 0)
+        try:
+            internal_winrate = float(accuracy.get("overall", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            internal_winrate = 0.0
+        # Convert the size-weighted Beta posterior MEAN back into a
+        # wins-vs-losses split. We only need integer-scale counts for
+        # the fusion math; the rounding error is bounded by 1 and
+        # gets absorbed by the Laplace smoothing.
+        internal_wins = round(internal_winrate * internal_resolved)
+
+        external_resolved = int(readiness.get("external_resolved_count", 0) or 0)
+        external_wins = int(readiness.get("external_wins", 0) or 0)
+        # Note: we don't actually need external_losses for the fusion
+        # — wins / resolved is the full sufficient statistic. We
+        # ignore the slot to keep the math simple.
+
+        try:
+            d = float(discount)
+        except (TypeError, ValueError):
+            d = 0.5
+        # Bound the discount defensively: a negative or >1 value
+        # would either flip the prior (nonsense) or weight external
+        # MORE than internal (the operator intent is "trust internal
+        # more"; a true 50/50 fusion is at d=1.0).
+        d = max(0.0, min(1.0, d))
+
+        effective_resolved = max(
+            internal_resolved,
+            int(external_resolved * d),
+        )
+
+        numerator = internal_wins + d * external_wins + 1.0
+        denominator = internal_resolved + d * external_resolved + 2.0
+        # Denominator is always >= 2 thanks to the Laplace +2, so
+        # division by zero is impossible.
+        effective_winrate = numerator / denominator
+
+        return effective_resolved, float(effective_winrate)
+
+    @staticmethod
+    def _classify_leader_tier(
+        falcon_score: float | None,
+        follower_count: int | None,
+        *,
+        tier_a_falcon: float = 50.0,
+        tier_b_falcon: float = 20.0,
+        tier_a_followers: int = 5,
+        tier_b_followers: int = 3,
+    ) -> str:
+        """Return the leader's tier ("A", "B", "C").
+
+        Tier rules (A wins ties — Falcon-validated leaders get the
+        looser gate first):
+
+            Tier A: falcon_score >= tier_a_falcon
+                    OR confirmed_followers >= tier_a_followers
+            Tier B: falcon_score >= tier_b_falcon
+                    OR confirmed_followers >= tier_b_followers
+            Tier C: else (legacy strict gate)
+
+        Inputs are clamped to (0, ∞) — negatives and Nones land as 0
+        and degrade to Tier C cleanly. This matches the production
+        contract: a missing falcon_score (NULL in the leaders table)
+        means "Falcon doesn't recognise this wallet", which is
+        exactly the cold-start case Tier C handles.
+        """
+        try:
+            fs = float(falcon_score or 0.0)
+        except (TypeError, ValueError):
+            fs = 0.0
+        try:
+            fc = int(follower_count or 0)
+        except (TypeError, ValueError):
+            fc = 0
+        fs = max(0.0, fs)
+        fc = max(0, fc)
+        if fs >= tier_a_falcon or fc >= tier_a_followers:
+            return "A"
+        if fs >= tier_b_falcon or fc >= tier_b_followers:
+            return "B"
+        return "C"
+
     def _sample_thompson(self, wallet: str) -> tuple[float, float]:
         """Sample one value from each Beta distribution for this wallet."""
         state = self._thompson.get(wallet, {})
@@ -837,6 +1331,7 @@ class ConfidenceEngine:
         alpha: float,
         beta_: float,
         market_price: float = 0.5,
+        kelly_fraction_multiplier: float = 1.0,
     ) -> tuple[float, float]:
         """
         Bayesian Kelly fraction with shrinkage.
@@ -845,6 +1340,12 @@ class ConfidenceEngine:
         b  = market odds = (1 - market_price) / market_price
         f* = (p * b - (1 - p)) / b
         shrinkage = 1 - variance / p^2
+
+        ``kelly_fraction_multiplier`` applies the operator-tunable
+        fractional-Kelly knob (RuntimeConfig key ``kelly_fraction``,
+        default 0.50). The 2% MAX_POSITION_PCT cap is still enforced
+        AFTER the multiplier so the dollar cap is the binding constraint
+        even at full Kelly.
         """
         p = alpha / (alpha + beta_)
         if p <= 0 or p >= 1:
@@ -870,6 +1371,14 @@ class ConfidenceEngine:
         min_kelly_cold_start = 0.005  # 0.5% of capital
         if alpha + beta_ <= 6 and kelly_fraction < min_kelly_cold_start:
             kelly_fraction = min_kelly_cold_start
+
+        # Apply the operator-tunable fractional-Kelly multiplier BEFORE
+        # the dollar cap so 0.5×Kelly with f*=0.04 lands at 0.02
+        # (= MAX_POSITION_PCT cap). Clamp to [0, 1] to defend against a
+        # bad override that would scale UP (>1) — the multiplier is a
+        # de-leverage knob by design.
+        clamped_mul = max(0.0, min(1.0, float(kelly_fraction_multiplier)))
+        kelly_fraction = kelly_fraction * clamped_mul
 
         max_size = settings.PAPER_CAPITAL_USDC * settings.MAX_POSITION_PCT
         if action == "fade":
@@ -1168,8 +1677,74 @@ class ConfidenceEngine:
                 logger.debug(f"Confidence cache write failed for {wallet}: {exc}")
         return cached
 
+    async def _get_leader_gate_state(self, wallet: str) -> dict:
+        """Cheap lookup of `(excluded, exclude_reason)` for the wallet.
+
+        2026-05-17 round 3 quick-win patch. Used by `evaluate` BEFORE any
+        other gate so an excluded wallet never costs us downstream work.
+        The query is a PK lookup on the small `leaders` table
+        (sub-millisecond on production). On any DB failure we return
+        ``{"excluded": False, "exclude_reason": None}`` — the same
+        defensive default the rest of the engine uses, so a transient
+        Postgres blip CANNOT accidentally widen acceptance.
+        """
+        try:
+            async with get_db() as conn:
+                row = await conn.fetchrow(
+                    """
+                    SELECT excluded, exclude_reason
+                    FROM leaders
+                    WHERE wallet_address = $1
+                    """,
+                    wallet,
+                )
+                if row:
+                    return {
+                        "excluded": bool(row["excluded"]),
+                        "exclude_reason": row["exclude_reason"],
+                    }
+        except Exception as exc:
+            logger.debug(
+                f"_get_leader_gate_state failed for {wallet}: {exc}"
+            )
+        return {"excluded": False, "exclude_reason": None}
+
+    async def _read_min_leader_total_resolved(self) -> int:
+        """Resolve the cold-start floor (`min_leader_total_resolved`).
+
+        2026-05-17 round 3 quick-win. RuntimeConfig wins over the static
+        `settings.MIN_LEADER_TOTAL_RESOLVED` default so the operator can
+        tighten / relax via the dashboard cockpit without redeploying.
+        Best-effort: never raises. A config-layer outage falls back to
+        the env-driven static default (5 by default).
+        """
+        try:
+            from src.control.runtime_config import get_runtime_config
+            cfg = get_runtime_config()
+            effective = await cfg.effective()
+            raw = effective.get("min_leader_total_resolved")
+            if raw is not None:
+                return int(raw)
+        except Exception as exc:
+            logger.debug(
+                f"_read_min_leader_total_resolved: runtime_config read "
+                f"failed: {exc}"
+            )
+        return int(getattr(settings, "MIN_LEADER_TOTAL_RESOLVED", 5))
+
     async def _get_readiness(self, wallet: str) -> dict:
-        """Load leader readiness stats from DB."""
+        """Load leader readiness stats from DB.
+
+        Strategy upgrade 2026-05-17 round 2: ALSO pulls the Falcon
+        prior columns (``leader_profiles.external_*``, populated by
+        ``scripts/import_falcon_external_stats_2026_05_17.py``) and
+        the leader's ``falcon_score`` so the tier classifier and the
+        ``_compute_effective_metrics`` Bayesian fusion can run without
+        a second DB roundtrip. Older callers that don't care about
+        the new fields still see ``trades_observed`` /
+        ``positions_resolved`` / ``confirmed_followers`` at the same
+        keys with the same semantics.
+        """
         try:
             async with get_db() as conn:
                 row = await conn.fetchrow(
@@ -1181,7 +1756,11 @@ class ConfidenceEngine:
                         (SELECT COUNT(*) FROM follower_edges fe
                          WHERE fe.leader_wallet = $1
                            AND fe.co_occurrences >= 5
-                           AND fe.same_direction_rate >= 0.7) AS confirmed_followers
+                           AND fe.same_direction_rate >= 0.7) AS confirmed_followers,
+                        COALESCE(lp.external_resolved_count, 0) AS external_resolved_count,
+                        COALESCE(lp.external_wins, 0) AS external_wins,
+                        COALESCE(lp.external_losses, 0) AS external_losses,
+                        COALESCE(l.falcon_score, 0) AS falcon_score
                     FROM leaders l
                     LEFT JOIN leader_profiles lp ON lp.wallet_address = l.wallet_address
                     WHERE l.wallet_address = $1
@@ -1193,10 +1772,25 @@ class ConfidenceEngine:
                         "trades_observed": int(row["trades_observed"] or 0),
                         "positions_resolved": int(row["positions_resolved"] or 0),
                         "confirmed_followers": int(row["confirmed_followers"] or 0),
+                        # Strategy 2026-05-17 round 2 — Falcon prior fields.
+                        "external_resolved_count": int(
+                            row["external_resolved_count"] or 0
+                        ),
+                        "external_wins": int(row["external_wins"] or 0),
+                        "external_losses": int(row["external_losses"] or 0),
+                        "falcon_score": float(row["falcon_score"] or 0.0),
                     }
         except Exception as e:
             logger.debug(f"Readiness check failed for {wallet}: {e}")
-        return {"trades_observed": 0, "positions_resolved": 0, "confirmed_followers": 0}
+        return {
+            "trades_observed": 0,
+            "positions_resolved": 0,
+            "confirmed_followers": 0,
+            "external_resolved_count": 0,
+            "external_wins": 0,
+            "external_losses": 0,
+            "falcon_score": 0.0,
+        }
 
     async def _log_decision(
         self,

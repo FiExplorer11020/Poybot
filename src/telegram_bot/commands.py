@@ -157,7 +157,14 @@ async def cmd_status(ctx: CommandContext) -> str:
 
 
 async def cmd_pnl(ctx: CommandContext) -> str:
-    """/pnl — realized + unrealized PnL across paper and live."""
+    """/pnl — realized + unrealized PnL across paper and live.
+
+    Unrealized PnL is the mark-to-market value of open positions, computed
+    by `PaperTrader.compute_unrealized_pnl` (sum of
+    `(current_price - entry_price)/entry_price * size_usdc` per trade).
+    The earlier cost-basis approximation always returned ~$0 regardless of
+    price movement; see docs/AUDIT_PAPER_TRADING_2026_05_17.md.
+    """
     from src.database.connection import get_db
     from src.engine.portfolio_state import load_state
 
@@ -166,19 +173,13 @@ async def cmd_pnl(ctx: CommandContext) -> str:
     try:
         state = await load_state()
         paper_realized = float(state.realized_pnl_cum)
-        # Unrealized = current capital - (initial PAPER_CAPITAL - realized)
-        # Approximate; the precise mark-to-market lives in PaperTrader.
-        if ctx.paper_trader is not None:
-            current = float(ctx.paper_trader.capital)
-            # rough estimate of float value of open positions
-            open_value = sum(
-                float(t.size_usdc) for t in ctx.paper_trader.open_trades
-            )
-            paper_unrealized = (current + open_value) - (
-                float(settings.PAPER_CAPITAL_USDC) + paper_realized
-            )
     except Exception as e:
-        logger.warning(f"telegram cmd: paper pnl failed: {e}")
+        logger.warning(f"telegram cmd: paper realized pnl failed: {e}")
+    if ctx.paper_trader is not None:
+        try:
+            paper_unrealized = await ctx.paper_trader.compute_unrealized_pnl()
+        except Exception as e:
+            logger.warning(f"telegram cmd: paper unrealized pnl failed: {e}")
     live_realized = await _live_realized_pnl(ctx)
     shadow_n = await _count_live_trades(ctx, "shadow")
     real_n = 0
@@ -208,6 +209,120 @@ async def cmd_positions(ctx: CommandContext) -> str:
     paper = await _open_positions_snapshot(ctx, "paper_trades")
     live = await _open_positions_snapshot(ctx, "live_trades")
     return formatters.format_positions(paper_positions=paper, live_positions=live)
+
+
+async def cmd_summary(ctx: CommandContext) -> str:
+    """/summary — today's trading activity (UTC since 00:00).
+
+    Aggregates closed paper_trades since UTC midnight: wins/losses, average
+    PnL, breakdown by close_reason and strategy. Adds the cumulative
+    lifetime realized PnL and the current unrealized PnL on open positions
+    so the operator gets a single-screen view of where the portfolio
+    stands without scrolling through close alerts.
+    """
+    from src.database.connection import get_db
+    from src.engine.portfolio_state import load_state
+
+    payload: dict = {
+        "trades_closed_today": 0,
+        "trades_open": 0,
+        "wins": 0,
+        "losses": 0,
+        "avg_win": None,
+        "avg_loss": None,
+        "net_today": 0.0,
+        "cum_realized": None,
+        "unrealized": None,
+        "by_reason": [],   # list of {reason, count, avg_pnl}
+        "by_strategy": [], # list of {strategy, count, wins, losses}
+    }
+
+    # Open count + unrealized PnL come straight from the paper trader.
+    if ctx.paper_trader is not None:
+        try:
+            payload["trades_open"] = len(ctx.paper_trader.open_trades)
+        except Exception:
+            payload["trades_open"] = 0
+        try:
+            payload["unrealized"] = await ctx.paper_trader.compute_unrealized_pnl()
+        except Exception as e:
+            logger.warning(f"telegram cmd: summary unrealized failed: {e}")
+
+    # Lifetime realized PnL from portfolio_state.
+    try:
+        state = await load_state()
+        payload["cum_realized"] = float(state.realized_pnl_cum)
+    except Exception as e:
+        logger.warning(f"telegram cmd: summary cum realized failed: {e}")
+
+    # Today's aggregates + breakdowns.
+    try:
+        async with get_db() as conn:
+            totals = await conn.fetchrow(
+                "SELECT "
+                "  COUNT(*) AS n_closed, "
+                "  COUNT(*) FILTER (WHERE pnl_usdc > 0) AS wins, "
+                "  COUNT(*) FILTER (WHERE pnl_usdc <= 0) AS losses, "
+                "  COALESCE(SUM(pnl_usdc), 0) AS net_today, "
+                "  AVG(pnl_usdc) FILTER (WHERE pnl_usdc > 0) AS avg_win, "
+                "  AVG(pnl_usdc) FILTER (WHERE pnl_usdc <= 0) AS avg_loss "
+                "FROM paper_trades "
+                "WHERE status = 'closed' "
+                "  AND closed_at >= date_trunc('day', NOW() AT TIME ZONE 'UTC')"
+            )
+            if totals is not None:
+                payload["trades_closed_today"] = int(totals["n_closed"] or 0)
+                payload["wins"] = int(totals["wins"] or 0)
+                payload["losses"] = int(totals["losses"] or 0)
+                payload["net_today"] = float(totals["net_today"] or 0.0)
+                payload["avg_win"] = (
+                    float(totals["avg_win"]) if totals["avg_win"] is not None else None
+                )
+                payload["avg_loss"] = (
+                    float(totals["avg_loss"]) if totals["avg_loss"] is not None else None
+                )
+
+            reason_rows = await conn.fetch(
+                "SELECT close_reason, COUNT(*) AS n, AVG(pnl_usdc) AS avg_pnl "
+                "FROM paper_trades "
+                "WHERE status = 'closed' "
+                "  AND closed_at >= date_trunc('day', NOW() AT TIME ZONE 'UTC') "
+                "GROUP BY close_reason "
+                "ORDER BY n DESC"
+            )
+            payload["by_reason"] = [
+                {
+                    "reason": r["close_reason"] or "?",
+                    "count": int(r["n"] or 0),
+                    "avg_pnl": float(r["avg_pnl"]) if r["avg_pnl"] is not None else None,
+                }
+                for r in reason_rows
+            ]
+
+            strat_rows = await conn.fetch(
+                "SELECT strategy, "
+                "       COUNT(*) AS n, "
+                "       COUNT(*) FILTER (WHERE pnl_usdc > 0) AS wins, "
+                "       COUNT(*) FILTER (WHERE pnl_usdc <= 0) AS losses "
+                "FROM paper_trades "
+                "WHERE status = 'closed' "
+                "  AND closed_at >= date_trunc('day', NOW() AT TIME ZONE 'UTC') "
+                "GROUP BY strategy "
+                "ORDER BY n DESC"
+            )
+            payload["by_strategy"] = [
+                {
+                    "strategy": r["strategy"] or "?",
+                    "count": int(r["n"] or 0),
+                    "wins": int(r["wins"] or 0),
+                    "losses": int(r["losses"] or 0),
+                }
+                for r in strat_rows
+            ]
+    except Exception as e:
+        logger.warning(f"telegram cmd: summary aggregation failed: {e}")
+
+    return formatters.format_summary(payload)
 
 
 # --------------------------------------------------------------------------- #

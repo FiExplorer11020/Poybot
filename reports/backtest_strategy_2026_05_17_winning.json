@@ -1,0 +1,225 @@
+{
+  "ts_utc": "20260516T234735Z",
+  "params": {
+    "min_leader_resolved": 30,
+    "min_leader_winrate": 0.55,
+    "entry_min": 0.3,
+    "entry_max": 0.92,
+    "max_hold_s": 43200,
+    "categories": [
+      "crypto",
+      "macro",
+      "sports"
+    ]
+  },
+  "candidate_rows_loaded": 2830,
+  "headline": {
+    "params": {
+      "min_leader_resolved": 30,
+      "min_leader_winrate": 0.55,
+      "entry_min": 0.3,
+      "entry_max": 0.92,
+      "max_hold_s": 43200,
+      "categories": [
+        "crypto",
+        "macro",
+        "sports"
+      ]
+    },
+    "n_total": 530,
+    "wins": 449,
+    "losses": 81,
+    "win_pct": 0.8471698113207548,
+    "avg_pnl_pct": 0.599354150943397,
+    "total_pnl_usdc": 28444.583785999996,
+    "by_category": [
+      {
+        "label": "sports",
+        "n": 282,
+        "wins": 219,
+        "losses": 63,
+        "win_pct": 0.776595744680851,
+        "avg_pnl_pct": 0.5061943262411354,
+        "total_pnl_usdc": 27443.368441
+      },
+      {
+        "label": "crypto",
+        "n": 248,
+        "wins": 230,
+        "losses": 18,
+        "win_pct": 0.9274193548387096,
+        "avg_pnl_pct": 0.7052858870967742,
+        "total_pnl_usdc": 1001.2153450000004
+      }
+    ],
+    "by_entry_bucket": [
+      {
+        "label": "[0.30,0.40)",
+        "n": 93,
+        "wins": 70,
+        "losses": 23,
+        "win_pct": 0.7526881720430108,
+        "avg_pnl_pct": 0.9092978494623654,
+        "total_pnl_usdc": 10893.164482000006
+      },
+      {
+        "label": "[0.40,0.50)",
+        "n": 99,
+        "wins": 86,
+        "losses": 13,
+        "win_pct": 0.8686868686868687,
+        "avg_pnl_pct": 1.059928282828283,
+        "total_pnl_usdc": 11172.844611
+      },
+      {
+        "label": "[0.50,0.70)",
+        "n": 259,
+        "wins": 220,
+        "losses": 39,
+        "win_pct": 0.8494208494208494,
+        "avg_pnl_pct": 0.43004401544401555,
+        "total_pnl_usdc": 4735.471509
+      },
+      {
+        "label": "[0.70,0.85)",
+        "n": 62,
+        "wins": 57,
+        "losses": 5,
+        "win_pct": 0.9193548387096774,
+        "avg_pnl_pct": 0.24745483870967733,
+        "total_pnl_usdc": 1197.5732770000006
+      },
+      {
+        "label": "[0.85,0.92]",
+        "n": 17,
+        "wins": 16,
+        "losses": 1,
+        "win_pct": 0.9411764705882353,
+        "avg_pnl_pct": 0.08449999999999996,
+        "total_pnl_usdc": 445.529907
+      }
+    ],
+    "by_hold_bucket": [
+      {
+        "label": "<=1h",
+        "n": 362,
+        "wins": 300,
+        "losses": 62,
+        "win_pct": 0.8287292817679558,
+        "avg_pnl_pct": 0.5516599447513812,
+        "total_pnl_usdc": 7117.194759
+      },
+      {
+        "label": "1-4h",
+        "n": 160,
+        "wins": 141,
+        "losses": 19,
+        "win_pct": 0.88125,
+        "avg_pnl_pct": 0.7235918750000001,
+        "total_pnl_usdc": 20452.489027000003
+      },
+      {
+        "label": "4-12h",
+        "n": 8,
+        "wins": 8,
+        "losses": 0,
+        "win_pct": 1.0,
+        "avg_pnl_pct": 0.2727625,
+        "total_pnl_usdc": 874.9
+      },
+      {
+        "label": "12-24h",
+        "n": 0,
+        "wins": 0,
+        "losses": 0,
+        "win_pct": 0.0,
+        "avg_pnl_pct": 0.0,
+        "total_pnl_usdc": 0.0
+      },
+      {
+        "label": ">24h",
+        "n": 0,
+        "wins": 0,
+        "losses": 0,
+        "win_pct": 0.0,
+        "avg_pnl_pct": 0.0,
+        "total_pnl_usdc": 0.0
+      }
+    ],
+    "by_leader_top20": [
+      {
+        "label": "0xf7aae1ab91b0ff7ed22965ed4fd3e2c43e28abe3",
+        "n": 221,
+        "wins": 204,
+        "losses": 17,
+        "win_pct": 0.9230769230769231,
+        "avg_pnl_pct": 0.6636212669683258,
+        "total_pnl_usdc": 668.0961980000001
+      },
+      {
+        "label": "0x53757615de1c42b83f893b79d4241a009dc2aeea",
+        "n": 109,
+        "wins": 73,
+        "losses": 36,
+        "win_pct": 0.6697247706422018,
+        "avg_pnl_pct": 0.5764963302752293,
+        "total_pnl_usdc": 13842.558054999998
+      },
+      {
+        "label": "0xe9b72cca6799bd2dd75087ba52d959cd4f4e8030",
+        "n": 77,
+        "wins": 50,
+        "losses": 27,
+        "win_pct": 0.6493506493506493,
+        "avg_pnl_pct": 0.1380220779220779,
+        "total_pnl_usdc": 56.99059199999998
+      },
+      {
+        "label": "0x99d76c8a97a7c7ed25ecedc881d5aed3a73c6435",
+        "n": 71,
+        "wins": 71,
+        "losses": 0,
+        "win_pct": 1.0,
+        "avg_pnl_pct": 0.6566380281690141,
+        "total_pnl_usdc": 6683.639171999998
+      },
+      {
+        "label": "0xe9076a87c5ed90ef16e6fe6529c943baeca0cff6",
+        "n": 26,
+        "wins": 25,
+        "losses": 1,
+        "win_pct": 0.9615384615384616,
+        "avg_pnl_pct": 0.996946153846154,
+        "total_pnl_usdc": 186.329147
+      },
+      {
+        "label": "0x2761f55122313a7c2fd0a31c160b0eb04f744d95",
+        "n": 17,
+        "wins": 17,
+        "losses": 0,
+        "win_pct": 1.0,
+        "avg_pnl_pct": 1.1614588235294119,
+        "total_pnl_usdc": 6543.131605999999
+      },
+      {
+        "label": "0xe6a5fdb6f4e749c4e841d0077bc9314f5878e95d",
+        "n": 8,
+        "wins": 8,
+        "losses": 0,
+        "win_pct": 1.0,
+        "avg_pnl_pct": 0.6433875,
+        "total_pnl_usdc": 436.645115
+      },
+      {
+        "label": "0x307d40501ad879caf44b63a8d82531926d629163",
+        "n": 1,
+        "wins": 1,
+        "losses": 0,
+        "win_pct": 1.0,
+        "avg_pnl_pct": 0.0978,
+        "total_pnl_usdc": 27.193901
+      }
+    ]
+  },
+  "grid": []
+}

@@ -32,6 +32,13 @@ from src.monitoring.metrics import (
 
 REDIS_TRADES_CHANNEL = "trades:observed"
 REDIS_POSITIONS_CHANNEL = "positions:closed"
+# Producers (observer WS dispatch in main.py, maintenance-loop Gamma sweep)
+# publish ``{"market_id": ..., "outcome": "yes"|"no"}`` JSON envelopes on this
+# channel. The PositionTracker subscribes and closes every open position on
+# the market at its per-direction terminal value. Wiring this was the fix
+# for the long-standing bug where ``close_method='resolution'`` rows never
+# appeared in ``positions_reconstructed`` (Diagnosis 2026-05-17 §A.1).
+REDIS_MARKET_RESOLVED_CHANNEL = "market:resolved"
 MERGE_WINDOW_S = 600  # 10 minutes
 
 
@@ -68,6 +75,14 @@ class PositionTracker:
             settings.REDIS_URL, name="observer.position_tracker"
         )
         self._subscriber.register(REDIS_TRADES_CHANNEL, self._on_trade_message)
+        # WS dispatcher in `src/observer/main.py` publishes resolved-market
+        # envelopes here. Without this subscription the resolution code
+        # path is dead and ``positions_reconstructed.close_method`` never
+        # gets a ``'resolution'`` row — the bug the 2026-05-17 diagnosis
+        # flagged as the root cause of Phase 1→2 maturation starvation.
+        self._subscriber.register(
+            REDIS_MARKET_RESOLVED_CHANNEL, self._on_market_resolved_message
+        )
 
     async def start(self) -> None:
         self._running = True
@@ -94,6 +109,49 @@ class PositionTracker:
             # log site for continuity with pre-fix debug noise.
             logger.error(f"PositionTracker error processing message: {e}")
             raise
+
+    async def _on_market_resolved_message(
+        self, payload: dict, _channel: str
+    ) -> None:
+        """Subscriber handler for ``REDIS_MARKET_RESOLVED_CHANNEL``.
+
+        Producer contract: ``payload`` is a JSON-decoded dict with at
+        least ``market_id`` and ``outcome`` ("yes"/"no"). Anything else is
+        logged at debug and dropped — we don't want a malformed publish
+        to bring the subscriber down. We swallow per-payload errors here
+        because the channel covers many markets; one bad envelope must
+        not stall the rest.
+        """
+        if not self._running:
+            return
+        if not isinstance(payload, dict):
+            logger.debug(
+                f"PositionTracker: ignoring non-dict market_resolved payload: {payload!r}"
+            )
+            return
+        market_id = payload.get("market_id") or payload.get("market")
+        outcome = payload.get("outcome") or payload.get("winning_outcome")
+        if not market_id or not outcome:
+            logger.debug(
+                "PositionTracker: market_resolved payload missing market_id/outcome "
+                f"(market={market_id!r}, outcome={outcome!r})"
+            )
+            return
+        try:
+            closed = await self.close_market_positions(
+                str(market_id), outcome=str(outcome)
+            )
+            if closed:
+                logger.info(
+                    f"PositionTracker: closed {closed} open positions "
+                    f"on resolved market={market_id} outcome={outcome}"
+                )
+        except Exception as e:
+            logger.error(
+                f"PositionTracker: market_resolved handler failed "
+                f"(market={market_id}, outcome={outcome}): {e}"
+            )
+            # Swallow — subscriber loop must stay alive for other markets.
 
     async def on_trade(self, trade: dict) -> None:
         """Process a single trade dict. Called by _subscribe_loop or directly in tests."""
@@ -485,18 +543,84 @@ class PositionTracker:
 
         self._recompute_open_gauge()
 
-    async def close_market_positions(self, market_id: str, resolution_price: Decimal) -> None:
-        """Close all open positions for a resolved market at the resolution price."""
-        keys_to_close = [(w, m, t) for (w, m, t) in list(self._open_positions) if m == market_id]
+    async def close_market_positions(
+        self,
+        market_id: str,
+        resolution_price: Decimal | str | float | None = None,
+        *,
+        outcome: str | None = None,
+    ) -> int:
+        """Close all open positions for a resolved market.
+
+        Two calling conventions are supported:
+
+        1. Per-direction outcome (recommended for binary markets): pass
+           ``outcome="yes"`` or ``outcome="no"``. We look up ``token_yes``
+           and ``token_no`` for ``market_id`` and close each open position
+           at ``1.0`` if it holds the winning token, ``0.0`` otherwise.
+           This is what the WS ``market_resolved`` event and the
+           maintenance-loop Gamma sweep call. Returns the number of
+           positions closed.
+
+        2. Single resolution price (legacy): pass ``resolution_price`` (a
+           Decimal/float between 0 and 1) and every open position on the
+           market closes at that price regardless of direction. Useful
+           only when the caller has already resolved per-direction
+           upstream (e.g. tests that simulate a known terminal value).
+           Returns the number of positions closed.
+
+        Both conventions are idempotent — closing a market with no open
+        positions is a no-op and returns 0.
+        """
+        keys_to_close = [
+            (w, m, t) for (w, m, t) in list(self._open_positions) if m == market_id
+        ]
+        if not keys_to_close:
+            return 0
+
+        token_yes: str | None = None
+        token_no: str | None = None
+        if outcome is not None:
+            normalized = str(outcome).strip().lower()
+            if normalized not in ("yes", "no"):
+                logger.warning(
+                    f"close_market_positions: invalid outcome={outcome!r} "
+                    f"for market={market_id} — skipping"
+                )
+                return 0
+            token_yes, token_no = await self._get_market_tokens(market_id)
+            if not token_yes and not token_no:
+                logger.warning(
+                    f"close_market_positions: market={market_id} has no "
+                    "yes/no token mapping — cannot resolve per-direction"
+                )
+                return 0
+            winning_token = token_yes if normalized == "yes" else token_no
+
         now = datetime.now(tz=timezone.utc)
+        closed = 0
         for key in keys_to_close:
             positions = list(self._open_positions.get(key, []))
             for pos in positions:
+                if outcome is not None:
+                    # Per-direction terminal value: winning token → 1.0,
+                    # losing token → 0.0. A position on an unknown token
+                    # (shouldn't happen under normal operation) is closed
+                    # at 0.0 — safer than 1.0 because it under-states gains
+                    # rather than fabricating them.
+                    if winning_token and pos.token_id == winning_token:
+                        price = Decimal("1.0")
+                    else:
+                        price = Decimal("0.0")
+                else:
+                    price = Decimal(str(resolution_price or 0))
                 await self._close_position(
-                    pos, now, resolution_price, pos.shares_remaining, "resolution"
+                    pos, now, price, pos.shares_remaining, "resolution"
                 )
+                closed += 1
             if key in self._open_positions:
                 del self._open_positions[key]
+        return closed
 
     async def _get_fee_rate(self, market_id: str) -> Decimal:
         """Look up fee rate for a market from the markets table. Returns 0 if not found."""

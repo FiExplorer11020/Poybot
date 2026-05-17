@@ -257,7 +257,14 @@ class Settings(BaseSettings):
     FADE_MIN_RESOLVED: int = 25
     FADE_MIN_CONFIDENCE: float = 0.65
     THOMPSON_EXPLORATION_FLOOR: float = 0.15
-    LIVE_DECISION_MAX_TRADE_AGE_S: int = 120
+    # 2026-05-17 round 2: raised 120 → 600 (10 min). Diagnostic on prod
+    # showed 224/225 leader trades exceed 120 s by the time they reach the
+    # engine (observer api_wallet REST poll cadence is 30 s + dedup + publish
+    # + subscriber latency = realistic 200-400 s). The 120 s cap was silently
+    # killing 99.6 % of leader trades. Downstream paper_trader has its own
+    # `stale_book` + `high_entry_ask_blocked` gates to handle out-of-date
+    # entry prices, so 600 s here is safe.
+    LIVE_DECISION_MAX_TRADE_AGE_S: int = 600
 
     # ------------------------------------------------------------------ #
     # Paper Trading + Risk (CLAUDE.md § 9)                                #
@@ -270,6 +277,175 @@ class Settings(BaseSettings):
     MIN_POSITION_USDC: float = 50.0
     PAPER_REENTRY_COOLDOWN_S: int = 300
     INVALID_LEARNING_CLOSE_WINDOW_S: int = 300
+    # ── Audit 2026-05-17 hardening ─────────────────────────────────────
+    # Maximum acceptable age (seconds) for a `book:last:*` cache entry
+    # when used by the paper trader for entry/exit price decisions or
+    # mark-to-market unrealized PnL. Older entries are rejected and the
+    # caller falls through to the next price source. Mismatch with the
+    # confidence engine's 180s tolerance is intentional: the engine is
+    # gating signal generation (looser is fine), the paper trader is
+    # gating real money (effectively).
+    MAX_BOOK_AGE_PAPER_S: float = 60.0
+    # Upper bound on entry_ask (the actual fill price) for BOTH FOLLOW
+    # and FADE. The legacy FOLLOW-only check left a hole on FADE — buying
+    # the opposite token at 0.85 has the same asymmetric loss profile.
+    MAX_ENTRY_PRICE: float = 0.92
+    # Lower bound on entry_ask. Strategy upgrade 2026-05-17: empirical
+    # grid-search backtest on positions_reconstructed (n=530 cohort)
+    # showed the [0.30, 0.40) bucket wins 75% with +90% avg PnL — cutting
+    # at 0.40 chops total PnL 4.5x for only +2pp win-rate. Floor at 0.30
+    # captures the high-PnL low-price entries while still excluding the
+    # [0.0, 0.3) long-tail that loses money on average.
+    MIN_ENTRY_PRICE: float = 0.30
+    # Maximum allowed drift between leader's signal price and the bot's
+    # actual entry ask (after the FADE flip). Without this gate the bot
+    # has been booking "wins" against stale-cache exit prices that
+    # represent positions the leader never actually took. Loosened from
+    # 0.20 → 0.35 (2026-05-17 strategy upgrade): the 0.20 threshold was
+    # rejecting too many legitimate fills on thin books.
+    MAX_LEADER_PRICE_DRIFT: float = 0.35
+    # Minimum hours until market resolution required to open a trade.
+    # FADE has no leader-exit close path so it benefits from longer
+    # runway; FOLLOW closes when the leader exits, often within hours.
+    # FADE loosened from 24h → 6h (2026-05-17 strategy upgrade): the B9
+    # fix added leader_exit close for FADE, so the 24h gate is now
+    # redundant with the FOLLOW path.
+    MIN_HOURS_TO_RESOLUTION_FOLLOW: float = 6.0
+    MIN_HOURS_TO_RESOLUTION_FADE: float = 6.0
+    # Hard upper bound on a paper trade's holding period. Empirical
+    # grid-search (2026-05-17): 12h captures 87% of the edge with
+    # strictly more turnover than 24h (n=530, 84.7% win-rate at 12h vs
+    # marginally similar at 24h but with longer capital lock-up). The
+    # 1h-4h bucket is actually the highest-PnL window. Force close at
+    # the current bid (or terminal value if resolved) past the cap.
+    MAX_HOLDING_PERIOD_S: int = 43_200  # 12h
+    # Strategy upgrade 2026-05-17 (Tier 1 fix #4) — sport-specific holding cap.
+    # The 12h non-sport cap is far too loose for live sport markets that
+    # resolve in 30-90 min. Paper trade #23-style losses (entry 0.52, IPL
+    # match, -98% in resolution) happen when the bot holds through the
+    # entire match. Force-close any open sport position past 30 min so it
+    # exits BEFORE the resolution path can wipe it. Non-sport categories
+    # keep MAX_HOLDING_PERIOD_S. Runtime-config tunable.
+    SPORT_MAX_HOLDING_S: int = 1_800  # 30 min
+    # Strategy upgrade 2026-05-17 (Tier 1 fix #5) — sport-specific stop-loss.
+    # The 8% FOLLOW stop is calibrated for crypto/macro swing trades. On
+    # sport markets prices move 5-15% in seconds as event probabilities
+    # update, and the 8% gives too much room for a catastrophic resolution
+    # loss. Tighten to 3% for category='sports' only. Non-sport keeps
+    # STOP_LOSS_FOLLOW (0.08) / STOP_LOSS_FADE (0.05). Runtime-config tunable.
+    STOP_LOSS_SPORT: float = 0.03  # 3% (vs 8% for non-sport)
+    # Strategy upgrade 2026-05-17 (Tier 1 fix #2+#3) — live-match detector.
+    # When True, src/economics/live_match_detector.is_live_match is
+    # consulted by confidence_engine.evaluate AND paper_trader.open_trade
+    # (defense in depth). If the predicate fires, the signal is rejected
+    # with reason `live_match_blocked|signal=<reason>`. Disable only for
+    # backtest reruns where you want the legacy behaviour. Runtime-
+    # tunable; if Agent A's Gamma `is_live_match` enrichment falls behind
+    # the regex+volume fallback still catches the dominant cases.
+    LIVE_MATCH_BLOCK_ENABLED: bool = True
+    # USDC threshold for the volume-spike heuristic inside the live-match
+    # detector. Only applied when `category='sports'`. Calibrated against
+    # 2026-05-17 backtest: in-play sports markets routinely sustain
+    # $50k+ rolling 24h volume during the live window; long-dated
+    # futures (e.g. "Who wins Champions League 2027?") rarely cross
+    # that bar before the closing weeks.
+    LIVE_MATCH_VOLUME_THRESHOLD: float = 50_000.0
+    # Comma-separated category whitelist for paper_trader.open_trade.
+    # Backtest evidence (2026-05-17): sports/crypto/macro are the
+    # win-rate-positive cohorts; politics (33.8%) and unknown (43.8%)
+    # lose money on average. Override via env or RuntimeConfig.
+    CATEGORY_WHITELIST: str = "sports,crypto,macro"
+    # Strategy upgrade 2026-05-17 round 3 (quick-win patch) — book-wall
+    # guard. Post-mortem of the 11 trades that each lost -97% showed the
+    # bid-ask spread was >= 0.50 in ALL of them: the order book had
+    # collapsed to a binary pre-resolution wall (bid=0.01, ask=0.99) with
+    # no meaningful price to enter at. Reject any open_trade where the
+    # spread is wider than this threshold. Runtime-config tunable via
+    # `book_wall_max_spread`. Default 0.50 = 50pp = unrecoverable.
+    BOOK_WALL_MAX_SPREAD: float = 0.50
+    # Strategy upgrade 2026-05-17 round 3 (quick-win patch) — cold-start
+    # floor. A leader with fewer than this many resolved positions
+    # (internal_resolved + external_resolved combined) is too cold to
+    # trust regardless of any other gate. Cheap insurance against
+    # zero-history leaders that survived the legacy
+    # min_leader_resolved_for_follow gate via FADE-only or by missing
+    # data. Runtime-config tunable via `min_leader_total_resolved`.
+    MIN_LEADER_TOTAL_RESOLVED: int = 5
+    # Minimum confidence (Thompson posterior) to actually emit a
+    # FOLLOW/FADE decision from the confidence engine. Previously the
+    # runtime_config knob existed but was never read by evaluate(). Set
+    # to 0.30 — still permissive but kills the dregs that have been
+    # producing losing trades on the bottom-decile signals.
+    MIN_SIGNAL_STRENGTH: float = 0.30
+    # Minimum number of resolved positions a leader must have before
+    # FOLLOW signals on them are accepted. Backtest evidence (2026-05-17)
+    # showed wallets with <30 resolved positions had win rates near
+    # random; the top cohort (70%+ winrate) all had ≥50 resolved.
+    MIN_LEADER_RESOLVED_FOR_FOLLOW: int = 30
+    # Same gate for FADE — we still want to FADE leaders we know
+    # something about, not random newbies. Same threshold as FOLLOW
+    # (the FADE signal benefits from leader-history depth too).
+    MIN_LEADER_RESOLVED_FOR_FADE: int = 30
+    # Minimum posterior Beta-mean win-rate (from accuracy.overall) for
+    # FOLLOW to fire. 0.55 is permissive — production filters should
+    # eventually target the 70%-cohort wallets the backtest identified.
+    # FADE intentionally targets LOSERS so this gate does NOT apply
+    # to FADE.
+    MIN_LEADER_WINRATE_FOR_FOLLOW: float = 0.55
+
+    # ── Strategy upgrade 2026-05-17 round 2 — Falcon prior + tiers ────
+    # Lever B (Falcon prior integration). The confidence engine fuses
+    # Falcon Wallet 360 winning_trades / losing_trades into the
+    # Bayesian gate via:
+    #   effective_resolved = MAX(internal_resolved,
+    #                            int(external_resolved * FALCON_EXTERNAL_DISCOUNT))
+    #   effective_winrate  = (internal_wins + DISCOUNT*external_wins + 1)
+    #                       / (internal_resolved + DISCOUNT*external_resolved + 2)
+    # (the +1 / +2 is Laplace smoothing — keeps the posterior bounded
+    # at the Beta(1,1) uninformed prior when both sides are zero.)
+    # 0.5 = "trust our own observations 2x more than reported metrics".
+    # Operator-tunable at runtime via runtime_config.
+    FALCON_EXTERNAL_DISCOUNT: float = 0.5
+
+    # Lever C (tier-based thresholds). Falcon-validated leaders get
+    # tighter resolved/winrate floors so they can trade earlier. Tier
+    # criteria (in classify order — A wins ties):
+    #   Tier A: falcon_score >= TIER_A_FALCON_THRESHOLD OR
+    #           confirmed_followers >= TIER_A_FOLLOWER_COUNT
+    #   Tier B: falcon_score >= TIER_B_FALCON_THRESHOLD OR
+    #           confirmed_followers >= TIER_B_FOLLOWER_COUNT
+    #   Tier C: everyone else (the existing thresholds).
+    # Defaults are the current production gates (Tier C = legacy).
+    TIER_A_MIN_RESOLVED: int = 10
+    TIER_A_MIN_WINRATE: float = 0.50
+    TIER_B_MIN_RESOLVED: int = 20
+    TIER_B_MIN_WINRATE: float = 0.55
+    TIER_C_MIN_RESOLVED: int = 30
+    TIER_C_MIN_WINRATE: float = 0.55
+    TIER_A_FALCON_THRESHOLD: float = 50.0
+    TIER_B_FALCON_THRESHOLD: float = 20.0
+    TIER_A_FOLLOWER_COUNT: int = 5
+    TIER_B_FOLLOWER_COUNT: int = 3
+    # ── Audit 2026-05-17 session 2 — monitor + close safety ────────────
+    # Default monitor tick (60s) vs urgent tick (5s when any open trade
+    # is within ``URGENT_MONITOR_HOURS`` of its market's resolution).
+    # Urgent ticking ensures we either close BEFORE resolution (via the
+    # preclose path below) or close AT resolution with fresh book data
+    # instead of trailing it by up to 60 seconds.
+    MONITOR_TICK_S: float = 60.0
+    URGENT_MONITOR_TICK_S: float = 5.0
+    URGENT_MONITOR_HOURS: float = 1.0
+    # Force-close ``PRECLOSE_HOURS_BEFORE_RESOLUTION`` hours before
+    # market resolution. Closing slightly early at a fresh exit_bid is
+    # safer than relying on the resolution path: it depends on
+    # ``markets.resolved_outcome`` being backfilled in time. Setting
+    # this to 0 disables the preclose entirely.
+    PRECLOSE_HOURS_BEFORE_RESOLUTION: float = 0.25
+    # Single-trade return cap that triggers the suspicious-close audit
+    # log. 5.0 = 500% return. Trades closed by ``market_resolved`` are
+    # exempt (extreme tail-bet payouts of 100x are legitimate). Anything
+    # else above this magnitude is logged + Redis-flagged for review.
+    MAX_TRADE_RETURN_RATIO: float = 5.0
     # ── Mutable risk defaults (overridable at runtime via /api/risk/update) ──
     # The dashboard's Risk & Config cockpit edits the RuntimeConfig overrides
     # in Redis; on first boot the values below are used.

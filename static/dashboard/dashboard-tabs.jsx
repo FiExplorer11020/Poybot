@@ -2734,4 +2734,174 @@ const PipeRow = ({ label, value, color }) => (
   </div>
 );
 
-Object.assign(window, { AlphaTerminal, MarketScanner, LivePortfolio, DecisionEngine, RiskConfig, BotHealth, WalletGraph, MLProgression, Inspector });
+// ─── LAB — R7/R8/R9/R10 runtime gate cockpit ──────────────────────────────────
+// Single-source-of-truth UI for the four V2 features that run shadow-mode
+// daemons but whose output is gated OFF in confidence_engine until the
+// operator flips the corresponding runtime_config flag. Each card surfaces
+// the gate state, the blocker that's keeping it OFF, and an ENABLE button
+// that POSTs to /api/risk/update (the same endpoint RiskConfig uses).
+const LabGates = () => {
+  const { connectionState } = useLiveStore();
+  const [cfg, setCfg]             = useStateT(null);
+  const [saving, setSaving]       = useStateT('');
+  const [msg, setMsg]             = useStateT('');
+  const [gateStats, setGateStats] = useStateT(null);
+
+  const refresh = () => {
+    const base = window.PoybotAPI?.getSettings?.()?.API_BASE || '';
+    fetch(`${base}/api/risk/config`)
+      .then(r => r.ok ? r.json() : Promise.reject('HTTP ' + r.status))
+      .then(d => setCfg(d?.config || {}))
+      .catch(e => { console.warn('[Lab] cfg fetch failed', e); setCfg({}); });
+    fetch(`${base}/api/lab/gates`)
+      .then(r => r.ok ? r.json() : null)
+      .then(d => d && setGateStats(d))
+      .catch(() => {});
+  };
+  useEffectT(() => { refresh(); const t = setInterval(refresh, 10000); return () => clearInterval(t); }, []);
+
+  const GATES = [
+    {
+      key:  'strategy_conditional_confidence_enabled',
+      round:'R8', name:'The Lens', daemon:'strategy_classifier',
+      desc: 'Apply STRATEGY_WEIGHTS multiplier to FOLLOW/FADE based on each leader\'s 9-class strategy fingerprint (directional, momentum, arb_2way, market_maker, …). Daemon classifies every leader nightly via LightGBM features.',
+      blocker: 'None — multiplier defaults to 1.0 when a leader is unclassified, so flipping ON is safe. RECOMMENDED first activation.',
+      risk: 'low',
+    },
+    {
+      key:  'volume_anticipation_enabled',
+      round:'R9', name:'The Web', daemon:'follower_volume',
+      desc: 'Activate Kalman + multivariate Hawkes volume forecast as a new decision policy. Routes "anticipation" entries when follower-pool volume is predicted to spike before the leader\'s trade fully propagates.',
+      blocker: 'Cross-coupled with R10 — recommend flipping R10 first so anticipation entries are causally validated (avoids news-driven false positives).',
+      risk: 'medium',
+    },
+    {
+      key:  'causal_gating_enabled',
+      round:'R10', name:'The Truth Test', daemon:'causal',
+      desc: 'Gate FOLLOW/FADE confidence by IV-corrected ATE (Wu-Hausman test). Halves follow_confidence when Hawkes-implied causation overstates true causal effect (news-driven coincidence).',
+      blocker: 'Methodology audit pending — 1 week external causal-inference expert review required before flip (see docs/audit/phase3/round10_wave3_review.md § 11).',
+      risk: 'high',
+    },
+    {
+      key:  'prefill_live_enabled',
+      round:'R7', name:'The Front Door', daemon:'mempool',
+      desc: 'Polygon mempool watcher fires pre-signed orders via IntentRouter when a leader\'s transaction is detected in the mempool, ~250 ms ahead of REST polling.',
+      blocker: '30-day shadow-soak required + CLOBClientWrapper sign+submit split + p50 < 250 ms verified in production.',
+      risk: 'high',
+    },
+  ];
+
+  const toggleGate = async (key, currentlyOn, riskLevel) => {
+    if (!currentlyOn && (riskLevel === 'high' || riskLevel === 'medium')) {
+      const blocker = GATES.find(g => g.key === key)?.blocker || '';
+      if (!window.confirm(`Enable ${key}?\n\nBlocker:\n${blocker}\n\nProceed anyway?`)) return;
+    }
+    const newValue = currentlyOn ? 0.0 : 1.0;
+    setSaving(key); setMsg('');
+    try {
+      await window.PoybotAPI.updateConfig({ [key]: newValue });
+      setMsg(`✓ ${key} → ${newValue ? 'ON' : 'OFF'}`);
+      refresh();
+    } catch (e) { setMsg(`✗ ${e.message}`); }
+    setSaving('');
+    setTimeout(() => setMsg(''), 4000);
+  };
+
+  if (!cfg) {
+    return <div style={{ padding: 24, color: C.dim2 }}>Loading gate config…</div>;
+  }
+
+  const onCount = GATES.filter(g => !!cfg[g.key]).length;
+  const riskColor = (r) => r === 'low' ? C.green : r === 'medium' ? C.amber : C.red;
+
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', height: '100%', width: '100%', overflow: 'hidden' }}>
+      <ConnBanner state={connectionState} />
+      <KpiStrip items={[
+        { label: 'Gates ON',      value: `${onCount}/4`,            color: onCount > 0 ? C.green : C.dim },
+        { label: 'Gates OFF',     value: `${4 - onCount}/4`,        color: C.amber },
+        { label: 'Shadow daemons',value: gateStats?.daemons_running ?? '—', color: C.purple },
+        { label: 'R8 classified', value: gateStats?.r8_classifications_24h ?? '—', color: C.blue },
+        { label: 'R9 forecasts',  value: gateStats?.r9_forecasts_24h ?? '—',      color: C.blue },
+        { label: 'R10 estimates', value: gateStats?.r10_estimates_24h ?? '—',     color: C.blue },
+        { label: 'R7 intents',    value: gateStats?.r7_intents_24h ?? '—',        color: C.blue },
+      ]} />
+
+      <div style={{ flex: 1, overflow: 'auto', padding: 14 }}>
+        <div style={{ background: C.panel, padding: 12, marginBottom: 14, borderLeft: `3px solid ${C.amber}` }}>
+          <div style={{ color: C.amber, fontWeight: 700, fontSize: 11, marginBottom: 4 }}>⚠ LAB — Runtime gates for V2 features (R7/R8/R9/R10)</div>
+          <div style={{ color: C.dim2, fontSize: 10, lineHeight: 1.5 }}>
+            Each gate corresponds to a daemon running in shadow mode. The daemon computes its metric continuously, but the output is ignored by the decision engine until the flag flips. Read the blocker carefully before activating. Toggling is instant (Redis pubsub propagation &lt;5s).
+          </div>
+        </div>
+
+        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(440px, 1fr))', gap: 14 }}>
+          {GATES.map(gate => {
+            const isOn = !!cfg[gate.key];
+            const isSaving = saving === gate.key;
+            return (
+              <div key={gate.key} style={{ background: C.panel, padding: 14, border: `1px solid ${isOn ? C.green : C.border}` }}>
+                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', marginBottom: 8 }}>
+                  <div>
+                    <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+                      <span style={{ color: C.amber, fontWeight: 700, fontSize: 14, fontFamily: 'monospace' }}>{gate.round}</span>
+                      <span style={{ color: C.text, fontSize: 13 }}>· {gate.name}</span>
+                      <span style={{ color: riskColor(gate.risk), fontSize: 9, padding: '1px 5px', border: `1px solid ${riskColor(gate.risk)}`, marginLeft: 6 }}>
+                        {gate.risk.toUpperCase()} RISK
+                      </span>
+                    </div>
+                    <div style={{ color: C.dim2, fontSize: 10, fontFamily: 'monospace', marginTop: 3 }}>{gate.key}</div>
+                  </div>
+                  <Badge type={isOn ? 'green' : 'default'} size="sm">{isOn ? 'ON' : 'OFF'}</Badge>
+                </div>
+
+                <div style={{ color: C.text, fontSize: 11, lineHeight: 1.55, marginBottom: 10 }}>
+                  {gate.desc}
+                </div>
+
+                <div style={{ background: C.panel2, padding: 8, fontSize: 10, marginBottom: 10, borderLeft: `2px solid ${riskColor(gate.risk)}` }}>
+                  <div style={{ color: riskColor(gate.risk), fontWeight: 700, marginBottom: 3 }}>BLOCKER</div>
+                  <div style={{ color: C.dim2, lineHeight: 1.45 }}>{gate.blocker}</div>
+                </div>
+
+                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                  <span style={{ color: C.dim2, fontSize: 10 }}>
+                    Daemon: <span style={{ color: C.purple }}>polymarket_{gate.daemon}</span>
+                  </span>
+                  <button
+                    onClick={() => toggleGate(gate.key, isOn, gate.risk)}
+                    disabled={isSaving}
+                    style={{
+                      background: isOn ? C.red : C.green, color: '#000',
+                      border: 'none', padding: '6px 16px', fontWeight: 700,
+                      fontSize: 11, cursor: isSaving ? 'wait' : 'pointer',
+                      opacity: isSaving ? 0.5 : 1, fontFamily: 'monospace',
+                    }}
+                  >
+                    {isSaving ? '…' : (isOn ? 'DISABLE' : 'ENABLE')}
+                  </button>
+                </div>
+              </div>
+            );
+          })}
+        </div>
+
+        {msg && (
+          <div style={{ marginTop: 14, padding: 10, background: C.panel, color: msg.startsWith('✓') ? C.green : C.red, fontSize: 11, fontFamily: 'monospace' }}>
+            {msg}
+          </div>
+        )}
+
+        <div style={{ marginTop: 18, padding: 12, background: C.panel, fontSize: 10, color: C.dim2, lineHeight: 1.5 }}>
+          <div style={{ color: C.text, fontWeight: 700, marginBottom: 6 }}>How to validate a gate flip</div>
+          <div>1. Enable in LAB → 2. Watch shadow PnL delta vs baseline for 7 days → 3. Compare win-rate with/without via decision_log replay → 4. If gain &gt; 5 pts, keep ON. Otherwise revert.</div>
+          <div style={{ marginTop: 6 }}>
+            Audit log: <a href="#" onClick={(e) => { e.preventDefault(); window.PoybotNav?.go?.('risk'); }} style={{ color: C.blue }}>RISK & CONFIG → Audit log</a> (same source — all gate flips logged via risk_config_history)
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+};
+
+Object.assign(window, { AlphaTerminal, MarketScanner, LivePortfolio, DecisionEngine, RiskConfig, BotHealth, WalletGraph, MLProgression, Inspector, LabGates });

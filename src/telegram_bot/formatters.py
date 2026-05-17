@@ -82,18 +82,37 @@ def format_position_opened(*, venue: str, payload: dict) -> str:
 
 
 def format_position_closed(*, venue: str, payload: dict) -> str:
-    """Format a 'position closed' alert."""
+    """Format a 'position closed' alert.
+
+    Includes strategy, size, entry→exit prices, and pnl_pct so the user
+    can immediately judge magnitude vs exposure. Prior format showed only
+    pnl_usdc + exit_price + reason; without size + pct the operator had
+    no way to tell whether ``-198$`` was a 99% loss on $200 or a 12%
+    loss on $1650.
+    """
     pnl = payload.get("pnl_usdc")
     pnl_icon = "📈" if (pnl or 0) >= 0 else "📉"
     icon = "📄" if venue == "paper" else "💸"
     market = _short(payload.get("market_id"))
     reason = payload.get("close_reason", "?")
     exit_price = _price(payload.get("exit_price"))
+    entry_price = _price(payload.get("entry_price"))
     trade_id = payload.get("trade_id", "?")
+    strategy = str(payload.get("strategy", "?")).upper()
+    direction = str(payload.get("direction", "?")).upper()
+    size = _money_abs(payload.get("size_usdc"))
+    pnl_pct_raw = payload.get("pnl_pct")
+    try:
+        pnl_pct_str = (
+            f"{float(pnl_pct_raw):+.1f}%" if pnl_pct_raw is not None else "?"
+        )
+    except (TypeError, ValueError):
+        pnl_pct_str = "?"
     return (
-        f"{icon}{pnl_icon} {venue.upper()} CLOSE — #{trade_id}\n"
-        f"market: {market}\n"
-        f"exit: {exit_price}  pnl: {_money(pnl)}  reason: {reason}"
+        f"{icon}{pnl_icon} {venue.upper()} CLOSE — {strategy} #{trade_id}\n"
+        f"market: {market}  dir: {direction}  size: {size}\n"
+        f"entry: {entry_price} → exit: {exit_price}\n"
+        f"pnl: {_money(pnl)} ({pnl_pct_str})  reason: {reason}"
     )
 
 
@@ -228,6 +247,75 @@ def format_positions(
     return "\n".join(lines)
 
 
+def format_summary(payload: dict) -> str:
+    """Format the /summary reply.
+
+    Expected payload shape (all keys optional; missing fields render as
+    ``?`` or skipped sections):
+      {
+        "trades_closed_today": int,
+        "trades_open": int,
+        "wins": int,
+        "losses": int,
+        "avg_win": float | None,
+        "avg_loss": float | None,
+        "net_today": float,
+        "cum_realized": float | None,
+        "unrealized": float | None,
+        "by_reason":  [{"reason": str, "count": int, "avg_pnl": float | None}, ...],
+        "by_strategy": [{"strategy": str, "count": int, "wins": int, "losses": int}, ...],
+      }
+    """
+    n_closed = int(payload.get("trades_closed_today", 0) or 0)
+    n_open = int(payload.get("trades_open", 0) or 0)
+    wins = int(payload.get("wins", 0) or 0)
+    losses = int(payload.get("losses", 0) or 0)
+    avg_win = payload.get("avg_win")
+    avg_loss = payload.get("avg_loss")
+    net_today = payload.get("net_today", 0.0)
+    cum_realized = payload.get("cum_realized")
+    unrealized = payload.get("unrealized")
+
+    lines = ["📊 TODAY'S SUMMARY (UTC since 00:00)"]
+    lines.append(f"trades: {n_closed} closed, {n_open} open")
+    lines.append(
+        f"wins: {wins} (avg {_money(avg_win)})" if wins
+        else "wins: 0"
+    )
+    lines.append(
+        f"losses: {losses} (avg {_money(avg_loss)})" if losses
+        else "losses: 0"
+    )
+    lines.append(f"net realized: {_money(net_today)} (today)")
+    if cum_realized is not None:
+        lines.append(f"cum realized: {_money(cum_realized)} (lifetime)")
+    if unrealized is not None:
+        lines.append(f"unrealized: {_money(unrealized)} ({n_open} open)")
+
+    by_reason = payload.get("by_reason") or []
+    if by_reason:
+        lines.append("")
+        lines.append("by close reason:")
+        for r in by_reason:
+            reason = str(r.get("reason", "?"))
+            count = int(r.get("count", 0) or 0)
+            avg_pnl = r.get("avg_pnl")
+            lines.append(f"  {reason}: {count} (avg {_money(avg_pnl)})")
+
+    by_strategy = payload.get("by_strategy") or []
+    if by_strategy:
+        lines.append("")
+        lines.append("by strategy:")
+        for s in by_strategy:
+            strat = str(s.get("strategy", "?"))
+            count = int(s.get("count", 0) or 0)
+            w = int(s.get("wins", 0) or 0)
+            l = int(s.get("losses", 0) or 0)
+            lines.append(f"  {strat}: {count} ({w}W {l}L)")
+
+    return "\n".join(lines)
+
+
 def format_mode_change(*, old_mode: Optional[str], new_mode: str) -> str:
     """Format the /mode reply."""
     return (
@@ -243,6 +331,7 @@ def format_help() -> str:
         "/status           — current mode, capital, open positions\n"
         "/pnl              — realized + unrealized PnL\n"
         "/positions        — list of open positions\n"
+        "/summary          — today's trading activity (UTC)\n"
         "/mode <m>         — switch trading mode (paper|live|dual)\n"
         "/killswitch <s>   — flip the killswitch (on|off)\n"
         "/pause            — stop the engine (observer keeps running)\n"

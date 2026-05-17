@@ -62,7 +62,9 @@ _live_snapshot_cache: dict = {"data": None, "last_built": 0.0}
 _live_snapshot_lock = asyncio.Lock()
 
 TEMPLATE_PATH = Path(__file__).parent.parent.parent / "templates" / "dashboard.html"
-TEMPLATE_V2_PATH = Path(__file__).parent.parent.parent / "templates" / "dashboard_v2.html"
+# TEMPLATE_V2_PATH removed 2026-05-17 — V2 dashboard deleted (R6-R13
+# features now exposed via the V1 LAB tab; see static/dashboard/dashboard-tabs.jsx
+# LabGates component + /api/lab/gates endpoint).
 STATIC_DIR = Path(__file__).parent.parent.parent / "static"
 STATS_PUSH_INTERVAL_S = 1.0  # how often to push live stats over WebSocket
 HEALTH_CACHE_TTL_S = 5.0
@@ -2058,23 +2060,74 @@ async def api_control_real_execution(payload: _KillswitchFlip):
     return state.to_dict()
 
 
+@app.get("/api/lab/gates")
+async def api_lab_gates():
+    """LAB cockpit — aggregate the 4 V2 runtime gate states + shadow-mode
+    daemon health counters.
+
+    Returns the count of items each gated daemon produced in the last 24h
+    so the operator can verify the daemon is healthy BEFORE flipping the
+    gate ON. A daemon returning 0 over 24h is either disabled, crashed,
+    or has no work to do — none of which warrant activating the gate.
+    """
+    cfg = await get_runtime_config().effective()
+
+    async def _safe_count(sql: str) -> int | None:
+        try:
+            async with _pool.acquire() as conn:
+                row = await conn.fetchrow(sql)
+                return int(row["n"]) if row and row["n"] is not None else 0
+        except Exception as exc:
+            logger.debug(f"lab_gates count failed for {sql[:60]}: {exc}")
+            return None
+
+    r8 = await _safe_count(
+        "SELECT COUNT(*) AS n FROM strategy_labels WHERE updated_at > NOW() - INTERVAL '24 hours'"
+    )
+    r9 = await _safe_count(
+        "SELECT COUNT(*) AS n FROM follower_pool_state_history WHERE updated_at > NOW() - INTERVAL '24 hours'"
+    )
+    r10 = await _safe_count(
+        "SELECT COUNT(*) AS n FROM causal_estimates WHERE estimated_at > NOW() - INTERVAL '24 hours'"
+    )
+    r7 = await _safe_count(
+        "SELECT COUNT(*) AS n FROM mempool_observations WHERE observed_at > NOW() - INTERVAL '24 hours'"
+    )
+
+    daemons = sum(1 for v in (r8, r9, r10, r7) if v is not None and v > 0)
+
+    return {
+        "gates": {
+            "strategy_conditional_confidence_enabled": bool(cfg.get("strategy_conditional_confidence_enabled", False)),
+            "volume_anticipation_enabled":             bool(cfg.get("volume_anticipation_enabled", False)),
+            "causal_gating_enabled":                   bool(cfg.get("causal_gating_enabled", False)),
+            "prefill_live_enabled":                    bool(cfg.get("prefill_live_enabled", False)),
+        },
+        "r8_classifications_24h": r8,
+        "r9_forecasts_24h":       r9,
+        "r10_estimates_24h":      r10,
+        "r7_intents_24h":         r7,
+        "daemons_running":        daemons,
+    }
+
+
 # ---------------------------------------------------------------------------
-# Dashboard v2 — refonded UI (R6-R13 surface)
+# Dashboard v2 — REMOVED 2026-05-17.
 #
-# Lives at /v2 alongside the existing dashboard at /. Migration strategy
-# per docs/UI_REDESIGN_PHASE3.md § 9 — both UIs run side-by-side for one
-# release cycle, then v1 is retired. The 22 stub endpoints below return
-# minimal placeholder shapes (empty arrays / null) so the v2 components
-# render their graceful empty states until the underlying data layer is
-# wired by the operator.
+# The /v2 route and dashboard_v2.html template were deleted as part of
+# the V1-as-source-of-truth strategy. R6-R13 features are now surfaced
+# via the V1 LAB tab (see static/dashboard/dashboard-tabs.jsx
+# `LabGates` component + /api/lab/gates endpoint). Anyone hitting /v2
+# will get a 404 from FastAPI's default handler.
+#
+# The placeholder /api/overview/, /api/intelligence/*, /api/mempool/*,
+# /api/microscope/*, /api/periphery/*, /api/execution/*, /api/wallet/*,
+# /api/calibration/*, /api/research/* endpoints below are kept INACTIVE
+# (no V2 client calls them) but left in place — they make zero runtime
+# impact when not called and may be repurposed by future LAB-tab
+# extensions. To purge them entirely, delete from here to the
+# `# /ws/live` block.
 # ---------------------------------------------------------------------------
-
-
-@app.get("/v2", response_class=HTMLResponse)
-async def root_v2():
-    if not TEMPLATE_V2_PATH.exists():
-        raise HTTPException(status_code=404, detail="dashboard_v2.html not found")
-    return HTMLResponse(content=TEMPLATE_V2_PATH.read_text())
 
 
 # ---------------------------------------------------------------------------
