@@ -22,6 +22,7 @@ from datetime import datetime, timedelta, timezone
 from loguru import logger
 
 from src.config import settings
+from src.control.price_oracle import PriceOracle, PriceQuote
 from src.control.redis_pubsub import Subscriber
 from src.database.connection import get_db
 from src.economics.fees import calculate_polymarket_fee
@@ -76,10 +77,24 @@ class OpenPaperTrade:
 
 
 class PaperTrader:
-    def __init__(self, redis_client, confidence_engine=None, risk_manager=None):  # FIX 4
+    def __init__(
+        self,
+        redis_client,
+        confidence_engine=None,
+        risk_manager=None,
+        price_oracle: PriceOracle | None = None,
+    ):  # FIX 4 + Pillar 1 (2026-05-17)
         self._redis = redis_client
         self._confidence_engine = confidence_engine
         self._risk_manager = risk_manager  # FIX 4
+        # Pillar 1 (audit 2026-05-17): the PriceOracle is the canonical
+        # source for close-time exit prices. When None (legacy callers /
+        # some unit tests) the trader builds one on-demand against its
+        # own redis client — that way the existing test suite that only
+        # provides a redis mock keeps working without churn.
+        if price_oracle is None and redis_client is not None:
+            price_oracle = PriceOracle(redis_client=redis_client)
+        self._price_oracle = price_oracle
         self._running = False
         self._stop_event = asyncio.Event()
         self._open_trades: list[OpenPaperTrade] = []
@@ -453,16 +468,34 @@ class PaperTrader:
             )
 
         for trade in list(self._open_trades):
-            exit_price = await self._exit_bid(
-                trade.market_id, trade.token_id, trade.entry_price
+            # ── Pillar 1 (audit 2026-05-17) ────────────────────────────
+            # Single source of truth for the close-time exit price: the
+            # PriceOracle's cascade fresh_book → Gamma → resolved → FAIL.
+            # The legacy `_exit_bid` fallback to `trade.entry_price` is
+            # what produced the May 15 phantom-win pattern (PnL silently
+            # locked to $0 because exit_price == entry_price). When the
+            # oracle returns price=None we DEFER the close — the next
+            # monitor tick retries, and the 30d timeout is the only path
+            # that bypasses the defer (see below).
+            quote = await self._price_oracle.get_close_price(
+                market_id=trade.market_id,
+                token_id=trade.token_id,
+                direction=trade.direction,
             )
+            if quote.price is None:
+                logger.warning(
+                    f"PaperTrader: deferring close of #{trade.id} — oracle "
+                    f"source=fail (no fresh book, no Gamma trade, "
+                    f"resolved_outcome NULL) market={trade.market_id}"
+                )
+                continue
+            exit_price = quote.price
             # mark_price = mid (used ONLY for stop/take threshold checks
-            # — never as a settlement price). Falls back to exit_price
-            # when the book quote is missing so a stale-book moment
-            # doesn't suddenly fire spurious closes.
-            mark_price = await self._mark_mid(
-                trade.market_id, trade.token_id, fallback=exit_price
-            )
+            # — never as a settlement price). For source="book" the
+            # oracle already returns mid as `quote.price`, so we can
+            # reuse it directly. For source="gamma" or "resolved" we use
+            # the same value (no order-book mid available anyway).
+            mark_price = exit_price
             # Resolve the trade's market category ONCE per tick — it
             # gates both the sport-specific holding cap (below) and the
             # adaptive stop-loss (further down). Falls back to "unknown"
@@ -474,25 +507,63 @@ class PaperTrader:
             # MUST fire BEFORE the absolute 30d timeout so a position that
             # crosses the 24h boundary doesn't sit until the broader cap
             # fires. If the market has resolved by the holding-cap moment,
-            # use the terminal value; otherwise the fresh bid.
+            # use the terminal value; otherwise the oracle's exit_price.
             if trade.opened_at and holding_cap_s > 0:
                 held_for_s = (now - trade.opened_at).total_seconds()
                 if held_for_s >= holding_cap_s:
                     cap_price = exit_price
+                    cap_quote = quote
                     if await self._is_market_resolved(trade.market_id):
-                        resolved = await self._fetch_market_resolution(
-                            trade.market_id, trade.token_id
+                        resolved_quote = await self._price_oracle.get_close_price(
+                            market_id=trade.market_id,
+                            token_id=trade.token_id,
+                            direction=trade.direction,
+                            prefer_resolved=True,
                         )
-                        if resolved is not None:
-                            cap_price = resolved
+                        if resolved_quote.price is not None:
+                            cap_price = resolved_quote.price
+                            cap_quote = resolved_quote
                     await self.close_trade(
-                        trade.id, cap_price, "holding_cap_reached"
+                        trade.id,
+                        cap_price,
+                        "holding_cap_reached",
+                        price_quote=cap_quote,
                     )
                     continue
 
             # --- FIX 9: Timeout (absolute, 30d) ---
+            # 30d timeout uses the oracle with prefer_resolved=True — a
+            # 30-day-old book quote is meaningless even when "fresh". If
+            # the resolution is still pending after 30d (which would be
+            # operationally pathological) we close at 0.5 as a last
+            # resort with a distinct `timeout_unresolved` reason so the
+            # operator sees this case in the audit log.
             if trade.opened_at and (now - trade.opened_at) > timedelta(days=TIMEOUT_DAYS):
-                await self.close_trade(trade.id, exit_price, "timeout")
+                timeout_quote = await self._price_oracle.get_close_price(
+                    market_id=trade.market_id,
+                    token_id=trade.token_id,
+                    direction=trade.direction,
+                    prefer_resolved=True,
+                )
+                if timeout_quote.price is not None:
+                    await self.close_trade(
+                        trade.id,
+                        timeout_quote.price,
+                        "timeout",
+                        price_quote=timeout_quote,
+                    )
+                else:
+                    logger.error(
+                        f"PaperTrader: 30d timeout on #{trade.id} but "
+                        f"resolution still pending — closing at 0.5 fallback "
+                        f"(market={trade.market_id})"
+                    )
+                    await self.close_trade(
+                        trade.id,
+                        0.5,
+                        "timeout_unresolved",
+                        price_quote=timeout_quote,
+                    )
                 continue
 
             # --- Strategy-aware pre-resolution timeout ---
@@ -502,35 +573,67 @@ class PaperTrader:
             # populated by the maintenance loop; if that backfill is
             # delayed, a position would otherwise hold past resolution
             # and either be deferred indefinitely or close at a stale bid.
-            # Closing slightly early at the fresh bid is the safe play.
+            # Closing slightly early via the oracle is the safe play.
+            #
+            # Pillar 1 hardening: preclose is stricter than the normal
+            # close — if the oracle's source is "book" with spread > 20%
+            # we defer rather than booking against a wide mid that's
+            # about to collapse to 0/1. The 20% gate is intentionally
+            # tighter than the default 30% MAX_BOOK_SPREAD_PCT.
             preclose_hours = float(
                 getattr(settings, "PRECLOSE_HOURS_BEFORE_RESOLUTION", 0.25)
             )
             if preclose_hours > 0:
                 hours_left = await self._hours_until_resolution(trade.market_id)
                 if hours_left is not None and 0 < hours_left <= preclose_hours:
+                    if (
+                        quote.source == "book"
+                        and quote.spread_pct is not None
+                        and quote.spread_pct > 0.20
+                    ):
+                        logger.warning(
+                            f"PaperTrader: deferring preclose of #{trade.id} — "
+                            f"book spread={quote.spread_pct:.3f} too wide "
+                            f"(>20% preclose gate)"
+                        )
+                        continue
                     await self.close_trade(
-                        trade.id, exit_price, "preclose_pre_resolution"
+                        trade.id,
+                        exit_price,
+                        "preclose_pre_resolution",
+                        price_quote=quote,
                     )
                     continue
 
             # --- Market resolved — use terminal token value, never stale bid ---
+            # When the oracle's first call already returned source="resolved"
+            # we book against that terminal value directly; otherwise we
+            # explicitly ask for the resolved path (the first call may
+            # have returned a fresh-book mid instead).
             if await self._is_market_resolved(trade.market_id):
-                resolution_price = await self._fetch_market_resolution(
-                    trade.market_id, trade.token_id
-                )
-                if resolution_price is not None:
-                    # Settlement known: 1.0 for winner, 0.0 for loser.
+                if quote.source == "resolved":
+                    resolution_quote = quote
+                else:
+                    resolution_quote = await self._price_oracle.get_close_price(
+                        market_id=trade.market_id,
+                        token_id=trade.token_id,
+                        direction=trade.direction,
+                        prefer_resolved=True,
+                    )
+                if resolution_quote.price is not None:
                     await self.close_trade(
-                        trade.id, resolution_price, "market_resolved"
+                        trade.id,
+                        resolution_quote.price,
+                        "market_resolved",
+                        price_quote=resolution_quote,
                     )
                 else:
                     # Outcome not yet known (oracle pending or unbacked).
-                    # Defer the close — using the stale bid here is exactly
+                    # Defer the close — using a stale bid here is exactly
                     # what produced the $42k phantom-wins in May 15. The
-                    # next monitor tick will retry; if it never resolves,
-                    # the timeout path will eventually close at the
-                    # last-known bid which is at least sanity-bounded.
+                    # next monitor tick will retry; the 30d timeout path
+                    # above will eventually catch any never-resolving
+                    # market.
                     logger.warning(
                         f"PaperTrader: market {trade.market_id} past end_date but "
                         f"resolution outcome unknown — deferring close of #{trade.id}"
@@ -541,7 +644,9 @@ class PaperTrader:
             # Previously FOLLOW-only; FADE benefits equally because leader
             # exiting indicates the original signal is stale.
             if await self._leader_exited_recently(trade.leader_wallet, trade.market_id):
-                await self.close_trade(trade.id, exit_price, "leader_exit")
+                await self.close_trade(
+                    trade.id, exit_price, "leader_exit", price_quote=quote
+                )
                 continue
 
             # --- Sport holding cap (Strategy upgrade 2026-05-17, Tier 1 #4) ---
@@ -567,7 +672,10 @@ class PaperTrader:
                 held_for_s = (now - trade.opened_at).total_seconds()
                 if held_for_s >= sport_holding_cap_s:
                     await self.close_trade(
-                        trade.id, exit_price, "holding_cap_sport"
+                        trade.id,
+                        exit_price,
+                        "holding_cap_sport",
+                        price_quote=quote,
                     )
                     continue
 
@@ -609,7 +717,9 @@ class PaperTrader:
             # spread should accelerate not delay the stop.
             effective_stop_pnl = min(pnl_pct, bid_pnl_pct)
             if effective_stop_pnl <= -stop:
-                await self.close_trade(trade.id, exit_price, "stop_loss")
+                await self.close_trade(
+                    trade.id, exit_price, "stop_loss", price_quote=quote
+                )
             # Take-profit: require BOTH mid and bid to clear the
             # threshold. A take_profit at the spread-induced mid that
             # actually books a bid loss is the bug that produced
@@ -618,7 +728,9 @@ class PaperTrader:
             # bot only closes as take_profit when the realized sale
             # would actually be profitable.
             elif pnl_pct >= take and bid_pnl_pct >= take * 0.5:
-                await self.close_trade(trade.id, exit_price, "take_profit")
+                await self.close_trade(
+                    trade.id, exit_price, "take_profit", price_quote=quote
+                )
 
     async def open_trade(self, decision: dict) -> int | None:
         """Open a paper trade from a decision dict. Returns trade ID or None."""
@@ -1101,8 +1213,24 @@ class PaperTrader:
             pass
         return trade_id
 
-    async def close_trade(self, trade_id: int, exit_price: float, close_reason: str) -> bool:
-        """Close a paper trade by ID. Returns True on success."""
+    async def close_trade(
+        self,
+        trade_id: int,
+        exit_price: float,
+        close_reason: str,
+        *,
+        price_quote: PriceQuote | None = None,
+    ) -> bool:
+        """Close a paper trade by ID. Returns True on success.
+
+        ``price_quote`` (Pillar 1 + 5, audit 2026-05-17): the
+        ``PriceQuote`` that resolved this close. Carries the raw book /
+        Gamma / resolution snapshot used by ``_insert_close_audit`` to
+        populate the ``close_audit_log`` row. Optional for legacy
+        callers (older tests, manual closes) — when omitted the audit
+        row records ``oracle_source='fallback'`` and skips the snapshot
+        columns.
+        """
         trade = next((t for t in self._open_trades if t.id == trade_id), None)
         if trade is None:
             return False
@@ -1246,6 +1374,30 @@ class PaperTrader:
 
                     await self._persist_state(conn=conn)
                     await self._record_equity_sample(conn=conn)
+
+                # --- Pillar 5: close_audit_log (best-effort) ---------- #
+                # The audit insert lives OUTSIDE the close transaction
+                # by design: it is purely observational, and a failure
+                # to record audit evidence must never roll back a real
+                # close. We use the same `conn` (still open after the
+                # transaction) so the INSERT shares the same connection
+                # context but is its own auto-committed statement.
+                try:
+                    await self._insert_close_audit(
+                        conn,
+                        trade=trade,
+                        trade_id=trade_id,
+                        closed_at=now,
+                        close_reason=close_reason,
+                        exit_price=exit_price,
+                        pnl_usdc=pnl_usdc,
+                        price_quote=price_quote,
+                    )
+                except Exception as audit_exc:
+                    logger.warning(
+                        f"PaperTrader: close_audit_log insert failed for "
+                        f"#{trade_id}: {audit_exc} — close itself succeeded"
+                    )
         except Exception as e:
             # Restore the pre-close snapshot if anything in the transaction
             # raised — names only exist if we got that far, hence the guard.
@@ -1339,6 +1491,149 @@ class PaperTrader:
             f"({pnl_pct * 100:.1f}%) reason={close_reason}"
         )
         return True
+
+    # ------------------------------------------------------------------ #
+    # Pillar 5: close_audit_log helpers                                   #
+    # ------------------------------------------------------------------ #
+
+    async def _insert_close_audit(
+        self,
+        conn,
+        *,
+        trade: OpenPaperTrade,
+        trade_id: int,
+        closed_at: datetime,
+        close_reason: str,
+        exit_price: float,
+        pnl_usdc: float,
+        price_quote: PriceQuote | None,
+    ) -> None:
+        """Insert a row into ``close_audit_log`` capturing the evidence
+        used by this close.
+
+        Called from inside ``close_trade`` but OUTSIDE the close
+        transaction — see callsite for the rationale. Any exception
+        raised here is caught by the caller and logged as a warning;
+        the close itself is never rolled back on audit failure.
+        """
+        source = price_quote.source if price_quote is not None else "fallback"
+        book_snapshot = (
+            json.dumps(price_quote.raw_book)
+            if price_quote is not None
+            and price_quote.source == "book"
+            and price_quote.raw_book is not None
+            else None
+        )
+        gamma_snapshot = (
+            json.dumps(price_quote.raw_gamma)
+            if price_quote is not None
+            and price_quote.source == "gamma"
+            and price_quote.raw_gamma is not None
+            else None
+        )
+        resolution_snapshot = (
+            json.dumps(price_quote.raw_resolution)
+            if price_quote is not None
+            and price_quote.source == "resolved"
+            and price_quote.raw_resolution is not None
+            else None
+        )
+        leader_state = await self._snapshot_leader_state(trade)
+        leader_state_json = json.dumps(leader_state) if leader_state else None
+        decision_payload = trade.leader_context if trade.leader_context else None
+        decision_payload_json = (
+            json.dumps(decision_payload) if decision_payload else None
+        )
+
+        await conn.execute(
+            """
+            INSERT INTO close_audit_log (
+                paper_trade_id,
+                closed_at,
+                close_reason,
+                oracle_source,
+                exit_price,
+                computed_pnl_usdc,
+                book_snapshot,
+                gamma_snapshot,
+                resolution_snapshot,
+                leader_state,
+                decision_payload
+            )
+            VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8::jsonb, $9::jsonb, $10::jsonb, $11::jsonb)
+            """,
+            trade_id,
+            closed_at,
+            close_reason,
+            source,
+            float(exit_price),
+            round(float(pnl_usdc), 2),
+            book_snapshot,
+            gamma_snapshot,
+            resolution_snapshot,
+            leader_state_json,
+            decision_payload_json,
+        )
+
+    async def _snapshot_leader_state(
+        self, trade: OpenPaperTrade
+    ) -> dict | None:
+        """Capture the leader's last-known state for the audit row.
+
+        Looks at ``positions_reconstructed`` for the most recent trade
+        the leader made on this market — that's the same data source
+        ``_leader_exited_recently`` uses, so we already know it's
+        populated by the observer/position_tracker pipeline. Returns
+        None on any error or when the leader has no observed activity
+        on this market; the audit insert still proceeds with leader_state
+        as SQL NULL.
+        """
+        try:
+            async with get_db() as conn:
+                row = await conn.fetchrow(
+                    """
+                    SELECT
+                        wallet_address,
+                        open_time,
+                        close_time,
+                        entry_price,
+                        exit_price,
+                        direction
+                    FROM positions_reconstructed
+                    WHERE wallet_address = $1 AND market_id = $2
+                    ORDER BY open_time DESC
+                    LIMIT 1
+                    """,
+                    trade.leader_wallet,
+                    trade.market_id,
+                )
+            if row is None:
+                return None
+            now_ts = datetime.now(tz=timezone.utc)
+            reference_time = row["close_time"] or row["open_time"]
+            age_s = None
+            if reference_time is not None:
+                if reference_time.tzinfo is None:
+                    reference_time = reference_time.replace(tzinfo=timezone.utc)
+                age_s = max(0.0, (now_ts - reference_time).total_seconds())
+            last_trade_price = (
+                float(row["exit_price"])
+                if row["exit_price"] is not None
+                else float(row["entry_price"])
+            )
+            return {
+                "wallet": row["wallet_address"],
+                "last_trade_price": last_trade_price,
+                "side": row["direction"],
+                "age_s": age_s,
+                "still_open": row["close_time"] is None,
+            }
+        except Exception as exc:
+            logger.debug(
+                f"PaperTrader: _snapshot_leader_state failed for "
+                f"wallet={trade.leader_wallet} market={trade.market_id}: {exc}"
+            )
+            return None
 
     async def _get_book_quote(
         self,

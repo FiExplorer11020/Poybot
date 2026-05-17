@@ -10,6 +10,7 @@ from loguru import logger
 
 from src.config import settings
 from src.control.killswitch import get_killswitch
+from src.control.price_oracle import PriceOracle
 from src.control.runtime_config import get_runtime_config, init_runtime_config
 from src.database.connection import close_pool, initialize_pool
 from src.engine.confidence_engine import ConfidenceEngine
@@ -163,10 +164,20 @@ async def main() -> None:
     # S3.11: risk_manager takes a redis_client so circuit-breaker trips
     # and drawdown threshold crossings surface to Telegram.
     risk_manager = RiskManager(redis_client=redis_client)
+    # Pillar 1 (audit 2026-05-17): the PriceOracle is the canonical
+    # source for close-time exit prices. Owns its own aiohttp session
+    # for Gamma /markets queries (cached 60s) and reuses the engine's
+    # redis client for the fresh-book step. Shutdown is handled in the
+    # main() finally block via aclose().
+    price_oracle = PriceOracle(
+        redis_client=redis_client,
+        gamma_cache_ttl_s=60.0,
+    )
     paper_trader = PaperTrader(
         redis_client=redis_client,
         confidence_engine=confidence,
         risk_manager=risk_manager,  # FIX 4
+        price_oracle=price_oracle,  # Pillar 1
     )
     # GraphEngine: subscribes to trades:observed, builds the leader→follower
     # social graph in `follower_edges`. Without this, FOLLOW_MIN_FOLLOWERS=5
@@ -517,6 +528,11 @@ async def main() -> None:
             pass
         try:
             await get_runtime_config().stop_pubsub()
+        except Exception:
+            pass
+        # Pillar 1: release the PriceOracle's owned aiohttp session.
+        try:
+            await price_oracle.aclose()
         except Exception:
             pass
         await close_pool()

@@ -113,7 +113,52 @@ def _stub_trader_for_monitor(
     hours_to_resolution: float = 48.0,
 ) -> None:
     """Wire the bare-minimum mocks ``_check_open_positions`` needs so a
-    test can focus on the branch under inspection."""
+    test can focus on the branch under inspection.
+
+    Updated 2026-05-17 (Pillar 1): the monitor loop now drives close
+    prices through ``PriceOracle.get_close_price``. We stub the oracle
+    to return ``exit_price`` as a fresh-book quote, which is also used
+    as the mark price (the PriceOracle's source="book" already returns
+    the mid, so mark and exit converge).
+    """
+    import time as _time
+    from src.control.price_oracle import PriceQuote
+
+    # Use the mark_price (if provided) as the oracle's price — that's
+    # the value the monitor loop will use for both signal evaluation
+    # AND close booking now that the oracle is the single source.
+    effective_price = mark_price if mark_price is not None else exit_price
+    oracle_quote = PriceQuote(
+        price=effective_price,
+        source="book",
+        observed_ts=_time.time(),
+        spread_pct=0.04,
+        raw_book={"best_bid": effective_price, "best_ask": effective_price},
+    )
+
+    # When the test sets market_resolved=True + resolution_price, the
+    # monitor loop will issue a SECOND oracle call with prefer_resolved=
+    # True. We route that one to a "resolved" quote so the priority-order
+    # test (market_resolved must beat holding_cap_sport) books against
+    # the terminal value 0.0/1.0, not the book mid.
+    async def _route(*args, **kwargs):
+        if kwargs.get("prefer_resolved") and resolution_price is not None:
+            return PriceQuote(
+                price=float(resolution_price),
+                source="resolved",
+                observed_ts=_time.time(),
+                raw_resolution={
+                    "resolved_outcome": "no" if resolution_price == 0.0 else "yes",
+                    "winning_token": "tok-loser" if resolution_price == 0.0 else "tok-A",
+                    "held_token": args[1] if len(args) > 1 else kwargs.get("token_id"),
+                },
+            )
+        return oracle_quote
+
+    trader._price_oracle.get_close_price = AsyncMock(side_effect=_route)
+    # Keep the legacy helpers stubbed too — some tests still call them
+    # directly (the helpers exist for backward compatibility with non-
+    # close paths like _compute_unrealized_pnl).
     trader._exit_bid = AsyncMock(return_value=exit_price)
     trader._mark_mid = AsyncMock(
         return_value=mark_price if mark_price is not None else exit_price
@@ -188,8 +233,11 @@ class TestAdaptiveStopLoss:
         # But a -9% drawdown on the SAME non-sport trade should fire
         # stop_loss — confirms the legacy threshold is still in effect.
         trader.close_trade.reset_mock()
-        trader._exit_bid = AsyncMock(return_value=0.52 * (1 - 0.09))
-        trader._mark_mid = AsyncMock(return_value=0.52 * (1 - 0.09))
+        _stub_trader_for_monitor(
+            trader,
+            exit_price=0.52 * (1 - 0.09),
+            mark_price=0.52 * (1 - 0.09),
+        )
         await trader._check_open_positions()
         assert trader.close_trade.called
         _, _, reason = trader.close_trade.call_args[0]

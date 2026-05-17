@@ -23,6 +23,7 @@ from __future__ import annotations
 import asyncio
 import json
 import math
+import time
 from datetime import datetime, timedelta, timezone
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
@@ -30,6 +31,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from src.config import settings
+from src.control.price_oracle import PriceQuote
 from src.engine.paper_trader import (
     OpenPaperTrade,
     PaperTrader,
@@ -94,6 +96,157 @@ def _make_open_trade(
     )
 
 
+def _stub_oracle(
+    trader: PaperTrader,
+    *,
+    price: float | None,
+    source: str = "book",
+    spread_pct: float | None = 0.04,
+) -> AsyncMock:
+    """Pillar 1 helper — replace the trader's PriceOracle with a stub
+    that returns a fixed PriceQuote.
+
+    Tests that previously mocked ``_exit_bid`` should call this instead,
+    since the monitor loop now drives the close path through the oracle.
+    """
+    quote = PriceQuote(
+        price=price,
+        source=source,
+        observed_ts=time.time(),
+        spread_pct=spread_pct if source == "book" else None,
+        raw_book=(
+            {"best_bid": price, "best_ask": price, "spread_pct": spread_pct}
+            if source == "book" and price is not None
+            else None
+        ),
+    )
+    stub = AsyncMock(return_value=quote)
+    trader._price_oracle.get_close_price = stub
+    return stub
+
+
+# --------------------------------------------------------------------------- #
+# Pillar 1 — PriceOracle integration into the close path                       #
+# --------------------------------------------------------------------------- #
+
+
+class TestPriceOracleIntegration:
+    """The monitor loop now drives the close path through
+    ``PriceOracle.get_close_price`` instead of ``_exit_bid`` (which had
+    a fallback to ``entry_price`` — the May 15 phantom-win pattern).
+
+    These tests pin the new contract:
+      * When the oracle returns price=None → DEFER (do not close).
+      * When source="resolved" + held wins → close at 1.0.
+      * When source="resolved" + held loses → close at 0.0.
+      * Trade NEVER closes at entry_price as a fallback.
+    """
+
+    @pytest.mark.asyncio
+    async def test_defer_close_when_oracle_returns_fail(self):
+        """No fresh book + no Gamma + no resolved_outcome → oracle
+        returns source='fail'. Close MUST be deferred (no close_trade
+        call), never papered over at entry_price."""
+        trader = PaperTrader(redis_client=_make_redis())
+        trade = _make_open_trade(
+            strategy="follow", direction="yes", entry_price=0.50
+        )
+        trader._open_trades = [trade]
+        trader.close_trade = AsyncMock(return_value=True)
+        # Oracle says "no price available".
+        trader._price_oracle.get_close_price = AsyncMock(
+            return_value=PriceQuote(
+                price=None, source="fail", observed_ts=time.time()
+            )
+        )
+        trader._is_market_resolved = AsyncMock(return_value=False)
+        trader._leader_exited_recently = AsyncMock(return_value=False)
+        trader._hours_until_resolution = AsyncMock(return_value=24.0)
+
+        await trader._check_open_positions()
+
+        # No close — we defer until the oracle has fresh data.
+        trader.close_trade.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_resolved_yes_held_yes_closes_at_one(self):
+        """resolved_outcome=YES + direction=yes → exit at 1.0."""
+        trader = PaperTrader(redis_client=_make_redis())
+        trade = _make_open_trade(
+            strategy="follow", direction="yes", entry_price=0.40
+        )
+        trader._open_trades = [trade]
+        trader.close_trade = AsyncMock(return_value=True)
+        resolved_quote = PriceQuote(
+            price=1.0, source="resolved", observed_ts=time.time(),
+            raw_resolution={"resolved_outcome": "yes", "held_token": "tok-A"},
+        )
+        trader._price_oracle.get_close_price = AsyncMock(return_value=resolved_quote)
+        trader._is_market_resolved = AsyncMock(return_value=True)
+        trader._leader_exited_recently = AsyncMock(return_value=False)
+
+        await trader._check_open_positions()
+
+        trader.close_trade.assert_called_once()
+        args, kwargs = trader.close_trade.call_args
+        trade_id, exit_price, reason = args
+        assert exit_price == 1.0
+        assert reason == "market_resolved"
+
+    @pytest.mark.asyncio
+    async def test_resolved_yes_held_no_closes_at_zero(self):
+        """resolved_outcome=YES + direction=no (FADE) → exit at 0.0."""
+        trader = PaperTrader(redis_client=_make_redis())
+        trade = _make_open_trade(
+            strategy="fade", direction="no", entry_price=0.40
+        )
+        trader._open_trades = [trade]
+        trader.close_trade = AsyncMock(return_value=True)
+        resolved_quote = PriceQuote(
+            price=0.0, source="resolved", observed_ts=time.time(),
+            raw_resolution={"resolved_outcome": "yes", "held_token": "tok-A"},
+        )
+        trader._price_oracle.get_close_price = AsyncMock(return_value=resolved_quote)
+        trader._is_market_resolved = AsyncMock(return_value=True)
+        trader._leader_exited_recently = AsyncMock(return_value=False)
+
+        await trader._check_open_positions()
+
+        trader.close_trade.assert_called_once()
+        args, kwargs = trader.close_trade.call_args
+        _, exit_price, reason = args
+        assert exit_price == 0.0
+        assert reason == "market_resolved"
+
+    @pytest.mark.asyncio
+    async def test_does_not_close_at_entry_price_on_stale_book(self):
+        """Critical Pillar 1 invariant: if ALL three oracle steps fail
+        (stale book + Gamma down + resolved_outcome NULL), the trade
+        STAYS OPEN. Pre-fix the close would book at trade.entry_price,
+        silently locking PnL to $0 and hiding real losses (the May 15
+        phantom-win pattern)."""
+        trader = PaperTrader(redis_client=_make_redis())
+        trade = _make_open_trade(
+            strategy="follow", direction="yes", entry_price=0.40
+        )
+        trader._open_trades = [trade]
+        trader.close_trade = AsyncMock(return_value=True)
+        trader._price_oracle.get_close_price = AsyncMock(
+            return_value=PriceQuote(
+                price=None, source="fail", observed_ts=time.time()
+            )
+        )
+        trader._is_market_resolved = AsyncMock(return_value=False)
+        trader._leader_exited_recently = AsyncMock(return_value=False)
+        trader._hours_until_resolution = AsyncMock(return_value=24.0)
+
+        await trader._check_open_positions()
+
+        # The trade is STILL OPEN. No silent close at entry_price.
+        trader.close_trade.assert_not_called()
+        assert trade in trader._open_trades
+
+
 # --------------------------------------------------------------------------- #
 # B1 / B10  —  FADE direction PnL inversion                                   #
 # --------------------------------------------------------------------------- #
@@ -114,6 +267,11 @@ class TestFadeDirectionNotInverted:
         threshold triggers (STOP_LOSS_FADE=0.05 → require ≤-5%,
         TAKE_PROFIT_FADE=0.10 → require ≥+10%; +25% triggers take_profit).
         The key regression is that we do NOT close via stop_loss.
+
+        Updated 2026-05-17 (Pillar 1): the monitor loop now drives the
+        close path through ``PriceOracle.get_close_price`` instead of
+        ``_exit_bid``. We stub the oracle to return 0.50 as a fresh-book
+        quote; the FAde direction-sign logic under test is unchanged.
         """
         trader = PaperTrader(redis_client=_make_redis())
         trade = _make_open_trade(
@@ -122,7 +280,7 @@ class TestFadeDirectionNotInverted:
         trader._open_trades = [trade]
         trader.close_trade = AsyncMock(return_value=True)
         # Book bid sits at 0.50 (our LONG of opposite token is winning).
-        trader._exit_bid = AsyncMock(return_value=0.50)
+        _stub_oracle(trader, price=0.50, source="book")
         trader._is_market_resolved = AsyncMock(return_value=False)
         trader._leader_exited_recently = AsyncMock(return_value=False)
 
@@ -130,7 +288,8 @@ class TestFadeDirectionNotInverted:
 
         # Must close at take_profit (real gain +25% ≥ +10%), NEVER stop_loss.
         assert trader.close_trade.called
-        _, _, reason = trader.close_trade.call_args[0]
+        args, kwargs = trader.close_trade.call_args
+        reason = args[2]
         assert reason == "take_profit", (
             f"FADE winning position closed as {reason!r}; expected take_profit. "
             "Direction-inversion regression."
@@ -150,14 +309,15 @@ class TestFadeDirectionNotInverted:
         )
         trader._open_trades = [trade]
         trader.close_trade = AsyncMock(return_value=True)
-        trader._exit_bid = AsyncMock(return_value=0.35)
+        _stub_oracle(trader, price=0.35, source="book")
         trader._is_market_resolved = AsyncMock(return_value=False)
         trader._leader_exited_recently = AsyncMock(return_value=False)
 
         await trader._check_open_positions()
 
         assert trader.close_trade.called
-        _, exit_price, reason = trader.close_trade.call_args[0]
+        args, kwargs = trader.close_trade.call_args
+        _, exit_price, reason = args
         assert reason == "stop_loss", (
             f"FADE losing position closed as {reason!r}; expected stop_loss. "
             "Direction-inversion regression."
@@ -174,13 +334,14 @@ class TestFadeDirectionNotInverted:
         trader._open_trades = [trade]
         trader.close_trade = AsyncMock(return_value=True)
         # +20% gain
-        trader._exit_bid = AsyncMock(return_value=0.60)
+        _stub_oracle(trader, price=0.60, source="book")
         trader._is_market_resolved = AsyncMock(return_value=False)
         trader._leader_exited_recently = AsyncMock(return_value=False)
 
         await trader._check_open_positions()
 
-        _, _, reason = trader.close_trade.call_args[0]
+        args, kwargs = trader.close_trade.call_args
+        reason = args[2]
         assert reason == "take_profit"
 
     @pytest.mark.asyncio
@@ -472,7 +633,7 @@ class TestPrecloseBeforeResolution:
         trader = PaperTrader(redis_client=_make_redis())
         trade = _make_open_trade(strategy="follow", direction="yes")
         trader._open_trades = [trade]
-        trader._exit_bid = AsyncMock(return_value=0.50)
+        _stub_oracle(trader, price=0.50, source="book")
         trader._hours_until_resolution = AsyncMock(return_value=0.1)  # 6 min
         trader._is_market_resolved = AsyncMock(return_value=False)
         trader._leader_exited_recently = AsyncMock(return_value=False)
@@ -481,7 +642,8 @@ class TestPrecloseBeforeResolution:
         await trader._check_open_positions()
 
         assert trader.close_trade.called
-        _, _, reason = trader.close_trade.call_args[0]
+        args, kwargs = trader.close_trade.call_args
+        reason = args[2]
         assert reason == "preclose_pre_resolution"
 
     @pytest.mark.asyncio
@@ -492,7 +654,7 @@ class TestPrecloseBeforeResolution:
         )
         trader._open_trades = [trade]
         # +20% gain → would trigger take_profit
-        trader._exit_bid = AsyncMock(return_value=0.60)
+        _stub_oracle(trader, price=0.60, source="book")
         trader._hours_until_resolution = AsyncMock(return_value=12.0)
         trader._is_market_resolved = AsyncMock(return_value=False)
         trader._leader_exited_recently = AsyncMock(return_value=False)
@@ -500,7 +662,8 @@ class TestPrecloseBeforeResolution:
 
         await trader._check_open_positions()
         assert trader.close_trade.called
-        _, _, reason = trader.close_trade.call_args[0]
+        args, kwargs = trader.close_trade.call_args
+        reason = args[2]
         assert reason == "take_profit"
 
 

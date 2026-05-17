@@ -283,7 +283,17 @@ class TestHoldingCapClose:
             entry_price=0.50, opened_at=opened_at,
         )
         trader._open_trades = [trade]
-        trader._exit_bid = AsyncMock(return_value=0.55)
+        # Pillar 1: stub the oracle (the monitor loop now drives the
+        # close path through PriceOracle instead of _exit_bid).
+        import time as _time
+        from src.control.price_oracle import PriceQuote
+        trader._price_oracle.get_close_price = AsyncMock(
+            return_value=PriceQuote(
+                price=0.55, source="book", observed_ts=_time.time(),
+                spread_pct=0.04,
+                raw_book={"best_bid": 0.55, "best_ask": 0.55},
+            )
+        )
         trader._is_market_resolved = AsyncMock(return_value=False)
         trader._leader_exited_recently = AsyncMock(return_value=False)
         trader._hours_until_resolution = AsyncMock(return_value=48.0)
@@ -293,7 +303,8 @@ class TestHoldingCapClose:
 
         assert trader.close_trade.called
         # close_trade signature: (trade_id, exit_price, reason)
-        _, _, reason = trader.close_trade.call_args[0]
+        args, kwargs = trader.close_trade.call_args
+        _, _, reason = args
         assert reason == "holding_cap_reached", (
             f"Expected holding_cap_reached close, got {reason!r}. "
             "Did MAX_HOLDING_PERIOD_S get unwired?"
@@ -313,7 +324,15 @@ class TestHoldingCapClose:
         )
         trader._open_trades = [trade]
         # Hold the bid steady at entry so no other close branch fires.
-        trader._exit_bid = AsyncMock(return_value=0.50)
+        import time as _time
+        from src.control.price_oracle import PriceQuote
+        trader._price_oracle.get_close_price = AsyncMock(
+            return_value=PriceQuote(
+                price=0.50, source="book", observed_ts=_time.time(),
+                spread_pct=0.04,
+                raw_book={"best_bid": 0.50, "best_ask": 0.50},
+            )
+        )
         trader._is_market_resolved = AsyncMock(return_value=False)
         trader._leader_exited_recently = AsyncMock(return_value=False)
         trader._hours_until_resolution = AsyncMock(return_value=48.0)
@@ -324,7 +343,8 @@ class TestHoldingCapClose:
         # Either close_trade was not called, OR if called, NOT with the
         # holding cap reason.
         if trader.close_trade.called:
-            _, _, reason = trader.close_trade.call_args[0]
+            args, kwargs = trader.close_trade.call_args
+            _, _, reason = args
             assert reason != "holding_cap_reached", (
                 f"holding_cap_reached fired prematurely (held only 1h): {reason}"
             )

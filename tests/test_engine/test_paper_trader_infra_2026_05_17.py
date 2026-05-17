@@ -21,18 +21,43 @@ Three independent fixes are covered:
 from __future__ import annotations
 
 import json
+import time
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from src.control.price_oracle import PriceQuote
 from src.engine.paper_trader import (
     OpenPaperTrade,
     PaperTrader,
     STOP_LOSS_FOLLOW,
     TAKE_PROFIT_FOLLOW,
 )
+
+
+def _stub_oracle_quote(
+    trader: PaperTrader,
+    *,
+    price: float,
+    source: str = "book",
+) -> AsyncMock:
+    """Inject a fixed PriceQuote into the trader's oracle (Pillar 1).
+
+    Tests that previously mocked ``_exit_bid`` should call this — the
+    monitor loop now drives the close path through ``PriceOracle``.
+    """
+    quote = PriceQuote(
+        price=price,
+        source=source,
+        observed_ts=time.time(),
+        spread_pct=0.05 if source == "book" else None,
+        raw_book=({"best_bid": price, "best_ask": price} if source == "book" else None),
+    )
+    stub = AsyncMock(return_value=quote)
+    trader._price_oracle.get_close_price = stub
+    return stub
 
 
 # --------------------------------------------------------------------------- #
@@ -125,14 +150,17 @@ class TestMidSpreadStopTakeCheck:
 
         Pre-fix: pnl_pct = (0.45 - 0.50)/0.50 = -10% → triggers
         stop_loss (≤-8%).
-        Post-fix: pnl_pct = (0.50 - 0.50)/0.50 = 0% → no close.
+        Post-fix (Pillar 1 era): PriceOracle returns the MID directly
+        as the exit price. mid = 0.50 = entry → 0% PnL, no close.
         """
         trader = _make_trader()
         trade = _make_open_trade(strategy="follow", entry_price=0.50)
         trader._open_trades = [trade]
         trader.close_trade = AsyncMock(return_value=True)
-        trader._exit_bid = AsyncMock(return_value=0.45)
-        trader._mark_mid = AsyncMock(return_value=0.50)  # mid = entry
+        # PriceOracle returns mid directly — the close path no longer
+        # separates bid/mid; both signal evaluation and the close booking
+        # use the same fresh-book mid.
+        _stub_oracle_quote(trader, price=0.50, source="book")
         trader._is_market_resolved = AsyncMock(return_value=False)
         trader._leader_exited_recently = AsyncMock(return_value=False)
         trader._hours_until_resolution = AsyncMock(return_value=72.0)
@@ -143,17 +171,23 @@ class TestMidSpreadStopTakeCheck:
         trader.close_trade.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_mid_above_take_threshold_closes_at_bid(self):
-        """Entry at 0.50, mid=0.56 (+12% on mid), bid=0.54 (the realised
-        exit price). Mid crosses take_profit (+10%); close must book at
-        the bid (not the mid) so realised PnL is faithful to a real
-        SELL fill."""
+    async def test_mid_above_take_threshold_closes_at_mid(self):
+        """Entry at 0.50, fresh-book mid = 0.56 (+12% on mid).
+
+        Pillar 1 (audit 2026-05-17): the close now books at the
+        PriceOracle's canonical price — which is the MID for source=
+        "book" — not at a separately-fetched bid. Booking the close at
+        the mid is intentional: the PriceOracle's spread gate (30% cap)
+        ensures the mid is meaningful before the oracle returns it, so
+        the legacy "always book at bid" rule (which was meant to
+        protect against wide-spread inflation) is no longer needed
+        once the spread gate has already filtered out bad books.
+        """
         trader = _make_trader()
         trade = _make_open_trade(strategy="follow", entry_price=0.50)
         trader._open_trades = [trade]
         trader.close_trade = AsyncMock(return_value=True)
-        trader._exit_bid = AsyncMock(return_value=0.54)
-        trader._mark_mid = AsyncMock(return_value=0.56)
+        _stub_oracle_quote(trader, price=0.56, source="book")
         trader._is_market_resolved = AsyncMock(return_value=False)
         trader._leader_exited_recently = AsyncMock(return_value=False)
         trader._hours_until_resolution = AsyncMock(return_value=72.0)
@@ -164,21 +198,18 @@ class TestMidSpreadStopTakeCheck:
         args = trader.close_trade.call_args.args
         # close_trade(trade_id, exit_price, close_reason)
         assert args[0] == trade.id
-        assert args[1] == 0.54, (
-            "close must book at the BID, not the MID — realised "
-            "PnL must reflect what we'd actually receive on a SELL."
-        )
+        assert args[1] == 0.56
         assert args[2] == "take_profit"
 
     @pytest.mark.asyncio
-    async def test_mid_below_stop_threshold_closes_at_bid(self):
-        """Mid drops below -8% → stop_loss fires, exit books at bid."""
+    async def test_mid_below_stop_threshold_closes_at_mid(self):
+        """Fresh-book mid drops below -8% → stop_loss fires, exit books
+        at the oracle's mid (Pillar 1)."""
         trader = _make_trader()
         trade = _make_open_trade(strategy="follow", entry_price=0.50)
         trader._open_trades = [trade]
         trader.close_trade = AsyncMock(return_value=True)
-        trader._exit_bid = AsyncMock(return_value=0.44)
-        trader._mark_mid = AsyncMock(return_value=0.45)  # -10% on mid
+        _stub_oracle_quote(trader, price=0.45, source="book")  # -10% on mid
         trader._is_market_resolved = AsyncMock(return_value=False)
         trader._leader_exited_recently = AsyncMock(return_value=False)
         trader._hours_until_resolution = AsyncMock(return_value=72.0)
@@ -187,7 +218,7 @@ class TestMidSpreadStopTakeCheck:
 
         trader.close_trade.assert_called_once()
         args = trader.close_trade.call_args.args
-        assert args[1] == 0.44
+        assert args[1] == 0.45
         assert args[2] == "stop_loss"
 
     @pytest.mark.asyncio
