@@ -1654,12 +1654,18 @@ async def open_positions_with_prices(conn, redis_client) -> list[dict]:
 
 
 async def recent_observed_trades(conn, limit: int = 50) -> list[dict]:
+    # Perf fix (V1 audit Phase 3, dashboard rebuild hotpath):
+    # The previous version used ROW_NUMBER() OVER (ORDER BY t.time DESC, ...)
+    # to generate a global rank, which forces PostgreSQL to fully sort the
+    # 580k-row trades_observed table on every call — defeating the
+    # (time DESC) index. Frontend never consumes the rank; it only uses the
+    # composed "id" string as a row key. Switching to t.id (BIGSERIAL PK
+    # per CLAUDE.md § 6) gives a monotonically increasing identifier that's
+    # already indexed and free to read.
     rows = await conn.fetch(
         """
         SELECT
-            ROW_NUMBER() OVER (
-                ORDER BY t.time DESC, t.market_id, t.token_id, t.wallet_address, t.side, t.price
-            )::int AS seq,
+            t.id AS seq,
             t.time,
             t.market_id,
             t.token_id,

@@ -28,7 +28,14 @@ class Settings(BaseSettings):
     DATABASE_URL: str = "postgresql://polymarket:polymarket_dev_password@localhost:5432/polymarket"
     REDIS_URL: str = "redis://localhost:6379/0"
     DB_POOL_MIN: int = 2
-    DB_POOL_MAX: int = 10
+    # Bumped 10 → 25 (V1 audit Phase 3, May 17): dashboard snapshot rebuild
+    # runs 17 parallel queries via asyncio.gather() while the observer also
+    # shares the pool. At max=10 queries serialized and the rebuild stalled
+    # near 229s. 25 leaves ~2x headroom even when observer + API are both
+    # under load. Note: src/api/main.py also passes max_size=20 to its own
+    # asyncpg.create_pool() — that value should track this setting if the
+    # API hot path is the bottleneck.
+    DB_POOL_MAX: int = 25
 
     # ------------------------------------------------------------------ #
     # Falcon API (CLAUDE.md § 5 + § 9)                                    #
