@@ -15,7 +15,7 @@ _LOGURU_RE = re.compile(
 
 _READINESS_EXECUTABLE_STATES = {"CANDIDATE_SIGNAL", "PROBE_PAPER", "V1_GO_CANDIDATE"}
 _READINESS_OPEN_STATES = {"CANDIDATE_SIGNAL", "PROBE_PAPER", "V1_GO_CANDIDATE", "HOLD"}
-_LIVE_MARKET_FRESHNESS_MS = 15000
+_LIVE_MARKET_FRESHNESS_MS = 90000
 
 
 def _to_float(value: Any, default: float | None = None) -> float | None:
@@ -394,24 +394,26 @@ def _build_ingestion(
 ) -> dict[str, Any]:
     live_markets = sum(1 for row in market_rows if _to_int(row.get("freshness_ms"), 999999) <= _LIVE_MARKET_FRESHNESS_MS)
     stale_markets = max(0, len(market_rows) - live_markets)
-    updates_last_minute = sum(_to_int(row.get("messages_last_minute"), 0) for row in market_rows)
-    avg_freshness = _mean([float(row.get("freshness_ms") or 0.0) for row in market_rows])
-    stage_health = health.get("pipeline_stage_health") or {}
-    stage_status = stage_health.get("stage_status") or {}
-    ws_age_s = _to_float(health.get("last_message_age_s"), 0.0) or 0.0
-
     # Prefer the real WebSocket throughput counter (price_change + book +
     # trade events all combined) over the trades_observed-derived count
     # which only sees the tiny subset that maps to a known leader wallet.
     ws_msgs_real = _to_int(health.get("ws_messages_last_minute"), -1)
-    ws_msgs_for_panel = ws_msgs_real if ws_msgs_real >= 0 else updates_last_minute
+    updates_last_minute = (
+        ws_msgs_real
+        if ws_msgs_real >= 0
+        else sum(_to_int(row.get("messages_last_minute"), 0) for row in market_rows)
+    )
+    avg_freshness = _mean([float(row.get("freshness_ms") or 0.0) for row in market_rows])
+    stage_health = health.get("pipeline_stage_health") or {}
+    stage_status = stage_health.get("stage_status") or {}
+    ws_age_s = _to_float(health.get("last_message_age_s"), 0.0) or 0.0
 
     sources = [
         {
             "name": "CLOB WebSocket",
             "status": "healthy" if health.get("websocket_connected") else "degraded",
             "lag_ms": int(round(ws_age_s * 1000)),
-            "messages_last_minute": ws_msgs_for_panel,
+            "messages_last_minute": updates_last_minute,
             "note": None,
         },
         {
