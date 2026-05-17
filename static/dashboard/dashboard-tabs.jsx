@@ -2763,33 +2763,46 @@ const LabGates = () => {
   const GATES = [
     {
       key:  'strategy_conditional_confidence_enabled',
-      round:'R8', name:'The Lens', daemon:'strategy_classifier',
+      round:'R8', name:'The Lens', daemon:'strategy_classifier', tableKey: 'r8',
       desc: 'Apply STRATEGY_WEIGHTS multiplier to FOLLOW/FADE based on each leader\'s 9-class strategy fingerprint (directional, momentum, arb_2way, market_maker, …). Daemon classifies every leader nightly via LightGBM features.',
       blocker: 'None — multiplier defaults to 1.0 when a leader is unclassified, so flipping ON is safe. RECOMMENDED first activation.',
       risk: 'low',
     },
     {
       key:  'volume_anticipation_enabled',
-      round:'R9', name:'The Web', daemon:'follower_volume',
+      round:'R9', name:'The Web', daemon:'follower_volume', tableKey: 'r9',
       desc: 'Activate Kalman + multivariate Hawkes volume forecast as a new decision policy. Routes "anticipation" entries when follower-pool volume is predicted to spike before the leader\'s trade fully propagates.',
       blocker: 'Cross-coupled with R10 — recommend flipping R10 first so anticipation entries are causally validated (avoids news-driven false positives).',
       risk: 'medium',
     },
     {
       key:  'causal_gating_enabled',
-      round:'R10', name:'The Truth Test', daemon:'causal',
+      round:'R10', name:'The Truth Test', daemon:'causal', tableKey: 'r10',
       desc: 'Gate FOLLOW/FADE confidence by IV-corrected ATE (Wu-Hausman test). Halves follow_confidence when Hawkes-implied causation overstates true causal effect (news-driven coincidence).',
       blocker: 'Methodology audit pending — 1 week external causal-inference expert review required before flip (see docs/audit/phase3/round10_wave3_review.md § 11).',
       risk: 'high',
     },
     {
       key:  'prefill_live_enabled',
-      round:'R7', name:'The Front Door', daemon:'mempool',
+      round:'R7', name:'The Front Door', daemon:'mempool', tableKey: 'r7',
       desc: 'Polygon mempool watcher fires pre-signed orders via IntentRouter when a leader\'s transaction is detected in the mempool, ~250 ms ahead of REST polling.',
       blocker: '30-day shadow-soak required + CLOBClientWrapper sign+submit split + p50 < 250 ms verified in production.',
       risk: 'high',
     },
   ];
+
+  // Daemon health helper: turn (24h count, lifetime count) into a label
+  // + color so the operator can tell "never ran" vs "quiet today" vs
+  // "actively producing".
+  const daemonHealth = (gate) => {
+    const tbl = gate.tableKey;
+    const last24h  = gateStats?.[`${tbl}_${{r7:'intents',r8:'classifications',r9:'forecasts',r10:'estimates'}[tbl]}_24h`];
+    const lifetime = gateStats?.[`${tbl}_${{r7:'intents',r8:'classifications',r9:'forecasts',r10:'estimates'}[tbl]}_total`];
+    if (lifetime == null) return { label: 'unknown', color: C.dim2, detail: 'daemon-state query failed' };
+    if (lifetime === 0)   return { label: 'NO DATA EVER', color: C.red, detail: 'daemon has never produced output — flipping the gate is a no-op until this changes' };
+    if (last24h === 0)    return { label: 'quiet 24h', color: C.amber, detail: `${lifetime.toLocaleString()} lifetime rows but 0 in last 24h` };
+    return { label: `${(last24h ?? '?').toLocaleString()}/24h`, color: C.green, detail: `${lifetime.toLocaleString()} lifetime rows` };
+  };
 
   const toggleGate = async (key, currentlyOn, riskLevel) => {
     if (!currentlyOn && (riskLevel === 'high' || riskLevel === 'medium')) {
@@ -2864,10 +2877,20 @@ const LabGates = () => {
                   <div style={{ color: C.dim2, lineHeight: 1.45 }}>{gate.blocker}</div>
                 </div>
 
-                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-                  <span style={{ color: C.dim2, fontSize: 10 }}>
-                    Daemon: <span style={{ color: C.purple }}>polymarket_{gate.daemon}</span>
-                  </span>
+                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 10 }}>
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: 2 }}>
+                    <span style={{ color: C.dim2, fontSize: 10 }}>
+                      Daemon: <span style={{ color: C.purple }}>polymarket_{gate.daemon}</span>
+                    </span>
+                    {gateStats && (() => {
+                      const h = daemonHealth(gate);
+                      return (
+                        <span style={{ color: h.color, fontSize: 9, fontFamily: 'monospace' }} title={h.detail}>
+                          ◉ {h.label} <span style={{ color: C.dim2 }}>· {h.detail}</span>
+                        </span>
+                      );
+                    })()}
+                  </div>
                   <button
                     onClick={() => toggleGate(gate.key, isOn, gate.risk)}
                     disabled={isSaving}

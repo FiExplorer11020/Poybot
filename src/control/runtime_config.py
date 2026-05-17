@@ -85,6 +85,16 @@ ALLOWED_KEYS: dict[str, str] = {
         "ATE for the (leader, pool) pair does not exclude zero "
         "positively. Boolean, default False (shadow phase)."
     ),
+    # Round 7 (The Front Door) — mempool intent router master gate.
+    # Registered 2026-05-17 so the LAB dashboard can flip it without
+    # operator SSH access. The TODO at intent_router.py:581 is now
+    # closed. The flag remains off until 30-day shadow-soak completes
+    # + CLOBClientWrapper sign+submit split + p50 < 250ms verified.
+    "prefill_live_enabled": (
+        "Round 7 gate: enable IntentRouter live firing of pre-signed "
+        "orders when a leader's tx is detected in the mempool. Boolean, "
+        "default False (shadow mode)."
+    ),
     # Strategy upgrade 2026-05-17 — Phase 3 cohort selection knobs.
     # These wire backtest-confirmed filters into the live decision flow
     # so the operator can tune them from the dashboard.
@@ -260,6 +270,8 @@ BOUNDS: dict[str, tuple[float, float]] = {
     "volume_anticipation_threshold_usdc": (50.0, 1_000_000.0),
     # Round 10 — boolean flag (coerced to {0, 1}).
     "causal_gating_enabled": (0.0, 1.0),
+    # Round 7 — boolean flag (coerced to {0, 1}).
+    "prefill_live_enabled": (0.0, 1.0),
     # Strategy upgrade 2026-05-17 — Phase 3 cohort filters.
     "min_entry_price": (0.0, 1.0),
     "max_entry_price": (0.0, 1.0),
@@ -325,6 +337,8 @@ BOOLEAN_KEYS: frozenset[str] = frozenset({
     "volume_anticipation_enabled",
     # Round 10 — causal gating flag.
     "causal_gating_enabled",
+    # Round 7 — mempool intent router live-firing gate.
+    "prefill_live_enabled",
     # Strategy upgrade 2026-05-17 — live-match detector master gate.
     "live_match_block_enabled",
 })

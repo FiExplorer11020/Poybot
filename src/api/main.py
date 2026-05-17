@@ -2081,20 +2081,35 @@ async def api_lab_gates():
             logger.debug(f"lab_gates count failed for {sql[:60]}: {exc}")
             return None
 
+    # SQL column names verified against actual schema 2026-05-17:
+    #   strategy_labels.labelled_at, follower_pool_state_history.snapshot_at,
+    #   mempool_observations.intent_received_at. causal_estimates uses
+    #   estimated_at per migration 030. Each query is also `_total` fallback
+    #   so the operator can see lifetime daemon output even when 24h is 0.
     r8 = await _safe_count(
-        "SELECT COUNT(*) AS n FROM strategy_labels WHERE updated_at > NOW() - INTERVAL '24 hours'"
+        "SELECT COUNT(*) AS n FROM strategy_labels WHERE labelled_at > NOW() - INTERVAL '24 hours'"
     )
     r9 = await _safe_count(
-        "SELECT COUNT(*) AS n FROM follower_pool_state_history WHERE updated_at > NOW() - INTERVAL '24 hours'"
+        "SELECT COUNT(*) AS n FROM follower_pool_state_history WHERE snapshot_at > NOW() - INTERVAL '24 hours'"
     )
     r10 = await _safe_count(
         "SELECT COUNT(*) AS n FROM causal_estimates WHERE estimated_at > NOW() - INTERVAL '24 hours'"
     )
     r7 = await _safe_count(
-        "SELECT COUNT(*) AS n FROM mempool_observations WHERE observed_at > NOW() - INTERVAL '24 hours'"
+        "SELECT COUNT(*) AS n FROM mempool_observations WHERE intent_received_at > NOW() - INTERVAL '24 hours'"
     )
+    # Lifetime totals — surface "daemon has produced something ever" vs
+    # "daemon has produced something in the last 24h". A daemon healthy
+    # for weeks but quiet today should not look identical to one that has
+    # NEVER produced output (the latter is a much louder red flag).
+    r8_total  = await _safe_count("SELECT COUNT(*) AS n FROM strategy_labels")
+    r9_total  = await _safe_count("SELECT COUNT(*) AS n FROM follower_pool_state_history")
+    r10_total = await _safe_count("SELECT COUNT(*) AS n FROM causal_estimates")
+    r7_total  = await _safe_count("SELECT COUNT(*) AS n FROM mempool_observations")
 
-    daemons = sum(1 for v in (r8, r9, r10, r7) if v is not None and v > 0)
+    # A daemon counts as "running" if it has produced ANYTHING in its
+    # table. 24h emptiness on a never-empty table = quiet but alive.
+    daemons = sum(1 for v in (r8_total, r9_total, r10_total, r7_total) if v is not None and v > 0)
 
     return {
         "gates": {
@@ -2107,7 +2122,11 @@ async def api_lab_gates():
         "r9_forecasts_24h":       r9,
         "r10_estimates_24h":      r10,
         "r7_intents_24h":         r7,
-        "daemons_running":        daemons,
+        "r8_classifications_total": r8_total,
+        "r9_forecasts_total":       r9_total,
+        "r10_estimates_total":      r10_total,
+        "r7_intents_total":         r7_total,
+        "daemons_running":          daemons,
     }
 
 
