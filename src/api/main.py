@@ -73,7 +73,7 @@ TERMINAL_SNAPSHOT_TTL_S = 5.0
 # Background rebuilder cadence. Each cycle calls _get_terminal_snapshot(force=True)
 # so the cache stays warm. Aligned with V1 client poll interval (5s) — by the
 # time the V1 client polls, a fresh snapshot is already in cache.
-SNAPSHOT_REBUILDER_INTERVAL_S = 5.0
+SNAPSHOT_REBUILDER_INTERVAL_S = 10.0
 # If the background rebuilder hasn't produced a fresh snapshot within this
 # many seconds, the snapshot endpoint logs a warning and falls back to a
 # synchronous rebuild (slow but correct). 30s = 6x the normal cadence —
@@ -101,15 +101,16 @@ async def lifespan(app: FastAPI):
     created_pool = False
     created_redis = False
     if _pool is None:
-        # Pool sized for the new asyncio.gather() in queries.overview()
-        # (11 parallel sub-queries) + concurrent V1+V2 clients. The
-        # observed saturation at the old max=10 happened with 6 active
-        # queries from a single live-summary rebuild — bumping to 20
-        # gives ~2x headroom.
+        # Pool sized for the asyncio.gather() in _get_terminal_snapshot
+        # (17 parallel sub-queries) + concurrent V1+V2 clients + observer
+        # sharing the same pool. Sized from settings.DB_POOL_MAX (default
+        # 25 after the May 17 V1 audit Phase 3 bump) so the limit can be
+        # tuned via env without a code change. min_size kept at 4 to avoid
+        # cold-start penalty on the rebuild loop.
         _pool = await asyncpg.create_pool(
             dsn=settings.DATABASE_URL,
-            min_size=4,
-            max_size=20,
+            min_size=max(4, settings.DB_POOL_MIN),
+            max_size=settings.DB_POOL_MAX,
         )
         created_pool = True
         # CRITICAL: also expose the pool to src.database.connection so that
@@ -495,8 +496,10 @@ async def _db_pipeline_stage_health_snapshot(conn) -> dict:
 
 
 async def _fetch_overview_snapshot() -> dict:
-    async with _pool.acquire() as conn:
-        return await queries.overview(conn, redis_client=_redis)
+    async def _build():
+        async with _pool.acquire() as conn:
+            return await queries.overview(conn, redis_client=_redis)
+    return await _cached_helper("overview", _build)
 
 
 # ------------------------------------------------------------------------- #
@@ -541,6 +544,18 @@ _HELPER_CACHE_TTLS = {
     "ops_chain_sync": 10.0,
     "ops_rpc_health": 15.0,
     "ops_mempool_wallet_index": 15.0,
+    # Dashboard hot-path (229s rebuild fix, V1 audit Phase 3, May 17 session).
+    # These helpers used to bypass the cache entirely; every parallel
+    # gather() in _get_terminal_snapshot re-queried Postgres. Short TTLs
+    # (5-10s) keep the data dashboard-fresh while collapsing the pool
+    # contention seen at SNAPSHOT_REBUILDER_INTERVAL_S=5s.
+    "overview": 5.0,
+    "recent_trades": 5.0,
+    "positions": 5.0,
+    "decisions": 5.0,
+    "decisions_stats": 5.0,
+    "risk": 10.0,
+    "activation": 10.0,
 }
 
 
@@ -598,33 +613,55 @@ async def _fetch_system_snapshot() -> dict:
 
 
 async def _fetch_positions_snapshot() -> dict:
-    async with _pool.acquire() as conn:
-        return await queries.positions(conn)
+    async def _build():
+        async with _pool.acquire() as conn:
+            return await queries.positions(conn)
+    return await _cached_helper("positions", _build)
 
 
 async def _fetch_positions_live_snapshot() -> list[dict]:
+    # NOT cached — live prices read from Redis on every call; the snapshot
+    # rebuilder loop already gates the cadence.
     async with _pool.acquire() as conn:
         return await queries.open_positions_with_prices(conn, _redis)
 
 
 async def _fetch_decisions_snapshot(limit: int = 60) -> list[dict]:
-    async with _pool.acquire() as conn:
-        return await queries.decisions(conn, limit=limit, offset=0)
+    # The cache key is fixed (no `limit` in the key) — every dashboard caller
+    # uses the default `limit=60`. Other limits go through /api/decisions
+    # which has its own dedicated `decisions_<N>` cache entries.
+    async def _build():
+        async with _pool.acquire() as conn:
+            return await queries.decisions(conn, limit=limit, offset=0)
+    if limit != 60:
+        # Bypass cache for non-default limits to avoid leaking stale rows
+        # for callers that ask for a different page size.
+        return await _build()
+    return await _cached_helper("decisions", _build)
 
 
 async def _fetch_decisions_stats_snapshot(window_hours: int = 24) -> dict:
-    async with _pool.acquire() as conn:
-        return await queries.decisions_stats(conn, window_hours=window_hours)
+    async def _build():
+        async with _pool.acquire() as conn:
+            return await queries.decisions_stats(conn, window_hours=window_hours)
+    if window_hours != 24:
+        # Bypass cache for non-default windows (only callsite uses 24h).
+        return await _build()
+    return await _cached_helper("decisions_stats", _build)
 
 
 async def _fetch_risk_snapshot() -> dict:
-    async with _pool.acquire() as conn:
-        return await queries.risk(conn)
+    async def _build():
+        async with _pool.acquire() as conn:
+            return await queries.risk(conn)
+    return await _cached_helper("risk", _build)
 
 
 async def _fetch_activation_snapshot() -> list[dict]:
-    async with _pool.acquire() as conn:
-        return await queries.activation_queue(conn)
+    async def _build():
+        async with _pool.acquire() as conn:
+            return await queries.activation_queue(conn)
+    return await _cached_helper("activation", _build)
 
 
 async def _fetch_data_quality_snapshot() -> dict:
@@ -642,10 +679,18 @@ async def _fetch_market_scanner_rows(limit: int = 60) -> list[dict]:
 
 
 async def _fetch_recent_observed_trades(limit: int = 60) -> list[dict]:
-    # Not cached — V1 client expects fresh trade tape (WS push covers
-    # most of this anyway, this is the bootstrap fallback).
-    async with _pool.acquire() as conn:
-        return await queries.recent_observed_trades(conn, limit=limit)
+    # Cached briefly (5s) — V1 client expects fresh trade tape but the
+    # snapshot rebuilder runs every 10s, so caching one cycle is enough
+    # to avoid double-querying when the bootstrap fallback fires in the
+    # same window. WS push remains the source of truth for low-latency
+    # updates on the client.
+    async def _build():
+        async with _pool.acquire() as conn:
+            return await queries.recent_observed_trades(conn, limit=limit)
+    if limit != 60:
+        # Bypass cache for non-default limits.
+        return await _build()
+    return await _cached_helper("recent_trades", _build)
 
 
 async def _fetch_alpha_extras() -> dict:
@@ -2081,16 +2126,25 @@ async def api_lab_gates():
             logger.debug(f"lab_gates count failed for {sql[:60]}: {exc}")
             return None
 
-    # SQL column names verified against actual schema 2026-05-17:
-    #   strategy_labels.labelled_at, follower_pool_state_history.snapshot_at,
-    #   mempool_observations.intent_received_at. causal_estimates uses
-    #   estimated_at per migration 030. Each query is also `_total` fallback
-    #   so the operator can see lifetime daemon output even when 24h is 0.
+    # SQL tables/columns verified against actual daemon write paths
+    # 2026-05-17 investigation:
+    #   R8: writes to BOTH strategy_labels AND leader_strategy_history;
+    #       the history table is the heartbeat (one row per classification
+    #       pass, classified_at column), so it's the right liveness signal.
+    #   R9: writes to multivariate_hawkes_fits (NOT follower_pool_state_history,
+    #       which is for a separate Kalman feature that's not yet wired).
+    #   R10: reads instrumental_events but InstrumentRegistry detectors are
+    #        NEVER scheduled in production → instrumental_events stays empty
+    #        → causal_estimates stays empty.
+    #   R7: mempool_observations is written by IntentRouter (engine container)
+    #       on each leaders:intent message. In prod the leaders:intent pubsub
+    #       has 0 subscribers AND the mempool stream has 0 messages → wiring
+    #       gap (daemon doesn't publish OR engine doesn't subscribe).
     r8 = await _safe_count(
-        "SELECT COUNT(*) AS n FROM strategy_labels WHERE labelled_at > NOW() - INTERVAL '24 hours'"
+        "SELECT COUNT(*) AS n FROM leader_strategy_history WHERE classified_at > NOW() - INTERVAL '24 hours'"
     )
     r9 = await _safe_count(
-        "SELECT COUNT(*) AS n FROM follower_pool_state_history WHERE snapshot_at > NOW() - INTERVAL '24 hours'"
+        "SELECT COUNT(*) AS n FROM multivariate_hawkes_fits WHERE fit_at > NOW() - INTERVAL '24 hours'"
     )
     r10 = await _safe_count(
         "SELECT COUNT(*) AS n FROM causal_estimates WHERE estimated_at > NOW() - INTERVAL '24 hours'"
@@ -2098,12 +2152,8 @@ async def api_lab_gates():
     r7 = await _safe_count(
         "SELECT COUNT(*) AS n FROM mempool_observations WHERE intent_received_at > NOW() - INTERVAL '24 hours'"
     )
-    # Lifetime totals — surface "daemon has produced something ever" vs
-    # "daemon has produced something in the last 24h". A daemon healthy
-    # for weeks but quiet today should not look identical to one that has
-    # NEVER produced output (the latter is a much louder red flag).
-    r8_total  = await _safe_count("SELECT COUNT(*) AS n FROM strategy_labels")
-    r9_total  = await _safe_count("SELECT COUNT(*) AS n FROM follower_pool_state_history")
+    r8_total  = await _safe_count("SELECT COUNT(*) AS n FROM leader_strategy_history")
+    r9_total  = await _safe_count("SELECT COUNT(*) AS n FROM multivariate_hawkes_fits")
     r10_total = await _safe_count("SELECT COUNT(*) AS n FROM causal_estimates")
     r7_total  = await _safe_count("SELECT COUNT(*) AS n FROM mempool_observations")
 
