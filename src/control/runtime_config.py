@@ -174,6 +174,58 @@ ALLOWED_KEYS: dict[str, str] = {
         "(internal + external) resolved positions for a leader before any "
         "FOLLOW/FADE signal fires. Default 5."
     ),
+    # ── Audit 2026-05-17 (QW2) — whitelist for audit-introduced constants ─
+    # Logs showed `runtime_config: legacy hash key '...' not in ALLOWED_KEYS
+    # — dropped` for these knobs whenever an operator HSET them on Redis
+    # (the dashboard cockpit silently ignored them). Adding them here
+    # restores both the dashboard write path AND the legacy hand-edit
+    # path. Bounds chosen so the loosest sensible value is reachable but
+    # accidental typos (negative, 100x) are rejected.
+    "min_hours_to_resolution_follow": (
+        "Audit 2026-05-17 (QW2): minimum hours until market resolution "
+        "required to open a FOLLOW trade. Default 6.0. Mirrors "
+        "settings.MIN_HOURS_TO_RESOLUTION_FOLLOW."
+    ),
+    "min_hours_to_resolution_fade": (
+        "Audit 2026-05-17 (QW2): minimum hours until market resolution "
+        "required to open a FADE trade. Default 6.0. Mirrors "
+        "settings.MIN_HOURS_TO_RESOLUTION_FADE."
+    ),
+    "max_book_age_paper_s": (
+        "Audit 2026-05-17 (QW2): max acceptable age (seconds) of a "
+        "`book:last:*` cache entry before paper_trader._get_book_quote "
+        "rejects it. Default 60.0. Mirrors settings.MAX_BOOK_AGE_PAPER_S."
+    ),
+    "max_leader_price_drift": (
+        "Audit 2026-05-17 (QW2): max allowed drift between leader's "
+        "signal price and the bot's actual entry ask. Default 0.35. "
+        "Mirrors settings.MAX_LEADER_PRICE_DRIFT."
+    ),
+    "preclose_hours_before_resolution": (
+        "Audit 2026-05-17 (QW2): how many hours before market resolution "
+        "to force-close open trades to avoid the indeterminate-outcome "
+        "deferral path. Default 0.25 (15 min). Set to 0 to disable."
+    ),
+    "max_trade_return_ratio": (
+        "Audit 2026-05-17 (QW2): single-trade return ratio above which "
+        "the close is logged to `paper:audit:suspicious_close`. Default "
+        "5.0 (500%). Mirrors settings.MAX_TRADE_RETURN_RATIO."
+    ),
+    "monitor_tick_s": (
+        "Audit 2026-05-17 (QW2): default monitor loop cadence (seconds) "
+        "when no open trades are within URGENT_MONITOR_HOURS of "
+        "resolution. Default 60.0. Mirrors settings.MONITOR_TICK_S."
+    ),
+    "urgent_monitor_tick_s": (
+        "Audit 2026-05-17 (QW2): tightened monitor cadence (seconds) "
+        "when any open trade is near its market's resolution. Default "
+        "5.0. Mirrors settings.URGENT_MONITOR_TICK_S."
+    ),
+    "urgent_monitor_hours": (
+        "Audit 2026-05-17 (QW2): hours-until-resolution threshold that "
+        "tips the monitor loop from default to urgent cadence. Default "
+        "1.0. Mirrors settings.URGENT_MONITOR_HOURS."
+    ),
     "min_leader_resolved_for_follow": (
         "Strategy 2026-05-17: minimum positions_resolved on a leader "
         "before FOLLOW signals are accepted. Default 30."
@@ -326,6 +378,38 @@ BOUNDS: dict[str, tuple[float, float]] = {
     # bounds [0, 1000]: 0 disables the gate, 1000 is a sanity ceiling.
     "book_wall_max_spread": (0.01, 1.0),
     "min_leader_total_resolved": (0, 1000),
+    # ── Audit 2026-05-17 (QW2) — bounds for audit-introduced constants ─
+    # Hours-to-resolution gates: floor at 1h (lower than this kills FOLLOW
+    # entirely), ceiling at 168h (7d — anything wider is effectively no
+    # gate, since most leader swings close within 48h).
+    "min_hours_to_resolution_follow": (1.0, 168.0),
+    "min_hours_to_resolution_fade": (1.0, 168.0),
+    # Book staleness cap: floor 5s (anything tighter trashes legitimate
+    # fresh quotes), ceiling 600s (10 min — beyond that you're trading
+    # blind, which is the whole point of this gate).
+    "max_book_age_paper_s": (5.0, 600.0),
+    # Drift gate is a ratio in [0, 1] but we cap at 0.5: 0.5 = "the bot
+    # filled at a price differing from the leader's by 50%", which is
+    # already pathological. Floor 0.05 = strictest sane setting.
+    "max_leader_price_drift": (0.05, 0.5),
+    # Preclose: 0 disables, 4h ceiling (any wider and we're closing well
+    # ahead of resolution and losing the legitimate hold-to-resolution
+    # tail-bet edge case).
+    "preclose_hours_before_resolution": (0.0, 4.0),
+    # Suspicious-close return cap: floor 2x (anything below this catches
+    # legitimate big swings), ceiling 100x (any wider effectively
+    # disables the audit signal).
+    "max_trade_return_ratio": (2.0, 100.0),
+    # Monitor cadence: tick floors at 1s (avoid CPU spin), ceiling 300s
+    # (5 min — wider and we miss too many entry/exit windows). Urgent
+    # cadence has tighter bounds because it runs in the last 60 min
+    # before resolution.
+    "monitor_tick_s": (1.0, 300.0),
+    "urgent_monitor_tick_s": (1.0, 60.0),
+    # Urgent-window threshold: 0.1h = 6 min (tightest sensible bound for
+    # the heartbeat-vs-tick race), 6h ceiling matches MIN_HOURS_TO_RESOLUTION
+    # so we never run urgent for an entire FOLLOW runway.
+    "urgent_monitor_hours": (0.1, 6.0),
 }
 
 # Keys that store booleans (not floats). set_overrides coerces these
@@ -486,6 +570,35 @@ def _defaults_from_settings() -> dict[str, Any]:
         ),
         "min_leader_total_resolved": int(
             getattr(settings, "MIN_LEADER_TOTAL_RESOLVED", 5)
+        ),
+        # ── Audit 2026-05-17 (QW2) — audit-introduced runtime knobs ────
+        # Defaults sourced from settings so an env override (via .env)
+        # still wins on first boot; the dashboard cockpit can then flip
+        # them at runtime without an engine redeploy.
+        "min_hours_to_resolution_follow": float(
+            getattr(settings, "MIN_HOURS_TO_RESOLUTION_FOLLOW", 6.0)
+        ),
+        "min_hours_to_resolution_fade": float(
+            getattr(settings, "MIN_HOURS_TO_RESOLUTION_FADE", 6.0)
+        ),
+        "max_book_age_paper_s": float(
+            getattr(settings, "MAX_BOOK_AGE_PAPER_S", 60.0)
+        ),
+        "max_leader_price_drift": float(
+            getattr(settings, "MAX_LEADER_PRICE_DRIFT", 0.35)
+        ),
+        "preclose_hours_before_resolution": float(
+            getattr(settings, "PRECLOSE_HOURS_BEFORE_RESOLUTION", 0.25)
+        ),
+        "max_trade_return_ratio": float(
+            getattr(settings, "MAX_TRADE_RETURN_RATIO", 5.0)
+        ),
+        "monitor_tick_s": float(getattr(settings, "MONITOR_TICK_S", 60.0)),
+        "urgent_monitor_tick_s": float(
+            getattr(settings, "URGENT_MONITOR_TICK_S", 5.0)
+        ),
+        "urgent_monitor_hours": float(
+            getattr(settings, "URGENT_MONITOR_HOURS", 1.0)
         ),
     }
 

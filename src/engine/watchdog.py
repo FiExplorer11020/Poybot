@@ -46,6 +46,22 @@ from src.config import settings
 REDIS_HEARTBEAT_PREFIX = "heartbeat:"
 ENGINE_CRASH_CHANNEL = "engine:crash"
 
+# QW3 (audit 2026-05-17) — alpha-grade components allowed to fail without
+# bringing the engine down. Production log evidence
+# (`watchdog: 'intent_router' exceeded max restarts (3); giving up and
+# stopping engine`) showed the engine self-killing every time an alpha
+# sub-component crashed loop-fast, opening multi-minute windows where no
+# consumer was draining the `decisions` Redis channel. These components
+# are auxiliary intelligence layers (mempool intent routing, instrument
+# registry), not the trading critical path. When they exhaust their
+# restart budget we set ``state.disabled = True`` and stop trying — the
+# core trading loop keeps running. Non-alpha components retain the
+# legacy engine-kill behaviour.
+ALPHA_COMPONENTS: frozenset[str] = frozenset({
+    "intent_router",
+    "instrument_registry",
+})
+
 
 # --------------------------------------------------------------------------- #
 # Types                                                                        #
@@ -73,6 +89,12 @@ class ComponentState:
     # Track whether we've already published a crash for the current
     # restart streak so we don't spam Telegram on every retry.
     crash_published: bool = False
+    # QW3: set to True when an alpha component (see ALPHA_COMPONENTS)
+    # exhausts its restart budget. Once disabled the watchdog skips
+    # this component entirely — it will not be restarted, will not
+    # trip the global stop_event, and will silently no-op on every
+    # tick until the engine restarts.
+    disabled: bool = False
 
 
 # --------------------------------------------------------------------------- #
@@ -206,6 +228,11 @@ class Watchdog:
                 await self._check_one(state, now)
 
     async def _check_one(self, state: ComponentState, now: float) -> None:
+        # QW3: alpha components that already exhausted their restart budget
+        # are silently skipped — they will NOT trip the global stop_event
+        # again, will NOT spawn new tasks, and the engine keeps running.
+        if state.disabled:
+            return
         # Forgive old restart counters once the component has been stable
         # for a while.
         if (
@@ -275,6 +302,28 @@ class Watchdog:
         )
 
         if state.restart_count > self._max_restarts:
+            # QW3: alpha components (intent_router, instrument_registry)
+            # are auxiliary intelligence layers — when they fail
+            # loop-fast we disable them in place but DO NOT tear down
+            # the trading engine. Non-alpha components keep the legacy
+            # engine-kill behaviour.
+            if state.name in ALPHA_COMPONENTS:
+                logger.error(
+                    f"watchdog: alpha component {state.name!r} exceeded "
+                    f"max restarts ({self._max_restarts}); disabling it "
+                    "in place. Engine remains UP."
+                )
+                state.disabled = True
+                await self._publish_crash(
+                    state,
+                    f"alpha component disabled after max restarts "
+                    f"({self._max_restarts})",
+                    fatal=False,
+                )
+                # Cancel any still-pending task so we don't leak it.
+                if state.task is not None and not state.task.done():
+                    state.task.cancel()
+                return
             logger.error(
                 f"watchdog: {state.name!r} exceeded max restarts "
                 f"({self._max_restarts}); giving up and stopping engine"

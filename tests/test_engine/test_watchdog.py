@@ -299,6 +299,105 @@ async def test_recent_heartbeat_avoids_restart(redis_client):
 # --------------------------------------------------------------------------- #
 
 
+# --------------------------------------------------------------------------- #
+# QW3 (audit 2026-05-17) — alpha-component isolation from engine kill          #
+# --------------------------------------------------------------------------- #
+
+
+async def test_alpha_component_exhausts_restarts_without_killing_engine(
+    redis_client,
+):
+    """QW3: ``intent_router`` is in ALPHA_COMPONENTS. When it exhausts
+    its restart budget, the watchdog must disable it in place (set
+    ``state.disabled = True``) and DO NOT trip ``stop_event``. The
+    engine stays UP — the trading critical path never lost its
+    decisions-channel consumer.
+
+    Pre-fix (the production incident this QW closes): the engine
+    auto-killed itself the moment intent_router crash-looped 4 times,
+    opening multi-minute windows where the paper trader had no
+    confidence-engine signals to act on.
+    """
+    stop = asyncio.Event()
+    wd = Watchdog(
+        redis_client=redis_client,
+        stop_event=stop,
+        max_restarts=3,
+        backoff_s=0,
+        heartbeat_timeout_s=999,
+    )
+    runs = []
+
+    async def always_crashes():
+        runs.append(1)
+        raise RuntimeError("alpha component is unstable")
+
+    # Register under the canonical alpha name.
+    await wd.register("intent_router", always_crashes)
+    # Drive past max_restarts.
+    for _ in range(6):
+        await asyncio.sleep(0.02)
+        await wd.tick()
+    # The whole point of QW3 — engine must remain UP.
+    assert not stop.is_set(), (
+        "QW3 regression: alpha component exhausted restarts and the "
+        "watchdog still tripped stop_event. The engine kill-switch on "
+        "intent_router crashes is back."
+    )
+    # Component should be marked disabled and the in-flight task
+    # cancelled / cleaned up.
+    state = wd._components["intent_router"]  # type: ignore[attr-defined]
+    assert state.disabled is True
+    # Once disabled, further ticks must be no-ops — no new task spawns.
+    runs_before = len(runs)
+    await wd.tick()
+    await asyncio.sleep(0.05)
+    assert len(runs) == runs_before, (
+        "Disabled alpha component restarted on next tick"
+    )
+    stop.set()
+    await wd.stop_all()
+
+
+async def test_non_alpha_component_still_kills_engine_on_max_restarts(
+    redis_client,
+):
+    """QW3 mirror: components NOT in ALPHA_COMPONENTS keep the legacy
+    behaviour. The paper_trader / confidence_engine / observer crashing
+    loop-fast must still trip stop_event — those ARE the trading
+    critical path.
+    """
+    stop = asyncio.Event()
+    wd = Watchdog(
+        redis_client=redis_client,
+        stop_event=stop,
+        max_restarts=2,
+        backoff_s=0,
+        heartbeat_timeout_s=999,
+    )
+
+    async def always_crashes():
+        raise RuntimeError("critical path failure")
+
+    # Pick a clearly non-alpha name — this stands in for paper_trader /
+    # confidence_engine.
+    await wd.register("paper_trader", always_crashes)
+    for _ in range(5):
+        await asyncio.sleep(0.02)
+        await wd.tick()
+        if stop.is_set():
+            break
+    assert stop.is_set(), (
+        "Non-alpha component exhausted restarts but engine kept "
+        "running — the legacy safety behaviour was broken alongside "
+        "the QW3 fix."
+    )
+    state = wd._components["paper_trader"]  # type: ignore[attr-defined]
+    # Non-alpha components don't get the ``disabled`` flag; they trip
+    # the global stop instead.
+    assert state.disabled is False
+
+
 async def test_restart_counter_resets_after_stable_period(redis_client):
     stop = asyncio.Event()
     wd = Watchdog(

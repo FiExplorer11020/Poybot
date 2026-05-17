@@ -261,6 +261,76 @@ class TestBookCacheStaleness:
 
 
 # --------------------------------------------------------------------------- #
+# QW4 (audit 2026-05-17) — book spread sanity gate                             #
+# --------------------------------------------------------------------------- #
+
+
+class TestBookSpreadGate:
+    """``_get_book_quote`` must reject books whose spread exceeds
+    ``MAX_BOOK_SPREAD_PCT`` (default 0.30 = 30%). Pre-fix the gate only
+    checked staleness + ``bid < ask`` invariant, so the typical pre-UMA
+    binary-wall book (bid≈0.001, ask≈0.999) was accepted and its
+    meaningless mid biased the monitor loop's TP/SL triggers — the
+    May 15 pattern-A phantom-win closes.
+    """
+
+    @pytest.mark.asyncio
+    async def test_narrow_spread_accepted(self):
+        """Spread = (0.47 - 0.45) / 0.46 ≈ 4.3% — well under the cap."""
+        redis = _make_redis()
+        redis.get = AsyncMock(
+            return_value=_book_payload(best_bid=0.45, best_ask=0.47, age_s=5)
+        )
+        trader = PaperTrader(redis_client=redis)
+        quote = await trader._get_book_quote("m", "t")
+        assert quote == (0.45, 0.47)
+
+    @pytest.mark.asyncio
+    async def test_borderline_spread_accepted(self):
+        """Spread = (0.58 - 0.42) / 0.50 = 32% > 30% — must be rejected.
+
+        Spread of exactly 30% sits on the boundary; we test the 32% case
+        to verify the cap fires unambiguously (no off-by-one).
+        """
+        redis = _make_redis()
+        redis.get = AsyncMock(
+            return_value=_book_payload(best_bid=0.42, best_ask=0.58, age_s=5)
+        )
+        trader = PaperTrader(redis_client=redis)
+        quote = await trader._get_book_quote("m", "t")
+        assert quote is None, (
+            "QW4 regression: 32% spread accepted — pre-UMA binary-wall "
+            "phantom-win path is open."
+        )
+
+    @pytest.mark.asyncio
+    async def test_half_spread_rejected(self):
+        """Spread = (0.75 - 0.25) / 0.50 = 100% > 30% — clearly rejected."""
+        redis = _make_redis()
+        redis.get = AsyncMock(
+            return_value=_book_payload(best_bid=0.25, best_ask=0.75, age_s=5)
+        )
+        trader = PaperTrader(redis_client=redis)
+        assert await trader._get_book_quote("m", "t") is None
+
+    @pytest.mark.asyncio
+    async def test_pre_uma_binary_wall_rejected(self):
+        """The actual production failure mode: bid=0.001, ask=0.999.
+
+        Spread ≈ 0.998 / 0.5 ≈ 200% — must be rejected. This is the
+        canonical "useless mid" case the gate exists to catch.
+        """
+        redis = _make_redis()
+        redis.get = AsyncMock(
+            return_value=_book_payload(
+                best_bid=0.001, best_ask=0.999, age_s=5
+            )
+        )
+        trader = PaperTrader(redis_client=redis)
+        assert await trader._get_book_quote("m", "t") is None
+
+
+# --------------------------------------------------------------------------- #
 # B7  —  Exit bid floor lowered to 0.0                                         #
 # --------------------------------------------------------------------------- #
 

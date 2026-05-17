@@ -226,8 +226,29 @@ class DecisionRouter:
     def _build_payload(decision: "Decision") -> dict:
         """Build the JSON payload — kept identical to the legacy
         ConfidenceEngine._emit() so PaperTrader / LiveTrader don't need
-        to change their parsing."""
+        to change their parsing.
+
+        Audit 2026-05-17 (QW1): the legacy payload omitted ``side`` and
+        ``price`` at the top level. The downstream paper_trader gates
+        ``leader_sell_side`` (open_trade ~L678) and ``leader_price_drift``
+        (~L953) read ``decision.get("side")`` and ``decision.get("price")``
+        respectively. Without these fields propagated they always returned
+        None, leaving both gates inert in production. Sourced from
+        ``trade_context`` (which the upstream
+        ConfidenceEngine._build_trade_context now stamps with
+        ``side`` and ``price``).
+        """
         ctx = decision.trade_context or {}
+        # QW1: surface leader side + signal price at the top level so the
+        # paper_trader gates can read them without spelunking into
+        # ``trade_context``. Accept multiple legacy key spellings to keep
+        # backward compat with any caller that already passed them in.
+        side = ctx.get("side") or ctx.get("trade_side") or ctx.get("leader_side")
+        price = (
+            ctx.get("market_price")
+            if ctx.get("market_price") is not None
+            else ctx.get("price") or ctx.get("trade_price") or ctx.get("leader_price")
+        )
         return {
             "action": decision.action,
             "leader_wallet": decision.leader_wallet,
@@ -236,6 +257,9 @@ class DecisionRouter:
             "market_category": ctx.get("market_category"),
             "market_type": ctx.get("market_type"),
             "token_id": decision.token_id,
+            # QW1 — top-level side/price required by paper_trader gates.
+            "side": side,
+            "price": price,
             "size_usdc": decision.size_usdc,
             "kelly_fraction": decision.kelly_fraction,
             "confidence": decision.confidence,

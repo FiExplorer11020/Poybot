@@ -365,3 +365,101 @@ async def test_payload_handles_missing_trade_context(monkeypatch):
     assert body["trade_context"] == {}
     assert body["market_question"] is None
     assert body["wallet_type"] is None
+
+
+# --------------------------------------------------------------------------- #
+# QW1 (audit 2026-05-17) — payload exposes leader side + signal price          #
+# --------------------------------------------------------------------------- #
+
+
+class TestPayloadSideAndPrice:
+    """The paper_trader gates ``leader_sell_side`` (rejects FOLLOW on a
+    leader SELL exit) and ``leader_price_drift`` (rejects fills far from
+    the leader's signal price) read ``decision["side"]`` and
+    ``decision["price"]`` respectively. The legacy payload omitted both,
+    leaving the gates silently inert in production. These tests pin the
+    contract: both fields must surface at the TOP LEVEL of the JSON
+    payload (not buried in ``trade_context``).
+    """
+
+    @pytest.mark.asyncio
+    async def test_payload_includes_side_and_price_from_market_price(
+        self, monkeypatch
+    ):
+        """The confidence engine builds trade_context with
+        ``market_price`` = trade["price"]. The router must surface that
+        as the top-level ``price`` field plus ``side`` from the leader's
+        observed trade."""
+        import json
+
+        monkeypatch.setattr(
+            "src.engine.decision_router.settings.TRADING_MODE", "paper"
+        )
+        redis = _make_redis()
+        router = DecisionRouter(redis)
+        decision = _decision(
+            trade_context={
+                "market_question": "Q?",
+                "wallet_type": "whale",
+                "side": "BUY",
+                "market_price": 0.42,
+            },
+            signal_audit={"accepted": True},
+        )
+        await router.route(decision)
+        body = json.loads(redis.publish.await_args.args[1])
+        assert body["side"] == "BUY", (
+            "QW1 regression: leader side missing from payload — "
+            "paper_trader.leader_sell_side gate is inert."
+        )
+        assert body["price"] == pytest.approx(0.42), (
+            "QW1 regression: signal price missing from payload — "
+            "paper_trader.leader_price_drift gate is inert."
+        )
+
+    @pytest.mark.asyncio
+    async def test_payload_fallback_keys_for_side_and_price(self, monkeypatch):
+        """Legacy callers may have stamped ``trade_side``/``leader_side``
+        or ``price``/``trade_price`` instead of the canonical
+        ``side``/``market_price``. Router accepts the aliases."""
+        import json
+
+        monkeypatch.setattr(
+            "src.engine.decision_router.settings.TRADING_MODE", "paper"
+        )
+        redis = _make_redis()
+        router = DecisionRouter(redis)
+        decision = _decision(
+            trade_context={
+                "trade_side": "sell",
+                "trade_price": 0.78,
+            },
+            signal_audit={"accepted": True},
+        )
+        await router.route(decision)
+        body = json.loads(redis.publish.await_args.args[1])
+        assert body["side"] == "sell"
+        assert body["price"] == pytest.approx(0.78)
+
+    @pytest.mark.asyncio
+    async def test_payload_missing_side_and_price_does_not_crash(
+        self, monkeypatch
+    ):
+        """When trade_context lacks both, the keys land as None — the
+        gates will simply not fire (current behaviour) but the payload
+        itself stays well-formed."""
+        import json
+
+        monkeypatch.setattr(
+            "src.engine.decision_router.settings.TRADING_MODE", "paper"
+        )
+        redis = _make_redis()
+        router = DecisionRouter(redis)
+        await router.route(_decision(trade_context={"market_question": "Q?"}))
+        body = json.loads(redis.publish.await_args.args[1])
+        # Both must be PRESENT in the payload contract (None is OK) so
+        # downstream `.get("side")` reads return None, never KeyError.
+        assert "side" in body
+        assert "price" in body
+        assert body["side"] is None
+        assert body["price"] is None

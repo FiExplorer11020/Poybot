@@ -1568,6 +1568,14 @@ class ConfidenceEngine:
             "size_ratio": round(size_ratio, 4),
             "liquidity_score": liquidity_score,
             "market_price": market_price,
+            # QW1 (audit 2026-05-17) — propagate leader side + signal price
+            # downstream so decision_router._build_payload can surface them
+            # at the top of the JSON payload. The paper_trader gates
+            # `leader_sell_side` and `leader_price_drift` read these from
+            # the decision dict, so without this stamping they always saw
+            # None and silently no-op'd in production.
+            "side": side,
+            "price": market_price,
             "profile_maturity": profile_maturity,
             "confirmed_followers": readiness["confirmed_followers"],
             "positions_resolved": readiness["positions_resolved"],

@@ -649,7 +649,14 @@ class PaperTrader:
             )
         )
         if market_id and token_id:
-            book_quote = await self._get_book_quote(market_id, token_id)
+            # QW4 — pass enforce_spread=False so the wide-spread book
+            # still surfaces here. The `book_wall_max_spread` runtime
+            # knob below owns the open-time refusal; the new spread cap
+            # in _get_book_quote is for the monitor / mark-to-market
+            # callers that don't have their own refusal path.
+            book_quote = await self._get_book_quote(
+                market_id, token_id, enforce_spread=False
+            )
             if book_quote is not None:
                 best_bid, best_ask = book_quote
                 spread = float(best_ask) - float(best_bid)
@@ -1339,6 +1346,7 @@ class PaperTrader:
         token_id: str,
         *,
         max_age_s: float | None = None,
+        enforce_spread: bool = True,
     ) -> tuple[float, float] | None:
         """Return (best_bid, best_ask) from book:last cache IF fresh.
 
@@ -1347,6 +1355,17 @@ class PaperTrader:
         Without this freshness gate, market_resolved closes against a
         stale near-final book bid produced ~$42k of phantom PnL in the
         May 15 session — confirmed by audit 2026-05-17.
+
+        ``enforce_spread`` (QW4, audit 2026-05-17): when True (default),
+        also reject quotes whose ``(ask - bid) / mid`` exceeds
+        ``settings.MAX_BOOK_SPREAD_PCT`` — these are pre-UMA binary
+        walls whose mid is uninformative. The single caller that disables
+        this is ``open_trade``'s book-wall gate (~L652), which needs to
+        SEE the wide quote to emit its own ``book_wall_spread`` refusal
+        reason with the actual bid/ask values for the operator. Every
+        other caller (mark-to-market, monitor loop TP/SL, exit price
+        computation) keeps the gate ON because using a 0.001/0.999 mid
+        as a TP/SL trigger is exactly the May 15 phantom-win pattern.
 
         The Redis payload schema differs by writer (observer WS,
         maintenance loop, JIT fetch in confidence_engine). We accept
@@ -1397,6 +1416,27 @@ class PaperTrader:
             best_ask = float(payload.get("best_ask"))
             if best_bid <= 0 or best_ask <= 0 or best_bid >= best_ask:
                 return None
+            # QW4 (audit 2026-05-17) — reject books whose spread is too
+            # wide to produce a meaningful mid. The pre-UMA binary-wall
+            # pattern (bid≈0.001, ask≈0.999) passes the bid<ask + freshness
+            # gates above but its mid is uninformative and was feeding the
+            # monitor loop's TP/SL triggers a stale phantom signal.
+            # Spread expressed as fraction of mid so this works across the
+            # full [0, 1] Polymarket price range. Skipped when the caller
+            # explicitly opts out (open_trade's book_wall_spread gate, which
+            # owns its own refusal reason and needs to read the wide quote).
+            if enforce_spread:
+                max_spread_pct = float(
+                    getattr(settings, "MAX_BOOK_SPREAD_PCT", 0.30)
+                )
+                mid = (best_bid + best_ask) / 2.0
+                spread_pct = (best_ask - best_bid) / max(mid, 1e-6)
+                if spread_pct > max_spread_pct:
+                    logger.debug(
+                        f"book_quote_rejected: spread_too_wide "
+                        f"market_id={market_id} spread={spread_pct:.4f}"
+                    )
+                    return None
             return best_bid, best_ask
         except Exception:
             return None
