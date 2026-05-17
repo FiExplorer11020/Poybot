@@ -146,7 +146,9 @@ async def main() -> None:
     # Flag #6). Without this every RiskManager check ate the 30s TTL.
     await get_runtime_config().start_pubsub()
 
-    error_model = ErrorModel()
+    # S3.11: error_model takes a redis_client so drift + phase upgrade
+    # events surface to Telegram. None = silent (test fixtures).
+    error_model = ErrorModel(redis_client=redis_client)
     profiler = BehaviorProfiler(redis_client=redis_client, error_model=error_model)
     # DecisionRouter (S2.7): in-memory router that decides whether each
     # decision goes to paper, live, or both — based on TRADING_MODE env
@@ -158,7 +160,9 @@ async def main() -> None:
         error_model=error_model,
         decision_router=decision_router,
     )
-    risk_manager = RiskManager()
+    # S3.11: risk_manager takes a redis_client so circuit-breaker trips
+    # and drawdown threshold crossings surface to Telegram.
+    risk_manager = RiskManager(redis_client=redis_client)
     paper_trader = PaperTrader(
         redis_client=redis_client,
         confidence_engine=confidence,
@@ -322,6 +326,67 @@ async def main() -> None:
         make_refresh_thresholds_job(),
         seconds=300,
     )
+
+    # ---- S3.11: Telegram digests + alerts evaluator ------------------- #
+    # Three new periodic jobs feeding the Telegram bot:
+    #  * hourly_digest — pushes a rolling 60min summary IF activity exists
+    #  * daily_digest — pushes a full snapshot every day at the configured
+    #                   UTC hour (default 23:00)
+    #  * alerts_eval — evaluates configurable threshold rules every 60s
+    # All gated on the bot being enabled; otherwise the jobs are no-ops.
+    try:
+        from src.telegram_bot import digest as digest_mod
+
+        async def _hourly_digest_job() -> None:
+            if not settings.TELEGRAM_DIGEST_HOURLY_ENABLED:
+                return
+            if telegram_bot.notifier is None:
+                return
+            payload = await digest_mod.build_hourly_digest(
+                redis_client=redis_client, paper_trader=paper_trader
+            )
+            if payload is None:
+                return
+            from src.telegram_bot import formatters
+            text = formatters.format_digest_hourly(payload)
+            await telegram_bot.notifier.push(text, tier=2)  # INFO tier
+
+        async def _daily_digest_job() -> None:
+            if not settings.TELEGRAM_DIGEST_DAILY_ENABLED:
+                return
+            if telegram_bot.notifier is None:
+                return
+            payload = await digest_mod.build_daily_digest(
+                redis_client=redis_client, paper_trader=paper_trader
+            )
+            from src.telegram_bot import formatters
+            text = formatters.format_digest_daily(payload)
+            await telegram_bot.notifier.push(text, tier=1)  # ALERT tier
+
+        async def _alerts_eval_job() -> None:
+            if telegram_bot.alerts_mgr is None or telegram_bot.notifier is None:
+                return
+            fired = await telegram_bot.alerts_mgr.evaluate(paper_trader=paper_trader)
+            for _rule, msg in fired:
+                await telegram_bot.notifier.push(msg, tier=1)  # ALERT tier
+
+        scheduler.add_interval(
+            "telegram_hourly_digest",
+            _hourly_digest_job,
+            seconds=3600,
+        )
+        scheduler.add_cron(
+            "telegram_daily_digest",
+            _daily_digest_job,
+            hour=settings.TELEGRAM_DIGEST_DAILY_HOUR_UTC,
+        )
+        scheduler.add_interval(
+            "telegram_alerts_eval",
+            _alerts_eval_job,
+            seconds=60,
+        )
+    except Exception as exc:  # pragma: no cover — graceful degrade
+        logger.warning(f"Engine: skipping Telegram digest/alerts wiring: {exc}")
     # Round 9 (The Web) — nightly multivariate Hawkes refit. Lives at
     # 03:30 UTC, right after the R5 bivariate batch window so the two
     # fitters don't fight for DB / CPU. The job is gated on the R9

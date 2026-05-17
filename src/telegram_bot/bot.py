@@ -1,10 +1,11 @@
 """
-TelegramBot orchestrator (S3.9).
+TelegramBot orchestrator (S3.9 + S3.11).
 
 Wires together:
   * a python-telegram-bot Application in long-polling mode,
   * the TelegramNotifier (Redis subscriber pushing alerts),
-  * the command handlers (defined in commands.py).
+  * the AlertsManager (configurable threshold-based rules),
+  * the command handlers (defined in commands.py and commands_extras.py).
 
 Lifecycle is start() / stop(), called by src/engine/main.py. If the
 bot is disabled (TELEGRAM_ENABLED=false, missing token, empty
@@ -12,33 +13,30 @@ allowlist), start() returns immediately — no exceptions, no log
 spam. We design for "missing config = inert" because most dev
 machines won't have a Telegram bot configured.
 
-Why python-telegram-bot:
-  * Async-native (asyncio.Application).
-  * Built-in long-polling with timeout + dropping pending updates.
-  * CommandHandler primitive that makes us not parse raw updates.
-
-We deliberately keep the framework in this single file. commands.py
-and notifier.py never import telegram.* — they're framework-agnostic
-and unit-testable without a Telegram client.
+Public accessors used by the engine scheduler:
+  * .notifier — push() for digests / ad-hoc alerts
+  * .alerts_mgr — evaluate() for periodic rule checks
 """
 
 from __future__ import annotations
 
 import asyncio
+import time
 from typing import Optional
 
 from loguru import logger
 
 from src.config import settings
 from src.control.killswitch import KillswitchService
-from src.telegram_bot import commands
+from src.telegram_bot import commands, commands_extras
+from src.telegram_bot.alerts import AlertsManager
 from src.telegram_bot.auth import authorized_chat_ids, is_authorized, reload_allowlist
 from src.telegram_bot.notifier import TelegramNotifier
 
 
 class TelegramBot:
-    """Owns the python-telegram-bot Application + the Redis notifier.
-    Public surface: start(), stop()."""
+    """Owns the python-telegram-bot Application, TelegramNotifier, and
+    AlertsManager. Public surface: start(), stop(), notifier, alerts_mgr."""
 
     def __init__(
         self,
@@ -54,6 +52,7 @@ class TelegramBot:
         self._live_trader = live_trader
         self._app = None  # type: ignore[assignment]
         self._notifier: Optional[TelegramNotifier] = None
+        self._alerts_mgr: Optional[AlertsManager] = None
         self._cmd_ctx = commands.CommandContext(
             redis_client=redis_client,
             killswitch=killswitch,
@@ -64,13 +63,28 @@ class TelegramBot:
         self._running = False
 
     # ------------------------------------------------------------------ #
+    # Public accessors                                                    #
+    # ------------------------------------------------------------------ #
+
+    @property
+    def notifier(self) -> Optional[TelegramNotifier]:
+        return self._notifier
+
+    @property
+    def alerts_mgr(self) -> Optional[AlertsManager]:
+        return self._alerts_mgr
+
+    @property
+    def paper_trader(self):
+        return self._paper_trader
+
+    # ------------------------------------------------------------------ #
     # Configuration                                                       #
     # ------------------------------------------------------------------ #
 
     @staticmethod
     def _compute_enabled() -> bool:
-        """Bot only runs if EVERY required setting is populated. We don't
-        want a half-configured deploy to silently skip alerts."""
+        """Bot only runs if EVERY required setting is populated."""
         if not settings.TELEGRAM_ENABLED:
             return False
         if not settings.TELEGRAM_BOT_TOKEN:
@@ -78,7 +92,6 @@ class TelegramBot:
                 "telegram: TELEGRAM_ENABLED=true but TELEGRAM_BOT_TOKEN empty — disabling"
             )
             return False
-        # Refresh allowlist cache then check.
         reload_allowlist()
         if not authorized_chat_ids():
             logger.warning(
@@ -113,8 +126,7 @@ class TelegramBot:
             Application.builder().token(settings.TELEGRAM_BOT_TOKEN).build()
         )
 
-        # Register command handlers — every handler is wrapped so we
-        # auth-gate, log, and never let a handler crash kill the loop.
+        # --- S3.9 commands ---
         self._app.add_handler(CommandHandler("start", self._wrap(commands.cmd_help)))
         self._app.add_handler(CommandHandler("help", self._wrap(commands.cmd_help)))
         self._app.add_handler(CommandHandler("status", self._wrap(commands.cmd_status)))
@@ -136,7 +148,42 @@ class TelegramBot:
         self._app.add_handler(CommandHandler("pause", self._wrap(commands.cmd_pause)))
         self._app.add_handler(CommandHandler("resume", self._wrap(commands.cmd_resume)))
 
-        # Start the Application (initialize -> start -> updater.start_polling).
+        # --- S3.11 commands (extras) ---
+        self._app.add_handler(
+            CommandHandler("leaders", self._wrap_with_args(commands_extras.cmd_leaders))
+        )
+        self._app.add_handler(
+            CommandHandler("leader", self._wrap_with_args(commands_extras.cmd_leader))
+        )
+        self._app.add_handler(
+            CommandHandler("health", self._wrap(commands_extras.cmd_health))
+        )
+        self._app.add_handler(
+            CommandHandler("trades", self._wrap_with_args(commands_extras.cmd_trades))
+        )
+        self._app.add_handler(CommandHandler("risk", self._wrap(commands_extras.cmd_risk)))
+        self._app.add_handler(
+            CommandHandler("digest", self._wrap_with_args(commands_extras.cmd_digest))
+        )
+        self._app.add_handler(
+            CommandHandler("drift", self._wrap(commands_extras.cmd_drift))
+        )
+        self._app.add_handler(
+            CommandHandler("market", self._wrap_with_args(commands_extras.cmd_market))
+        )
+        self._app.add_handler(
+            CommandHandler("set", self._wrap_with_args(commands_extras.cmd_set))
+        )
+        self._app.add_handler(
+            CommandHandler(
+                "verbosity", self._wrap_with_args(commands_extras.cmd_verbosity)
+            )
+        )
+        self._app.add_handler(
+            CommandHandler("alert", self._wrap_with_args(commands_extras.cmd_alert))
+        )
+
+        # Application lifecycle.
         await self._app.initialize()
         await self._app.start()
         if settings.TELEGRAM_COMMANDS_ENABLED:
@@ -148,25 +195,27 @@ class TelegramBot:
         else:
             logger.info("TelegramBot started in alerts-only mode (commands disabled)")
 
-        # Start the notifier — it uses our send method so all outbound
-        # messages funnel through the same throttle and chat allowlist.
+        # Notifier (channel-subscriber + push).
         self._notifier = TelegramNotifier(
             redis_client=self._redis,
             send_fn=self._send,
         )
         await self._notifier.start()
 
-        # Keep this coroutine alive so the engine watchdog doesn't think we
-        # crashed: python-telegram-bot's start_polling() is non-blocking
-        # (the polling runs in background tasks owned by the Application),
-        # so without this loop, start() would return and the watchdog would
-        # interpret the resolved Task as a crash → restart loop.
+        # AlertsManager (configurable thresholds).
+        self._alerts_mgr = AlertsManager(redis_client=self._redis)
+        await self._alerts_mgr.load()
+
+        # Wire deps into CommandContext now that they exist.
+        self._cmd_ctx.notifier = self._notifier
+        self._cmd_ctx.alerts_mgr = self._alerts_mgr
+        self._cmd_ctx.engine_started_at = time.time()
+
+        # Keep this coroutine alive so the watchdog doesn't restart us.
         try:
             while self._running:
                 await asyncio.sleep(60)
         except asyncio.CancelledError:
-            # stop() flips _running and the watchdog/main cancels us; that's
-            # the expected shutdown path, swallow the cancellation cleanly.
             raise
 
     async def stop(self) -> None:
@@ -194,42 +243,46 @@ class TelegramBot:
         as `send_fn` so the throttle + allowlist live here only once."""
         if self._app is None:
             return
-        try:
-            await self._app.bot.send_message(chat_id=chat_id, text=text)
-        except Exception as e:
-            logger.warning(f"telegram send to {chat_id} failed: {e}")
+        await self._app.bot.send_message(chat_id=chat_id, text=text)
+        # NOTE: errors raised here propagate to the notifier so it can
+        # bump its exponential backoff. Earlier versions swallowed the
+        # exception, which silently disabled the backoff feedback.
 
     # ------------------------------------------------------------------ #
     # Handler wrappers                                                    #
     # ------------------------------------------------------------------ #
 
     def _wrap(self, fn):
-        """Adapt a (ctx) -> str handler into a python-telegram-bot
-        CommandHandler signature (update, context). Auth-gates and
-        catches every exception."""
+        """Adapt a (ctx) -> str handler. Auth-gates and catches errors."""
 
-        async def adapter(update, context):  # noqa: ANN001 (PTB types)
+        async def adapter(update, context):  # noqa: ANN001
             chat_id = update.effective_chat.id if update.effective_chat else None
             if chat_id is None or not is_authorized(chat_id):
-                logger.info(f"telegram: ignoring command from unauthorized chat={chat_id}")
+                logger.info(
+                    f"telegram: ignoring command from unauthorized chat={chat_id}"
+                )
                 return
             try:
                 reply = await fn(self._cmd_ctx)
             except Exception as e:
                 logger.exception("telegram cmd crashed")
                 reply = f"❌ Internal error: {e.__class__.__name__}: {e}"
-            await self._send(chat_id, reply)
+            try:
+                await self._send(chat_id, reply)
+            except Exception as e:
+                logger.warning(f"telegram cmd reply send failed: {e}")
 
         return adapter
 
     def _wrap_with_args(self, fn):
-        """Same as `_wrap` but for handlers that take positional args
-        from the command (e.g. /mode dual)."""
+        """Same as `_wrap` but for handlers that take positional args."""
 
         async def adapter(update, context):  # noqa: ANN001
             chat_id = update.effective_chat.id if update.effective_chat else None
             if chat_id is None or not is_authorized(chat_id):
-                logger.info(f"telegram: ignoring command from unauthorized chat={chat_id}")
+                logger.info(
+                    f"telegram: ignoring command from unauthorized chat={chat_id}"
+                )
                 return
             args = list(context.args) if context and context.args else []
             try:
@@ -237,6 +290,9 @@ class TelegramBot:
             except Exception as e:
                 logger.exception("telegram cmd-with-args crashed")
                 reply = f"❌ Internal error: {e.__class__.__name__}: {e}"
-            await self._send(chat_id, reply)
+            try:
+                await self._send(chat_id, reply)
+            except Exception as e:
+                logger.warning(f"telegram cmd reply send failed: {e}")
 
         return adapter

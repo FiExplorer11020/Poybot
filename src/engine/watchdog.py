@@ -293,6 +293,25 @@ class Watchdog:
             await self._publish_crash(state, state.last_failure_reason or "?")
             state.crash_published = True
 
+        # S3.11: also publish a dedicated WatchdogRestart event so the
+        # operator can distinguish "one component restarted" from "the
+        # whole engine crashed" (the engine:crash channel is reserved
+        # for fatal terminations). Best-effort.
+        try:
+            await self._redis.publish(
+                "engine:watchdog:restarted",
+                json.dumps(
+                    {
+                        "component": state.name,
+                        "reason": state.last_failure_reason or "?",
+                        "restart_count": state.restart_count,
+                        "max_restarts": self._max_restarts,
+                    }
+                ),
+            )
+        except Exception as e:
+            logger.debug(f"watchdog publish restart failed: {e}")
+
         # Linear backoff before re-spawning.
         backoff = self._backoff_s * state.restart_count
         if backoff > 0:

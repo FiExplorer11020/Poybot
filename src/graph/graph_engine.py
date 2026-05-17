@@ -4,6 +4,7 @@ Subscribes to trades:observed, detects follower patterns, updates follower_edges
 """
 
 import asyncio
+import json
 from collections import defaultdict, deque
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
@@ -18,6 +19,9 @@ from src.database.connection import get_db
 REDIS_TRADES_CHANNEL = "trades:observed"
 TRADES_STREAM_NAME = "trades:stream"
 TRADES_STREAM_GROUP = "graph"
+
+# S3.11: Telegram surface for first-time follower-edge confirmation.
+CHANNEL_FOLLOWER_CONFIRMED = "graph:follower:confirmed"
 
 
 class GraphEngine:
@@ -308,8 +312,55 @@ class GraphEngine:
                     round(new_avg_delay, 2),
                     round(new_sdr, 4),
                 )
+
+                # S3.11: surface FIRST confirmation of a follower edge
+                # (crosses both co_occurrences + same_direction_rate
+                # thresholds). Compares against the previous row state so
+                # subsequent ticks don't re-fire.
+                prev_co = int(row["co_occurrences"] or 0) if row is not None else 0
+                prev_sdr = float(row["same_direction_rate"] or 0.0) if row is not None else 0.0
+                prev_confirmed = (
+                    prev_co >= settings.MIN_CO_OCCURRENCES
+                    and prev_sdr >= settings.MIN_SAME_DIRECTION_RATE
+                )
+                new_confirmed = (
+                    new_count >= settings.MIN_CO_OCCURRENCES
+                    and float(new_sdr) >= settings.MIN_SAME_DIRECTION_RATE
+                )
+                if new_confirmed and not prev_confirmed:
+                    await self._publish_follower_confirmed(
+                        leader_wallet=leader_wallet,
+                        follower_wallet=follower_wallet,
+                        follow_probability=float(follow_probability),
+                        same_direction_rate=float(new_sdr),
+                        co_occurrences=int(new_count),
+                    )
         except Exception as e:
             logger.error(f"Failed to update edge {leader_wallet}→{follower_wallet}: {e}")
+
+    async def _publish_follower_confirmed(
+        self,
+        *,
+        leader_wallet: str,
+        follower_wallet: str,
+        follow_probability: float,
+        same_direction_rate: float,
+        co_occurrences: int,
+    ) -> None:
+        """Best-effort surfacing of a newly confirmed follower edge."""
+        if self._redis is None:
+            return
+        try:
+            payload = {
+                "leader_wallet": leader_wallet,
+                "follower_wallet": follower_wallet,
+                "follow_probability": follow_probability,
+                "same_direction_rate": same_direction_rate,
+                "co_occurrences": co_occurrences,
+            }
+            await self._redis.publish(CHANNEL_FOLLOWER_CONFIRMED, json.dumps(payload))
+        except Exception as e:
+            logger.debug(f"graph publish follower_confirmed failed: {e}")
 
     async def get_followers(self, leader_wallet: str) -> list[dict]:
         """Return all follower edges for a given leader, ordered by probability."""

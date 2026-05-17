@@ -536,9 +536,38 @@ class Settings(BaseSettings):
     # poll. Higher = fewer requests but slower shutdown response.
     TELEGRAM_POLL_TIMEOUT_S: int = 30
     # Rate-limit on outbound notifications: max per minute. Telegram caps
-    # at ~30/sec for bots; we throttle far below that to be polite during
-    # storms (e.g. flurry of TP/SL closes).
-    TELEGRAM_MAX_NOTIFICATIONS_PER_MINUTE: int = 20
+    # at ~30/sec for bots; we stay well below to be polite during storms.
+    # The operator-side hard cap; CRITICAL-tier alerts (engine crash,
+    # killswitch flip, circuit breaker) bypass this and always go out.
+    TELEGRAM_MAX_NOTIFICATIONS_PER_MINUTE: int = 60
+    # Sliding-window dedup. If we already sent a message with the same
+    # hash within this window, drop the new one silently. Kills the
+    # reconnect-storm "publish twice" path without losing real events.
+    # 0 disables dedup entirely.
+    TELEGRAM_DEDUP_WINDOW_S: int = 60
+    # Verbosity tier — filters the per-channel firehose:
+    #   quiet   = CRITICAL only (crash, killswitch, breaker, suspicious_close)
+    #   normal  = quiet + ALERT (live trades, ingest gaps, drift)
+    #   verbose = normal + INFO (paper trades, leaders, runtime_config, market_resolved)
+    #   debug   = verbose + DEBUG (everything, no filtering)
+    # The user explicitly asked for maximum visibility; default "verbose".
+    TELEGRAM_VERBOSITY: str = "verbose"
+    # Auto-digest pushed every hour with the last 1h of activity. Skipped
+    # entirely if no activity in the window (avoids "0 trades, $0 PnL" noise).
+    TELEGRAM_DIGEST_HOURLY_ENABLED: bool = True
+    # Auto-digest pushed once a day at this UTC hour (0-23). Default 23:00
+    # UTC so it lands at end-of-trading-day for most operators.
+    TELEGRAM_DIGEST_DAILY_ENABLED: bool = True
+    TELEGRAM_DIGEST_DAILY_HOUR_UTC: int = 23
+    # Exponential backoff on Telegram API send failures. Starts at INITIAL,
+    # doubles up to MAX, resets on the next successful send. Protects us
+    # against being rate-limited *by* Telegram (HTTP 429) on top of our
+    # own throttle.
+    TELEGRAM_BACKOFF_INITIAL_S: float = 1.0
+    TELEGRAM_BACKOFF_MAX_S: float = 60.0
+    # Redis key under which the configurable /alert rules live. Persistent
+    # across restarts. Schema: JSON list of {id, channel, condition, threshold}.
+    TELEGRAM_ALERTS_REDIS_KEY: str = "telegram:alerts:rules"
 
     # ------------------------------------------------------------------ #
     # Batch Processing (CLAUDE.md § 9)                                    #

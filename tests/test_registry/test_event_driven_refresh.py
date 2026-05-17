@@ -111,15 +111,21 @@ async def test_refresh_wallet_upserts_on_success(fake_redis):
     registry, falcon = _make_registry(redis_client=fake_redis)
     falcon.get_wallet360.return_value = _make_metrics()
     fake_get_db, conn = _mock_get_db()
+    # S3.11: _apply_wallet_refresh uses fetchrow with RETURNING (xmax = 0)
+    # so it can fire the registry:leader:added publish on first insert.
+    # The test asserts that the UPSERT was issued; whether it lands as
+    # a fresh insert or an update depends on the mocked return value.
+    conn.fetchrow.return_value = {"was_inserted": False}
     with patch("src.registry.leader_registry.get_db", fake_get_db):
         ok = await registry.refresh_wallet("0xLeader", reason="ws_unknown_wallet")
     assert ok is True
     falcon.get_wallet360.assert_awaited_once_with("0xLeader")
-    # leaders UPSERT was issued.
-    assert conn.execute.await_count == 1
-    sql, *args = conn.execute.await_args[0]
+    # leaders UPSERT was issued (via fetchrow now, not execute).
+    assert conn.fetchrow.await_count == 1
+    sql, *args = conn.fetchrow.await_args[0]
     assert "INSERT INTO leaders" in sql
     assert "ON CONFLICT" in sql
+    assert "RETURNING (xmax = 0)" in sql
 
 
 @pytest.mark.asyncio

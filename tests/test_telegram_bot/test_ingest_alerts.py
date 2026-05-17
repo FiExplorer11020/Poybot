@@ -185,12 +185,19 @@ async def test_different_source_is_allowed_within_cooldown(redis_client):
 
 
 async def test_cooldown_zero_means_no_throttle(redis_client):
-    """Setting cooldown to 0 disables the per-source gate."""
+    """Setting cooldown to 0 disables the per-source gate.
+
+    Note: dedup_window_s=0 is also passed so two identical payloads
+    aren't dropped by the S3.11 hash dedup — this test isolates the
+    cooldown behavior. In production two real outages produce
+    distinct durations so the dedup would let them through anyway.
+    """
     send = AsyncMock()
     n = notifier.TelegramNotifier(
         redis_client=redis_client,
         send_fn=send,
         ingest_alert_cooldown_s=0,
+        dedup_window_s=0,
     )
     await n.start()
     try:

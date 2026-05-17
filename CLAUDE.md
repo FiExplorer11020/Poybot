@@ -632,14 +632,94 @@ a git checkout). Postgres user/db are `polymarket` (NOT `postgres`).
 | api/terminal_snapshot       | IMPLEMENTED | composes the live JSON snapshot from query outputs                                        |
 | api/inspector               | IMPLEMENTED | /api/inspector/snapshot exposes raw trades + decisions + source mix + pipeline metrics    |
 | backups/dumper              | IMPLEMENTED | wired but idle until BACKUPS_ENABLED=true and R2 creds populated                          |
-| telegram_bot/notifier       | IMPLEMENTED | sortant: alerts opening/closing/killswitch/crash                                          |
-| telegram_bot/bot            | IMPLEMENTED | entrant: /status, /pnl, /positions, /mode, /killswitch, /pause, /resume                   |
+| telegram_bot/notifier       | IMPLEMENTED | sortant: 18 channels (open/close/killswitch/crash/breaker/drift/phase/watchdog/follower/leader/runtime_config/market_resolved/drawdown/suspicious) + dedup hash 60s + verbosity tiers + backoff exp |
+| telegram_bot/bot            | IMPLEMENTED | entrant: 21 commandes (S3.9 + S3.11 expansion). Voir § 17.                              |
+| telegram_bot/digest         | IMPLEMENTED | hourly (rolling 60min, skipped if vide) + daily (23:00 UTC) via scheduler                |
+| telegram_bot/alerts         | IMPLEMENTED | règles configurables (drawdown / daily_loss / win_rate_below / idle_minutes), cooldown 30min, persistance Redis |
 | monitoring/metrics          | IMPLEMENTED | health and runtime support utilities                                                      |
 | Frontend (8 tabs)           | IMPLEMENTED | Alpha Terminal, ML Progression, Wallet Graph (incl. Wallet Scanner table), Live Portfolio, Decision Engine, Inspector, Risk & Config, Bot Health |
 
 ---
 
-## 16. RECENT CHANGES (May 10, 2026 session)
+## 16. TELEGRAM BOT — FULL SURFACE (S3.11)
+
+The Telegram bot is the operator's primary remote-control surface. It
+covers BOTH outbound notifications and inbound commands. Designed for
+the user who wants to "see everything from Telegram" without manually
+polling the dashboard.
+
+### 17.1 Outbound channels (notifier subscribes, formats, pushes)
+
+Verbosity tiers gate which channels send:
+* **CRITICAL** (always, even in `quiet`): `engine:crash`,
+  `control:killswitch_changed`, `paper:audit:suspicious_close`,
+  `engine:risk:breaker_tripped`, `engine:portfolio:drawdown_threshold`
+* **ALERT** (`normal`+): `positions:live_opened/closed`, `ingest:gap`,
+  `profiler:drift:detected`, `profiler:phase:upgraded`,
+  `engine:watchdog:restarted`, `engine:position:market_resolved`
+* **INFO** (`verbose`+, default): `positions:paper_opened/closed`,
+  `graph:follower:confirmed`, `registry:leader:added`,
+  `registry:leader:excluded`, `runtime_config:changed`
+
+Anti-spam: sliding-window throttle (default 60 msg/min, CRITICAL
+bypasses) + hash-based dedup (60s sliding window, CRITICAL bypasses) +
+exponential backoff on Telegram API failures (1s → 60s cap).
+
+### 17.2 Inbound commands (21 total)
+
+**Observability**: `/status`, `/pnl`, `/positions`, `/summary`,
+`/digest [hourly|daily]`, `/trades [n]`, `/leaders [n]`,
+`/leader <wallet>`, `/market <id>`, `/drift`, `/health`, `/risk`
+
+**Control**: `/mode <paper|live|dual>`, `/killswitch <on|off>`,
+`/pause`, `/resume`, `/set <key> <value>`, `/verbosity <quiet|normal|verbose|debug>`
+
+**Proactive alerts (configurable)**: `/alert list`, `/alert add <type> <threshold>`,
+`/alert remove <id>` — types: `drawdown`, `daily_loss`, `win_rate_below`,
+`idle_minutes`. Persisted in Redis (`telegram:alerts:rules`), evaluated
+every 60s by the scheduler. 30min cooldown per rule prevents spam.
+
+### 17.3 Auto-digests (scheduler-driven)
+
+* `telegram_hourly_digest` — every 3600s. Builds last-60min summary;
+  skipped if window is empty AND no notable events. Pushed as INFO tier.
+* `telegram_daily_digest` — cron at `TELEGRAM_DIGEST_DAILY_HOUR_UTC`
+  (default 23). Full snapshot: trades, win rate, best/worst, top leader,
+  cum/unrealized PnL, breaker/drift/phase counters. Pushed as ALERT tier.
+
+### 17.4 Required env vars (.env.example)
+
+```bash
+TELEGRAM_ENABLED=true
+TELEGRAM_BOT_TOKEN=<from @BotFather>
+TELEGRAM_CHAT_IDS=<comma-separated, get via @userinfobot>
+# Optional knobs (defaults shown):
+TELEGRAM_COMMANDS_ENABLED=true
+TELEGRAM_MAX_NOTIFICATIONS_PER_MINUTE=60    # was 20 in S3.9
+TELEGRAM_DEDUP_WINDOW_S=60                  # 0 = disable dedup
+TELEGRAM_VERBOSITY=verbose                  # quiet|normal|verbose|debug
+TELEGRAM_DIGEST_HOURLY_ENABLED=true
+TELEGRAM_DIGEST_DAILY_ENABLED=true
+TELEGRAM_DIGEST_DAILY_HOUR_UTC=23
+TELEGRAM_BACKOFF_INITIAL_S=1.0
+TELEGRAM_BACKOFF_MAX_S=60.0
+TELEGRAM_ALERTS_REDIS_KEY=telegram:alerts:rules
+INGEST_ALERT_COOLDOWN_S=300                 # per-source for ingest_gap
+```
+
+### 17.5 Anti-drift rules
+* When adding a new Redis channel that the operator should see: declare
+  the constant in the producer module, add it to `ALL_CHANNELS` in
+  `notifier.py`, classify it in `CHANNEL_TIER`, and add a formatter in
+  `formatters.py` (alert) or `formatters_replies.py` (command/digest).
+* New command handlers go in `commands_extras.py`, not `commands.py`
+  (which holds the original S3.9 set).
+* Module size cap (per master rule): keep each `telegram_bot/*.py` file
+  under 500 lines.
+
+---
+
+## 17. RECENT CHANGES
 
 The following items were delivered this session and are reflected in the
 sections above. Keep this changelog concise — old entries get pruned
@@ -669,3 +749,20 @@ when they become "the way it has always worked".
 - **Dockerfile + .dockerignore** : `docs/migrations/` is now copied
   into the runtime image so `setup_db.py` can apply pending schema
   changes inside the container.
+- **Telegram bot expansion S3.11 (May 17, 2026)** : surface complète
+  pour pilotage 100% remote. Notifier passe de 7 → 18 channels
+  (suspicious_close, risk_breaker, drawdown_threshold, drift,
+  phase_upgraded, watchdog_restart, follower_confirmed, leader_added/
+  excluded, runtime_config_changed, market_resolved_position). Anti-spam :
+  dédup hash 60s + verbosity tiers (quiet/normal/verbose/debug) + backoff
+  exponentiel sur erreurs Telegram + throttle 60/min avec bypass CRITICAL.
+  Commandes : 9 → 21 (ajout de /leaders, /leader, /health, /trades,
+  /risk, /digest, /drift, /market, /set, /verbosity, /alert). Digest
+  auto horaire + quotidien 23:00 UTC via APScheduler. Système d'alertes
+  configurables `/alert add drawdown 0.05` etc. persisté en Redis avec
+  cooldown 30min/règle. Modules ajoutés : `telegram_bot/alerts.py`,
+  `digest.py`, `commands_extras.py`, `formatters_replies.py`. Publishers
+  branchés dans risk_manager (breakers + drawdown_threshold), error_model
+  (drift + phase upgrade), watchdog (restart séparé du crash),
+  graph_engine (follower_confirmed sur transition), leader_registry
+  (added/excluded). 103 tests passent.

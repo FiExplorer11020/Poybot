@@ -256,6 +256,10 @@ class LeaderRegistry:
                     """,
                     wallet,
                 )
+                await self._publish_leader_event(
+                    "registry:leader:excluded",
+                    {"wallet_address": wallet, "exclude_reason": "falcon_no_data"},
+                )
                 skipped += 1
                 continue
             w360 = metrics.to_dict()
@@ -445,7 +449,14 @@ class LeaderRegistry:
                 return
             w360 = metrics.to_dict()
             classification = self.classify_leader(w360)
-            await conn.execute(
+            exclude_reason = (
+                "structural_bot" if classification.strategy == "structural" else None
+            )
+            # ``xmax = 0`` is asyncpg-friendly way to distinguish inserted
+            # rows from updated rows on ON CONFLICT — we want to fire
+            # registry:leader:added only on the FIRST insert, not on
+            # every subsequent enrichment.
+            inserted_row = await conn.fetchrow(
                 """
                 INSERT INTO leaders
                     (wallet_address, falcon_score, wallet360_json,
@@ -458,13 +469,42 @@ class LeaderRegistry:
                     excluded = EXCLUDED.excluded,
                     exclude_reason = EXCLUDED.exclude_reason,
                     last_refresh = NOW()
+                RETURNING (xmax = 0) AS was_inserted
                 """,
                 wallet,
                 json.dumps(w360),
                 json.dumps(classification.model_dump()),
                 not classification.copiable,
-                "structural_bot" if classification.strategy == "structural" else None,
+                exclude_reason,
             )
+            was_inserted = bool(inserted_row and inserted_row["was_inserted"])
+            if was_inserted:
+                await self._publish_leader_event(
+                    "registry:leader:added",
+                    {
+                        "wallet_address": wallet,
+                        "falcon_score": None,  # populated by next enrich cycle
+                        "source": "wallet_refresh",
+                    },
+                )
+            if not classification.copiable:
+                # Exclusion at insert time — surface separately.
+                await self._publish_leader_event(
+                    "registry:leader:excluded",
+                    {
+                        "wallet_address": wallet,
+                        "exclude_reason": exclude_reason or "not_copiable",
+                    },
+                )
+
+    async def _publish_leader_event(self, channel: str, payload: dict) -> None:
+        """Best-effort surface to Telegram. ``self.redis`` may be None in tests."""
+        if self.redis is None:
+            return
+        try:
+            await self.redis.publish(channel, json.dumps(payload))
+        except Exception as e:
+            logger.debug(f"leader_registry publish {channel} failed: {e}")
 
     async def _reserve_falcon_budget(self) -> bool:
         """Decrement the daily Falcon budget. Returns True if a slot was

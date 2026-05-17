@@ -33,11 +33,20 @@ from src.telegram_bot import formatters
 @dataclass
 class CommandContext:
     """Everything a command handler may need. Built once at TelegramBot
-    construction time and passed to each handler call."""
+    construction time and passed to each handler call.
+
+    The notifier/alerts_mgr fields are wired in S3.11 to support the
+    new /verbosity, /digest, and /alert commands. They're Optional so
+    older test fixtures (which build a context with just redis +
+    killswitch) keep working.
+    """
     redis_client: object
     killswitch: KillswitchService
     paper_trader: object = None  # PaperTrader instance, optional
     live_trader: object = None   # LiveTrader instance, optional
+    notifier: object = None      # TelegramNotifier, for /verbosity + /digest
+    alerts_mgr: object = None    # AlertsManager, for /alert list|add|remove
+    engine_started_at: float = 0.0  # monotonic-ish for /health uptime
 
 
 # --------------------------------------------------------------------------- #

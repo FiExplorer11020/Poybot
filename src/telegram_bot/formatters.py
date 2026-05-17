@@ -1,16 +1,21 @@
 """
-Message formatters for the Telegram bot (S3.9).
+Alert formatters for the Telegram bot (S3.9 + S3.11).
 
-Pure functions that take an event payload (dict) and return a
-plain-text or MarkdownV2 string ready to send. Kept separate from the
-notifier / command handlers so they're trivial to unit-test without a
-Telegram client.
+Pure functions that take a Redis pub/sub payload (dict) and return a
+plain-text string ready to send. Kept separate from the notifier and
+command handlers so they're trivial to unit-test without a Telegram
+client.
+
+This module covers ONLY notification-driven (channel-routed) alerts.
+Command-reply formatters live in ``formatters_replies`` and are
+re-exported below so callers using ``from src.telegram_bot import
+formatters; formatters.format_status(...)`` keep working.
 
 Formatting choices:
   * Plain text (no MarkdownV2). MarkdownV2 requires escaping every
     `_*[]()~`>#+-=|{}.!` and we'd rather have readable code than
-    perfect bold formatting. We use light unicode glyphs (✅ ⚠️ ❌ 📈
-    📉) for visual scanning instead.
+    perfect bold formatting. Use unicode glyphs (✅ ⚠️ ❌ 📈 📉) for
+    visual scanning instead.
   * Truncate market_id to 14 chars — full hashes are unreadable on
     mobile and we only need them for cross-referencing in the DB.
   * Money formatted to 2 decimals; prices to 4; pct to 1.
@@ -22,7 +27,7 @@ from typing import Optional
 
 
 # --------------------------------------------------------------------------- #
-# Helpers                                                                      #
+# Helpers (also re-used by formatters_replies via private import)              #
 # --------------------------------------------------------------------------- #
 
 
@@ -35,7 +40,8 @@ def _short(market_id: Optional[str], n: int = 14) -> str:
 def _money(x: Optional[float]) -> str:
     if x is None:
         return "?"
-    return f"{float(x):+.2f}$" if x < 0 or x > 0 else "0.00$"
+    f = float(x)
+    return f"{f:+.2f}$" if f != 0 else "0.00$"
 
 
 def _money_abs(x: Optional[float]) -> str:
@@ -56,8 +62,25 @@ def _pct(x: Optional[float]) -> str:
     return f"{float(x) * 100:+.1f}%"
 
 
+def _fmt_duration(seconds) -> str:
+    """Render a duration in s/m/h/d. Tolerates None / weird types."""
+    try:
+        s = int(seconds)
+    except (TypeError, ValueError):
+        return "?"
+    if s < 0:
+        return "?"
+    if s < 60:
+        return f"{s}s"
+    if s < 3600:
+        return f"{s // 60}m"
+    if s < 86400:
+        return f"{s // 3600}h{(s % 3600) // 60}m"
+    return f"{s // 86400}d{(s % 86400) // 3600}h"
+
+
 # --------------------------------------------------------------------------- #
-# Notifier formatters                                                          #
+# Original (S3.9) alert formatters                                             #
 # --------------------------------------------------------------------------- #
 
 
@@ -82,14 +105,7 @@ def format_position_opened(*, venue: str, payload: dict) -> str:
 
 
 def format_position_closed(*, venue: str, payload: dict) -> str:
-    """Format a 'position closed' alert.
-
-    Includes strategy, size, entry→exit prices, and pnl_pct so the user
-    can immediately judge magnitude vs exposure. Prior format showed only
-    pnl_usdc + exit_price + reason; without size + pct the operator had
-    no way to tell whether ``-198$`` was a 99% loss on $200 or a 12%
-    loss on $1650.
-    """
+    """Format a 'position closed' alert."""
     pnl = payload.get("pnl_usdc")
     pnl_icon = "📈" if (pnl or 0) >= 0 else "📉"
     icon = "📄" if venue == "paper" else "💸"
@@ -143,14 +159,7 @@ def format_engine_crash(payload: dict) -> str:
 
 
 def format_ingest_gap(payload: dict) -> str:
-    """Format a Phase 3 Task D ingest_gap alert.
-
-    Payload shape (produced by IngestHealthMonitor recovery callback):
-      {"source": "falcon_leaderboard",
-       "duration_s": 2400.0,
-       "severity": "warning" | "critical",
-       "threshold_s": 2100}
-    """
+    """Format a Phase 3 Task D ingest_gap alert."""
     source = payload.get("source", "?")
     duration_s = float(payload.get("duration_s", 0) or 0)
     severity = payload.get("severity", "warning")
@@ -168,179 +177,216 @@ def format_ingest_gap(payload: dict) -> str:
 
 
 # --------------------------------------------------------------------------- #
-# Command formatters                                                           #
+# S3.11 alert formatters (operator-visibility expansion)                       #
 # --------------------------------------------------------------------------- #
 
 
-def format_status(
-    *,
-    mode: str,
-    paper_capital: Optional[float],
-    paper_open: int,
-    live_open: int,
-    killswitch_exec: bool,
-    killswitch_real: bool,
-) -> str:
-    """Format the /status reply."""
+def format_suspicious_close(payload: dict) -> str:
+    """Triggered by PaperTrader when |pnl_pct| exceeds MAX_TRADE_RETURN_RATIO
+    on a non-resolution close (likely stale-cache exit)."""
+    trade_id = payload.get("trade_id", "?")
+    pnl_pct = payload.get("pnl_pct")
+    pnl_str = _pct(pnl_pct) if pnl_pct is not None else "?"
+    entry = _price(payload.get("entry_price"))
+    exit_ = _price(payload.get("exit_price"))
+    reason = payload.get("close_reason", "?")
+    strategy = str(payload.get("strategy", "?")).upper()
+    market = _short(payload.get("market_id"))
     return (
-        f"📊 STATUS\n"
-        f"mode: {mode}\n"
-        f"paper: capital={_money_abs(paper_capital)} open={paper_open}\n"
-        f"live: open={live_open}\n"
-        f"killswitch: exec={'ON' if killswitch_exec else 'OFF'}, "
-        f"real={'ON' if killswitch_real else 'OFF'}"
+        f"🚨 SUSPICIOUS CLOSE — #{trade_id} ({strategy})\n"
+        f"market: {market}\n"
+        f"entry: {entry} → exit: {exit_} ({pnl_str})\n"
+        f"reason: {reason} — likely stale-cache exit; review before trusting PnL"
     )
 
 
-def format_pnl(
-    *,
-    paper_realized: Optional[float],
-    paper_unrealized: Optional[float],
-    live_realized: Optional[float],
-    live_shadow_count: int,
-    live_real_count: int,
-) -> str:
-    """Format the /pnl reply."""
-    return (
-        f"💰 PnL\n"
-        f"paper realized:   {_money(paper_realized)}\n"
-        f"paper unrealized: {_money(paper_unrealized)}\n"
-        f"live realized:    {_money(live_realized)}\n"
-        f"live trades: shadow={live_shadow_count}  real={live_real_count}"
-    )
+def format_risk_breaker(payload: dict) -> str:
+    """RiskManager circuit-breaker trip.
 
-
-def format_positions(
-    *,
-    paper_positions: list[dict],
-    live_positions: list[dict],
-) -> str:
-    """Format the /positions reply. Each position dict must have:
-    market_id, strategy, direction, entry_price, size_usdc."""
-    lines = ["📋 OPEN POSITIONS"]
-    if not paper_positions and not live_positions:
-        lines.append("(none)")
-        return "\n".join(lines)
-    if paper_positions:
-        lines.append(f"\nPAPER ({len(paper_positions)})")
-        for p in paper_positions[:10]:
-            lines.append(
-                f"  • {_short(p.get('market_id'))} "
-                f"{p.get('strategy', '?')}/{p.get('direction', '?')} "
-                f"size={_money_abs(p.get('size_usdc'))} "
-                f"@ {_price(p.get('entry_price'))}"
-            )
-        if len(paper_positions) > 10:
-            lines.append(f"  … +{len(paper_positions) - 10} more")
-    if live_positions:
-        lines.append(f"\nLIVE ({len(live_positions)})")
-        for p in live_positions[:10]:
-            lines.append(
-                f"  • {_short(p.get('market_id'))} "
-                f"{p.get('strategy', '?')}/{p.get('direction', '?')} "
-                f"size={_money_abs(p.get('size_usdc'))} "
-                f"@ {_price(p.get('entry_price'))} "
-                f"[{p.get('status', '?')}]"
-            )
-        if len(live_positions) > 10:
-            lines.append(f"  … +{len(live_positions) - 10} more")
-    return "\n".join(lines)
-
-
-def format_summary(payload: dict) -> str:
-    """Format the /summary reply.
-
-    Expected payload shape (all keys optional; missing fields render as
-    ``?`` or skipped sections):
-      {
-        "trades_closed_today": int,
-        "trades_open": int,
-        "wins": int,
-        "losses": int,
-        "avg_win": float | None,
-        "avg_loss": float | None,
-        "net_today": float,
-        "cum_realized": float | None,
-        "unrealized": float | None,
-        "by_reason":  [{"reason": str, "count": int, "avg_pnl": float | None}, ...],
-        "by_strategy": [{"strategy": str, "count": int, "wins": int, "losses": int}, ...],
-      }
+    Payload: {"breaker": str, "value": float, "threshold": float,
+              "market_id": str | None}
     """
-    n_closed = int(payload.get("trades_closed_today", 0) or 0)
-    n_open = int(payload.get("trades_open", 0) or 0)
-    wins = int(payload.get("wins", 0) or 0)
-    losses = int(payload.get("losses", 0) or 0)
-    avg_win = payload.get("avg_win")
-    avg_loss = payload.get("avg_loss")
-    net_today = payload.get("net_today", 0.0)
-    cum_realized = payload.get("cum_realized")
-    unrealized = payload.get("unrealized")
-
-    lines = ["📊 TODAY'S SUMMARY (UTC since 00:00)"]
-    lines.append(f"trades: {n_closed} closed, {n_open} open")
-    lines.append(
-        f"wins: {wins} (avg {_money(avg_win)})" if wins
-        else "wins: 0"
+    breaker = str(payload.get("breaker", "?"))
+    value = payload.get("value")
+    threshold = payload.get("threshold")
+    market_id = payload.get("market_id")
+    pct_like = breaker in {"drawdown", "market_exposure"}
+    val_str = (
+        f"{float(value):.2%}" if isinstance(value, (int, float)) and pct_like
+        else (str(int(value)) if isinstance(value, (int, float)) else "?")
     )
-    lines.append(
-        f"losses: {losses} (avg {_money(avg_loss)})" if losses
-        else "losses: 0"
+    thr_str = (
+        f"{float(threshold):.2%}" if isinstance(threshold, (int, float)) and pct_like
+        else (str(int(threshold)) if isinstance(threshold, (int, float)) else "?")
     )
-    lines.append(f"net realized: {_money(net_today)} (today)")
-    if cum_realized is not None:
-        lines.append(f"cum realized: {_money(cum_realized)} (lifetime)")
-    if unrealized is not None:
-        lines.append(f"unrealized: {_money(unrealized)} ({n_open} open)")
+    extra = f"\nmarket: {_short(market_id)}" if market_id else ""
+    return (
+        f"🛑 RISK BREAKER — {breaker}\n"
+        f"value: {val_str}  threshold: {thr_str}\n"
+        f"trade refused — system is protecting capital{extra}"
+    )
 
-    by_reason = payload.get("by_reason") or []
-    if by_reason:
-        lines.append("")
-        lines.append("by close reason:")
-        for r in by_reason:
-            reason = str(r.get("reason", "?"))
-            count = int(r.get("count", 0) or 0)
-            avg_pnl = r.get("avg_pnl")
-            lines.append(f"  {reason}: {count} (avg {_money(avg_pnl)})")
 
-    by_strategy = payload.get("by_strategy") or []
-    if by_strategy:
-        lines.append("")
-        lines.append("by strategy:")
-        for s in by_strategy:
-            strat = str(s.get("strategy", "?"))
-            count = int(s.get("count", 0) or 0)
-            w = int(s.get("wins", 0) or 0)
-            l = int(s.get("losses", 0) or 0)
-            lines.append(f"  {strat}: {count} ({w}W {l}L)")
+def format_drawdown_threshold(payload: dict) -> str:
+    """Portfolio drawdown crossing a tier threshold (3 / 5 / 10%)."""
+    dd_pct = payload.get("drawdown_pct")
+    threshold = payload.get("threshold")
+    peak = payload.get("peak_capital")
+    current = payload.get("current_capital")
+    dd_str = f"{float(dd_pct) * 100:.1f}%" if dd_pct is not None else "?"
+    thr_str = f"{float(threshold) * 100:.1f}%" if threshold is not None else "?"
+    return (
+        f"📉 DRAWDOWN — {dd_str} (crossed {thr_str} threshold)\n"
+        f"peak: {_money_abs(peak)}  current: {_money_abs(current)}"
+    )
 
+
+def format_drift_detected(payload: dict) -> str:
+    """Profiler CUSUM drift detection event."""
+    wallet = _short(payload.get("wallet"), n=10)
+    phase_before = payload.get("phase_before", "?")
+    phase_after = payload.get("phase_after", "?")
+    cusum = payload.get("cusum_value")
+    cusum_str = f"{float(cusum):.3f}" if cusum is not None else "?"
+    return (
+        f"⚠️ DRIFT — error model downgraded\n"
+        f"wallet: {wallet}\n"
+        f"phase: {phase_before} → {phase_after}  CUSUM: {cusum_str}\n"
+        f"leader's behavior changed — model collecting fresh data"
+    )
+
+
+def format_phase_upgraded(payload: dict) -> str:
+    """error_model phase upgrade (1→2 or 2→3)."""
+    wallet = _short(payload.get("wallet"), n=10)
+    old_phase = payload.get("old_phase", "?")
+    new_phase = payload.get("new_phase", "?")
+    resolved = payload.get("positions_resolved", "?")
+    model_name = {1: "Beta", 2: "BayesianRidge", 3: "LightGBM+Platt"}.get(
+        new_phase if isinstance(new_phase, int) else -1, "?"
+    )
+    return (
+        f"📈 ERROR MODEL UPGRADED\n"
+        f"wallet: {wallet}  phase {old_phase} → {new_phase} ({model_name})\n"
+        f"positions resolved: {resolved}"
+    )
+
+
+def format_watchdog_restart(payload: dict) -> str:
+    """Watchdog coroutine-restart event."""
+    component = payload.get("component", "?")
+    reason = payload.get("reason", "?")
+    restart_count = payload.get("restart_count", "?")
+    max_restarts = payload.get("max_restarts", "?")
+    return (
+        f"🔁 WATCHDOG RESTART — {component}\n"
+        f"reason: {reason}\n"
+        f"restart {restart_count}/{max_restarts}"
+    )
+
+
+def format_follower_confirmed(payload: dict) -> str:
+    """graph_engine new-follower-edge-confirmed event."""
+    leader = _short(payload.get("leader_wallet") or payload.get("leader"), n=10)
+    follower = _short(payload.get("follower_wallet") or payload.get("follower"), n=10)
+    prob = payload.get("follow_probability")
+    same_dir = payload.get("same_direction_rate")
+    co_occ = payload.get("co_occurrences", "?")
+    prob_str = f"{float(prob):.2f}" if prob is not None else "?"
+    sd_str = _pct(same_dir) if same_dir is not None else "?"
+    return (
+        f"🔗 FOLLOWER CONFIRMED\n"
+        f"{leader} → {follower}\n"
+        f"P(follow)={prob_str}  same_dir={sd_str}  co_occ={co_occ}"
+    )
+
+
+def format_leader_added(payload: dict) -> str:
+    """leader_registry leader-added event."""
+    wallet = _short(payload.get("wallet_address"), n=10)
+    falcon = payload.get("falcon_score")
+    falcon_str = f"{float(falcon):.2f}" if falcon is not None else "?"
+    source = payload.get("source", "leaderboard")
+    return (
+        f"➕ LEADER ADDED\n"
+        f"wallet: {wallet}\n"
+        f"falcon_score: {falcon_str}  source: {source}"
+    )
+
+
+def format_leader_excluded(payload: dict) -> str:
+    """leader_registry leader-excluded event."""
+    wallet = _short(payload.get("wallet_address"), n=10)
+    reason = payload.get("exclude_reason", "?")
+    return (
+        f"➖ LEADER EXCLUDED\n"
+        f"wallet: {wallet}\n"
+        f"reason: {reason}"
+    )
+
+
+def format_runtime_config_changed(payload: dict) -> str:
+    """runtime_config edit event.
+
+    Payload: {"actor": str, "edits": {key: value, ...}, "ts": float}
+    """
+    actor = payload.get("actor", "?")
+    edits = payload.get("edits") or {}
+    if not isinstance(edits, dict) or not edits:
+        return f"⚙️ CONFIG CHANGED by {actor} — (no diff)"
+    lines = [f"⚙️ CONFIG CHANGED by {actor}"]
+    for k, v in list(edits.items())[:10]:
+        lines.append(f"  {k} = {v}")
+    if len(edits) > 10:
+        lines.append(f"  … +{len(edits) - 10} more")
     return "\n".join(lines)
 
 
-def format_mode_change(*, old_mode: Optional[str], new_mode: str) -> str:
-    """Format the /mode reply."""
+def format_market_resolved_position(payload: dict) -> str:
+    """Market-resolved event for a market we hold a position in."""
+    market = _short(payload.get("market_id"))
+    outcome = str(payload.get("outcome", "?")).upper()
+    direction = str(payload.get("our_direction", "?")).upper()
+    size = _money_abs(payload.get("size_usdc"))
+    pnl = payload.get("pnl_usdc")
+    pnl_icon = "📈" if (pnl or 0) >= 0 else "📉"
+    venue = str(payload.get("venue", "?")).upper()
     return (
-        f"🔀 MODE CHANGED\n"
-        f"{old_mode or '?'} → {new_mode}\n"
-        f"(takes effect on the next decision; runtime override key set)"
+        f"🏁{pnl_icon} MARKET RESOLVED — {venue}\n"
+        f"market: {market}\n"
+        f"outcome: {outcome}  our_dir: {direction}  size: {size}\n"
+        f"pnl: {_money(pnl)}"
     )
 
 
-def format_help() -> str:
-    return (
-        "🤖 POLYMARKET BOT — COMMANDS\n"
-        "/status           — current mode, capital, open positions\n"
-        "/pnl              — realized + unrealized PnL\n"
-        "/positions        — list of open positions\n"
-        "/summary          — today's trading activity (UTC)\n"
-        "/mode <m>         — switch trading mode (paper|live|dual)\n"
-        "/killswitch <s>   — flip the killswitch (on|off)\n"
-        "/pause            — stop the engine (observer keeps running)\n"
-        "/resume           — restart the engine\n"
-        "/help             — this message"
-    )
+# --------------------------------------------------------------------------- #
+# Re-export command-reply + digest formatters for backwards compat.            #
+# This keeps `from src.telegram_bot import formatters; formatters.format_*`    #
+# working for every caller that doesn't care about the file split.             #
+# --------------------------------------------------------------------------- #
 
-
-def format_unauthorized() -> str:
-    """We don't actually send this — unauthorized chats are silently
-    ignored — but kept for tests and possible future debug output."""
-    return "⛔ Unauthorized chat."
+from src.telegram_bot.formatters_replies import (  # noqa: E402, F401
+    format_status,
+    format_pnl,
+    format_positions,
+    format_summary,
+    format_mode_change,
+    format_help,
+    format_unauthorized,
+    format_leaders,
+    format_leader_detail,
+    format_health,
+    format_trades,
+    format_risk,
+    format_drift,
+    format_market_detail,
+    format_set_ok,
+    format_set_rejected,
+    format_verbosity_changed,
+    format_alert_added,
+    format_alert_list,
+    format_alert_removed,
+    format_alert_help,
+    format_digest_hourly,
+    format_digest_daily,
+)

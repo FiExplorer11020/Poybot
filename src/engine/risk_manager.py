@@ -2,6 +2,7 @@
 Risk Manager — pre-trade circuit breakers and portfolio exposure controls.
 """
 
+import json
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
@@ -14,6 +15,17 @@ from src.database.connection import get_db
 from src.economics.versioning import valid_paper_trade_filter
 
 V1_PAPER_TRADE_SQL = valid_paper_trade_filter()
+
+# Telegram surfacing channels (S3.11). Kept as module constants so the
+# notifier subscriber and producer agree on the contract without
+# importing each other.
+CHANNEL_RISK_BREAKER = "engine:risk:breaker_tripped"
+CHANNEL_DRAWDOWN_THRESHOLD = "engine:portfolio:drawdown_threshold"
+
+# Drawdown tiers we surface to the operator. One alert per crossing of
+# a NEW (higher) tier; reset to 0 when capital recovers above half the
+# last-published threshold so we don't spam during sustained drawdown.
+DRAWDOWN_THRESHOLDS = (0.03, 0.05, 0.10, 0.15, 0.20)
 
 
 @dataclass
@@ -28,9 +40,16 @@ class PortfolioStats:
 
 
 class RiskManager:
-    def __init__(self):
+    def __init__(self, redis_client=None):
         self._consecutive_losses: int = 0
         self._peak_capital: float = settings.PAPER_CAPITAL_USDC
+        # S3.11: optional redis_client so circuit-breaker trips surface
+        # to Telegram. None = silent (kept that way for the legacy test
+        # constructor that passes no args).
+        self._redis = redis_client
+        # Highest drawdown threshold already published this session. Resets
+        # when drawdown halves to avoid retrigger flapping.
+        self._drawdown_published_threshold: float = 0.0
 
     def hydrate_from_state(self, *, peak_capital: float, consecutive_losses: int) -> None:
         """Restore counters from the persisted portfolio_state row.
@@ -80,14 +99,23 @@ class RiskManager:
             if self._peak_capital > 0
             else 0.0
         )
+        # Surface drawdown threshold crossings BEFORE evaluating the hard
+        # breaker, so the operator gets warnings at 3/5/10% instead of
+        # only seeing a refused trade at 20%.
+        await self._publish_drawdown_crossing(drawdown, current_capital)
+
         if drawdown >= max_dd:
             logger.warning(f"Circuit breaker: drawdown={drawdown:.1%} >= {max_dd:.1%}")
+            await self._publish_breaker("drawdown", drawdown, max_dd)
             return False
 
         if self._consecutive_losses >= max_cons_losses:
             logger.warning(
                 f"Circuit breaker: {self._consecutive_losses} consecutive losses "
                 f">= {max_cons_losses}"
+            )
+            await self._publish_breaker(
+                "consecutive_losses", self._consecutive_losses, max_cons_losses
             )
             return False
 
@@ -98,11 +126,18 @@ class RiskManager:
                 f"Circuit breaker: {recent_losses} losses on {market_id} in 24h "
                 f">= {max_recent_market_losses}"
             )
+            await self._publish_breaker(
+                "recent_market_losses",
+                recent_losses,
+                max_recent_market_losses,
+                market_id=market_id,
+            )
             return False
 
         open_count = await self._count_open_positions()
         if open_count >= max_open:
             logger.warning(f"Circuit breaker: {open_count} open positions >= {max_open}")
+            await self._publish_breaker("open_count", open_count, max_open)
             return False
 
         market_exposure = await self._market_exposure(market_id, current_capital)
@@ -111,9 +146,79 @@ class RiskManager:
                 f"Circuit breaker: market exposure {market_exposure:.1%} >= "
                 f"{max_market_exposure:.1%}"
             )
+            await self._publish_breaker(
+                "market_exposure",
+                market_exposure,
+                max_market_exposure,
+                market_id=market_id,
+            )
             return False
 
         return True
+
+    # ------------------------------------------------------------------ #
+    # S3.11 publishers — best-effort, never block the hot path           #
+    # ------------------------------------------------------------------ #
+
+    async def _publish_breaker(
+        self,
+        breaker: str,
+        value,
+        threshold,
+        *,
+        market_id: str | None = None,
+    ) -> None:
+        """Surface a circuit-breaker trip to Telegram. Silent on no-redis."""
+        if self._redis is None:
+            return
+        try:
+            payload = {
+                "breaker": breaker,
+                "value": float(value),
+                "threshold": float(threshold),
+                "market_id": market_id,
+            }
+            await self._redis.publish(CHANNEL_RISK_BREAKER, json.dumps(payload))
+        except Exception as e:
+            logger.debug(f"risk_manager publish breaker failed: {e}")
+
+    async def _publish_drawdown_crossing(
+        self, drawdown: float, current_capital: float
+    ) -> None:
+        """Fire one alert per NEW (higher) drawdown threshold crossed.
+
+        Reset condition: drawdown falls below half the last-published
+        threshold (so a 5% alert isn't refired during oscillation in
+        the 4-5% band; it stays armed until we drop back to <2.5%).
+        """
+        if self._redis is None or drawdown <= 0:
+            # Recovery → re-arm at zero.
+            if drawdown <= 0 and self._drawdown_published_threshold > 0:
+                self._drawdown_published_threshold = 0.0
+            return
+
+        if (
+            self._drawdown_published_threshold > 0
+            and drawdown < self._drawdown_published_threshold * 0.5
+        ):
+            self._drawdown_published_threshold = 0.0
+
+        for thr in DRAWDOWN_THRESHOLDS:
+            if drawdown >= thr and self._drawdown_published_threshold < thr:
+                try:
+                    payload = {
+                        "drawdown_pct": float(drawdown),
+                        "threshold": float(thr),
+                        "peak_capital": float(self._peak_capital),
+                        "current_capital": float(current_capital),
+                    }
+                    await self._redis.publish(
+                        CHANNEL_DRAWDOWN_THRESHOLD, json.dumps(payload)
+                    )
+                    self._drawdown_published_threshold = thr
+                except Exception as e:
+                    logger.debug(f"risk_manager publish drawdown failed: {e}")
+                break
 
     async def apply_size_async(self, kelly_size: float, signal: dict) -> float:
         """Enforce position size limits and return the allowed size in USDC.

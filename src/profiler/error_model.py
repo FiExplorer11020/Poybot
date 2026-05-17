@@ -68,10 +68,17 @@ class ErrorPrediction:
 
 
 class ErrorModel:
-    def __init__(self) -> None:
+    # Telegram surfacing channels (S3.11).
+    CHANNEL_DRIFT_DETECTED = "profiler:drift:detected"
+    CHANNEL_PHASE_UPGRADED = "profiler:phase:upgraded"
+
+    def __init__(self, redis_client=None) -> None:
         # Per-wallet running CUSUM statistic S (in-memory; persisted to DB implicitly
         # via phase downgrade).
         self._cusum_state: dict[str, float] = {}
+        # S3.11: optional redis_client so drift + phase upgrade events
+        # reach Telegram. None = silent (legacy test fixtures).
+        self._redis = redis_client
 
     # ─── Public API ──────────────────────────────────────────────────────────
 
@@ -151,6 +158,12 @@ class ErrorModel:
 
             if s_new > CUSUM_THRESHOLD and phase > 1:
                 logger.warning(f"CUSUM drift detected for {wallet} — downgrading error model")
+                await self._publish_drift(
+                    wallet=wallet,
+                    phase_before=phase,
+                    phase_after=max(1, phase - 1),
+                    cusum_value=s_new,
+                )
                 await self._downgrade_phase(wallet, phase, profile=profile)
                 return
         else:
@@ -161,6 +174,12 @@ class ErrorModel:
         # Check for phase upgrade
         new_phase = self._determine_phase(positions_resolved)
         if new_phase > phase:
+            await self._publish_phase_upgrade(
+                wallet=wallet,
+                old_phase=phase,
+                new_phase=new_phase,
+                positions_resolved=positions_resolved,
+            )
             await self._upgrade_phase(wallet, new_phase, profile)
         else:
             await self._retrain_if_needed(wallet, phase, profile)
@@ -468,6 +487,42 @@ class ErrorModel:
                 )
         except Exception as e:
             logger.error(f"Save runtime profile error for {wallet}: {e}")
+
+    # ─── S3.11 Telegram publishers ───────────────────────────────────────────
+
+    async def _publish_drift(
+        self, *, wallet: str, phase_before: int, phase_after: int, cusum_value: float
+    ) -> None:
+        """Best-effort surfacing of a CUSUM drift event."""
+        if self._redis is None:
+            return
+        try:
+            payload = {
+                "wallet": wallet,
+                "phase_before": phase_before,
+                "phase_after": phase_after,
+                "cusum_value": float(cusum_value),
+            }
+            await self._redis.publish(self.CHANNEL_DRIFT_DETECTED, json.dumps(payload))
+        except Exception as e:
+            logger.debug(f"error_model publish drift failed: {e}")
+
+    async def _publish_phase_upgrade(
+        self, *, wallet: str, old_phase: int, new_phase: int, positions_resolved: int
+    ) -> None:
+        """Best-effort surfacing of a phase upgrade event."""
+        if self._redis is None:
+            return
+        try:
+            payload = {
+                "wallet": wallet,
+                "old_phase": old_phase,
+                "new_phase": new_phase,
+                "positions_resolved": int(positions_resolved),
+            }
+            await self._redis.publish(self.CHANNEL_PHASE_UPGRADED, json.dumps(payload))
+        except Exception as e:
+            logger.debug(f"error_model publish phase_upgrade failed: {e}")
 
     async def _fetch_training_data(self, wallet: str, phase: int = 2) -> dict | None:
         """
