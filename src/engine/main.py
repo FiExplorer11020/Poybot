@@ -254,6 +254,44 @@ async def main() -> None:
     # buys us nothing.
     await watchdog.register("orderbook_observer", orderbook_observer.start)
 
+    # Round 7 supplement (2026-05-17 LAB diagnostic) — IntentRouter.
+    # The mempool daemon publishes intents to the `mempool:leader_intent`
+    # Redis stream (3520+ messages observed in prod), but the IntentRouter
+    # consumer was never instantiated. Without this wiring R7 writes 0
+    # rows to mempool_observations forever, blocking both shadow PnL
+    # measurement AND R10 LeaderGasQuirkDetector (which reads from
+    # mempool_observations). Routing in SHADOW mode by default —
+    # `prefill_live_enabled` runtime flag stays False until the operator
+    # explicitly enables LIVE firing via the LAB tab.
+    try:
+        from src.execution.prefill.intent_router import IntentRouter
+
+        class _NoOpPreSignedPool:
+            """Minimal pool stub for SHADOW mode. The IntentRouter's
+            `_rotation_loop` calls `expire_stale()` every tick; in
+            SHADOW we never `fire()`, so a true PreSignedPool with
+            CLOB signing + market scanning is unnecessary. Replace with
+            the real :class:`src.execution.prefill.pool.PreSignedPool`
+            when `prefill_live_enabled` is about to be flipped ON.
+            """
+            async def expire_stale(self) -> int:
+                return 0
+
+        intent_router = IntentRouter(
+            pool=_NoOpPreSignedPool(),
+            live_trader=None,           # not touched in SHADOW path
+            paper_trader=paper_trader,
+            confidence_engine=confidence,
+            risk_manager=risk_manager,
+            killswitch=killswitch,
+            runtime_config=get_runtime_config(),
+        )
+        await watchdog.register("intent_router", intent_router.start)
+    except Exception as exc:  # pragma: no cover — graceful degrade
+        logger.warning(
+            f"Engine: skipping IntentRouter wiring: {exc}"
+        )
+
     scheduler = Scheduler()
     scheduler.add_cron(
         "nightly_batch",
@@ -326,6 +364,62 @@ async def main() -> None:
     except Exception as exc:  # pragma: no cover — graceful degrade
         logger.warning(
             f"Scheduler: skipping causal_nightly registration: {exc}"
+        )
+
+    # Round 10 supplement — InstrumentRegistry hourly pass.
+    # Without this, the causal_nightly job runs against an empty
+    # instrumental_events table and always reports estimated=0. Per the
+    # 2026-05-17 LAB diagnostic, this wiring gap is the dominant reason
+    # R10 has produced 0 estimates lifetime.
+    #
+    # We register ONLY RelatedMarketResolver here (pure-SQL, no external
+    # API dep). LeaderGasQuirkDetector requires R7 mempool_observations
+    # which is still empty — adding it now would just NO-OP. The other
+    # detectors (NewsEventDetector, OracleUpdateDetector) need external
+    # data sources / RPC subscriptions that are out of scope for this
+    # job.
+    try:
+        from src.causal.instruments import InstrumentRegistry
+        from src.causal.instruments_sql import RelatedMarketResolver
+
+        async def _causal_instruments_hourly() -> None:
+            # 2026-05-17 perf tuning: the default RelatedMarketResolver
+            # (30-day lookback, min_co=5) is a wallet x market self-join
+            # on trades_observed (millions of rows, never ANALYZEd) and
+            # blows past the 60s statement_timeout. We tighten:
+            #   * lookback 30d → 1d  : limits the inner CTE to the most
+            #     recent active wallets x markets, the dominant signal.
+            #   * min_co 5 → 10      : prunes the cartesian product to
+            #     genuinely-shared market pairs (instrument quality is
+            #     more important than coverage for the first-stage IV).
+            # The job runs hourly so the 1-day window slides; we never
+            # miss long-tail shared pairs we'd otherwise catch in a
+            # 30-day window. Re-tune when trades_observed has been
+            # ANALYZEd and the planner picks a hash join.
+            registry = InstrumentRegistry()
+            registry.register(
+                RelatedMarketResolver(
+                    lookback_days=1,
+                    min_co_occurrences=10,
+                    max_pairs=200,
+                )
+            )
+            summary = await registry.run_one_pass()
+            for det_name, entry in summary.get("by_detector", {}).items():
+                logger.info(
+                    f"instruments[{det_name}]: detected={entry.get('events_detected', 0)} "
+                    f"persisted={entry.get('events_persisted', 0)} "
+                    f"error={entry.get('error') or 'none'}"
+                )
+
+        scheduler.add_interval(
+            "causal_instruments_hourly",
+            _causal_instruments_hourly,
+            seconds=3600,
+        )
+    except Exception as exc:  # pragma: no cover — graceful degrade
+        logger.warning(
+            f"Scheduler: skipping causal_instruments_hourly registration: {exc}"
         )
     await scheduler.start()
     # ------------------------------------------------------------------- #
