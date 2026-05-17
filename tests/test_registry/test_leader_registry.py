@@ -1,5 +1,6 @@
 """Unit tests for LeaderRegistry."""
 
+from contextlib import asynccontextmanager
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -14,6 +15,18 @@ from src.registry.models import (
     PnlLeaderEntry,
     WalletMetrics,
 )
+
+
+def _mock_response(status: int, data):
+    """Mirror the helper in tests/test_registry/test_falcon_phase1.py for
+    mocking aiohttp response context managers."""
+    resp = AsyncMock()
+    resp.status = status
+    resp.json = AsyncMock(return_value=data)
+    resp.raise_for_status = MagicMock()
+    resp.__aenter__ = AsyncMock(return_value=resp)
+    resp.__aexit__ = AsyncMock(return_value=False)
+    return resp
 
 
 def _make_registry() -> tuple[LeaderRegistry, MagicMock]:
@@ -575,3 +588,244 @@ class TestSyncMarkets:
         args = _markets_upsert_args(conn)
         assert args[8] is None
         assert args[10] is None
+
+
+class TestSyncMarketsActiveFlip:
+    """Agent C' patch: sync_markets upsert must flip `active=FALSE` when
+    the EXCLUDED.end_date is more than 24 h in the past, and preserve
+    the existing `markets.active` value otherwise.
+
+    These are SQL-text assertions (mock conn). The 24 h threshold and
+    CASE shape mirror the filter used at SELECT time in sync_markets so
+    a market that drops out of the live-pool query (end_date < NOW() -
+    24 h) is also flipped to inactive on its last upsert. Without this
+    flip, expired markets stay `active=TRUE` forever (column default
+    per master CLAUDE.md §6)."""
+
+    @pytest.mark.asyncio
+    async def test_sync_markets_upsert_has_active_flip_clause(self):
+        """The CASE clause must be present in the markets UPSERT SQL so
+        callers can rely on the runtime behaviour without an
+        integration DB."""
+        from datetime import datetime, timedelta, timezone
+
+        registry, falcon = _make_registry()
+        falcon.query = AsyncMock(
+            return_value=[
+                {
+                    "question": "Expired BTC market",
+                    "category": "crypto",
+                    "clob_token_ids": ["tok_yes", "tok_no"],
+                    "endDate": (
+                        datetime.now(tz=timezone.utc) - timedelta(days=2)
+                    ).isoformat(),
+                    "volume24hr": 0.0,
+                }
+            ]
+        )
+        conn = _make_conn()
+        conn.fetch = AsyncMock(return_value=[{"market_id": "0xexpired"}])
+
+        await registry.sync_markets(conn)
+
+        args = _markets_upsert_args(conn)
+        sql = args[0]
+        # The CASE clause + 24h threshold + active assignment must all
+        # be present in the ON CONFLICT branch.
+        assert "active" in sql.lower()
+        assert "EXCLUDED.end_date" in sql
+        assert "INTERVAL '24 hours'" in sql
+
+    @pytest.mark.asyncio
+    async def test_sync_markets_flips_expired_active(self):
+        """Param contract: when end_date is in the past by > 24 h, the
+        end_date param passed to the upsert is < NOW() - 24h. The CASE
+        clause checks `EXCLUDED.end_date < NOW() - INTERVAL '24 hours'`
+        so PG returns FALSE on the live row. Asserted at the
+        parameter-binding level (Postgres evaluates the CASE — we
+        verify the bound end_date is old enough for it to fire)."""
+        from datetime import datetime, timedelta, timezone
+
+        registry, falcon = _make_registry()
+        expired_end_date = (
+            datetime.now(tz=timezone.utc) - timedelta(days=2)
+        ).isoformat()
+        falcon.query = AsyncMock(
+            return_value=[
+                {
+                    "question": "Expired",
+                    "category": "crypto",
+                    "clob_token_ids": ["tok_yes", "tok_no"],
+                    "endDate": expired_end_date,
+                    "volume24hr": 0.0,
+                }
+            ]
+        )
+        conn = _make_conn()
+        conn.fetch = AsyncMock(return_value=[{"market_id": "0xexpired"}])
+
+        await registry.sync_markets(conn)
+
+        args = _markets_upsert_args(conn)
+        # $6 = end_date param. Must be a datetime in the past by > 24 h
+        # so the CASE clause fires on the live row.
+        bound_end_date = args[6]
+        assert bound_end_date is not None
+        threshold = datetime.now(tz=timezone.utc) - timedelta(hours=24)
+        assert bound_end_date < threshold
+
+    @pytest.mark.asyncio
+    async def test_sync_markets_preserves_active_for_live(self):
+        """When end_date is in the future, the CASE clause's WHEN does
+        not match (NOW() - 24 h is still in the past, but
+        EXCLUDED.end_date is in the future). PG falls through to
+        `ELSE markets.active` — the live row keeps its current value.
+        Verified at parameter-binding level."""
+        from datetime import datetime, timedelta, timezone
+
+        registry, falcon = _make_registry()
+        future_end_date = (
+            datetime.now(tz=timezone.utc) + timedelta(days=7)
+        ).isoformat()
+        falcon.query = AsyncMock(
+            return_value=[
+                {
+                    "question": "Live market",
+                    "category": "crypto",
+                    "clob_token_ids": ["tok_yes", "tok_no"],
+                    "endDate": future_end_date,
+                    "volume24hr": 5000.0,
+                }
+            ]
+        )
+        conn = _make_conn()
+        conn.fetch = AsyncMock(return_value=[{"market_id": "0xlive"}])
+
+        await registry.sync_markets(conn)
+
+        args = _markets_upsert_args(conn)
+        bound_end_date = args[6]
+        assert bound_end_date is not None
+        # > NOW() - 24h, so the CASE clause's WHEN does not fire.
+        threshold = datetime.now(tz=timezone.utc) - timedelta(hours=24)
+        assert bound_end_date > threshold
+        # And the ELSE branch keeps markets.active — assert via SQL
+        # shape that the ELSE branch references markets.active.
+        sql = args[0]
+        assert "ELSE markets.active" in sql
+
+
+class TestFetchMarketFromGammaClosedFallback:
+    """Agent C' patch: when the default Gamma call (active markets
+    only) returns [], retry with `closed=true` so resolved markets get
+    mapped instead of looping forever in sync_markets."""
+
+    @pytest.mark.asyncio
+    async def test_fetch_market_from_gamma_closed_fallback(self):
+        """Default call returns [] (resolved market); closed=true call
+        returns the market payload. Helper must surface the closed
+        payload."""
+        registry, _ = _make_registry()
+
+        closed_payload = {
+            "question": "Resolved election market",
+            "category": "politics",
+            "clobTokenIds": ["tok_yes", "tok_no"],
+            "endDateIso": "2025-11-05T00:00:00Z",
+            "volume24hr": 0.0,
+            "closed": True,
+        }
+
+        # Two responses in order: first default→[], then closed=true →
+        # the resolved market.
+        responses = [
+            _mock_response(200, []),
+            _mock_response(200, [closed_payload]),
+        ]
+        captured_calls: list[dict] = []
+
+        @asynccontextmanager
+        async def fake_get(url, params=None, timeout=None):
+            captured_calls.append(dict(params or {}))
+            resp = responses.pop(0)
+            yield resp
+
+        session = MagicMock()
+        session.get = fake_get
+        session.__aenter__ = AsyncMock(return_value=session)
+        session.__aexit__ = AsyncMock(return_value=False)
+
+        with patch("aiohttp.ClientSession", return_value=session):
+            result = await registry._fetch_market_from_gamma("0xresolved")
+
+        assert result == closed_payload
+        # Confirm the helper actually made the fallback call.
+        assert len(captured_calls) == 2
+        assert captured_calls[0].get("conditionId") == "0xresolved"
+        assert "closed" not in captured_calls[0]
+        assert captured_calls[1].get("conditionId") == "0xresolved"
+        assert captured_calls[1].get("closed") == "true"
+
+    @pytest.mark.asyncio
+    async def test_fetch_market_from_gamma_skips_fallback_on_default_hit(self):
+        """When the default call returns the market, we MUST NOT make
+        the closed=true call (no wasted HTTP traffic on the hot
+        sync_markets loop)."""
+        registry, _ = _make_registry()
+
+        active_payload = {
+            "question": "Live BTC market",
+            "category": "crypto",
+            "clobTokenIds": ["tok_yes", "tok_no"],
+            "endDateIso": "2027-01-01T00:00:00Z",
+            "volume24hr": 1000.0,
+            "closed": False,
+        }
+
+        responses = [_mock_response(200, [active_payload])]
+        captured_calls: list[dict] = []
+
+        @asynccontextmanager
+        async def fake_get(url, params=None, timeout=None):
+            captured_calls.append(dict(params or {}))
+            assert responses, "fallback call should not happen on default hit"
+            resp = responses.pop(0)
+            yield resp
+
+        session = MagicMock()
+        session.get = fake_get
+        session.__aenter__ = AsyncMock(return_value=session)
+        session.__aexit__ = AsyncMock(return_value=False)
+
+        with patch("aiohttp.ClientSession", return_value=session):
+            result = await registry._fetch_market_from_gamma("0xlive")
+
+        assert result == active_payload
+        assert len(captured_calls) == 1
+        assert "closed" not in captured_calls[0]
+
+    @pytest.mark.asyncio
+    async def test_fetch_market_from_gamma_returns_empty_when_both_calls_empty(self):
+        """If both default and closed=true return [], helper returns
+        {} so sync_markets keeps the row but doesn't crash."""
+        registry, _ = _make_registry()
+
+        responses = [
+            _mock_response(200, []),
+            _mock_response(200, []),
+        ]
+
+        @asynccontextmanager
+        async def fake_get(url, params=None, timeout=None):
+            resp = responses.pop(0)
+            yield resp
+
+        session = MagicMock()
+        session.get = fake_get
+        session.__aenter__ = AsyncMock(return_value=session)
+        session.__aexit__ = AsyncMock(return_value=False)
+
+        with patch("aiohttp.ClientSession", return_value=session):
+            result = await registry._fetch_market_from_gamma("0xnomatch")
+
+        assert result == {}

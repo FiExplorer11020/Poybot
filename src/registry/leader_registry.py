@@ -224,6 +224,7 @@ class LeaderRegistry:
             SELECT wallet_address FROM leaders
             WHERE (last_refresh IS NULL OR last_refresh < $1)
               AND excluded = FALSE
+            ORDER BY last_refresh ASC NULLS FIRST
             LIMIT 300
             """,
             stale_cutoff,
@@ -626,6 +627,11 @@ class LeaderRegistry:
             SELECT DISTINCT t.market_id FROM trades_observed t
             LEFT JOIN markets m ON m.market_id = t.market_id
             WHERE t.time > NOW() - INTERVAL '7 days'
+              -- Exclude source='onchain' rows: their market_id = token_id
+              -- placeholder (CLAUDE.md §15, pending Wave-3 decoder) would
+              -- feed garbage IDs to Falcon agent 574, burning quota and
+              -- inflating the unmapped_tokens DQ counter.
+              AND t.source IS DISTINCT FROM 'onchain'
               AND (m.end_date IS NULL OR m.end_date > NOW() - INTERVAL '24 hours')
               AND t.market_id NOT IN (
                   SELECT market_id FROM markets
@@ -739,6 +745,12 @@ class LeaderRegistry:
                             markets.liquidity_score_source
                         ),
                         fee_rate_pct   = EXCLUDED.fee_rate_pct,
+                        active         = CASE
+                            WHEN EXCLUDED.end_date IS NOT NULL
+                              AND EXCLUDED.end_date < NOW() - INTERVAL '24 hours'
+                            THEN FALSE
+                            ELSE markets.active
+                        END,
                         updated_at     = NOW()
                     """,
                     mid,
@@ -795,11 +807,41 @@ class LeaderRegistry:
         return count
 
     async def _fetch_market_from_gamma(self, market_id: str) -> dict:
+        """Fetch a market from Gamma's /markets endpoint.
+
+        Gamma's default /markets?conditionId=... only returns ACTIVE
+        markets. Resolved/closed markets return an empty list, which
+        used to leave sync_markets retrying the same `market_id`
+        forever (357+ unmapped tokens were stuck in that loop in
+        production). When the default call returns empty, we retry
+        once with `closed=true` so resolved markets are still mapped
+        and can be flipped to `active=FALSE` by the upsert in
+        sync_markets. Mirrors the closed-pagination pattern in
+        ``scripts/maintenance_loop.py:_fetch_gamma_closed_page``.
+        """
+        base = "https://gamma-api.polymarket.com/markets"
         try:
             async with aiohttp.ClientSession() as session:
+                # Default call: active markets only.
                 async with session.get(
-                    "https://gamma-api.polymarket.com/markets",
+                    base,
                     params={"conditionId": market_id, "limit": 1},
+                    timeout=aiohttp.ClientTimeout(total=8),
+                ) as resp:
+                    if resp.status == 200:
+                        rows = await resp.json()
+                        if isinstance(rows, list) and rows:
+                            return rows[0] or {}
+
+                # Fallback: closed/resolved markets. Gamma only returns
+                # these when `closed=true` is set explicitly.
+                async with session.get(
+                    base,
+                    params={
+                        "conditionId": market_id,
+                        "limit": 1,
+                        "closed": "true",
+                    },
                     timeout=aiohttp.ClientTimeout(total=8),
                 ) as resp:
                     if resp.status != 200:

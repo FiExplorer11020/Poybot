@@ -91,6 +91,13 @@ REFRESH_EVENT_TIMES_INTERVAL_S = 1800     # 30 min — refresh markets.is_live_m
                                           # of docs/autonomous_session_2026_05_17_strategy
                                           # /02_STRUCTURAL_FIX_PLAN.md (the bug that
                                           # cost 9 paper trades at -97% on 2026-05-17).
+SWEEP_EXPIRED_INTERVAL_S = 1800           # 30 min — flip ``active=FALSE`` on every
+                                          # market whose ``end_date`` slipped past
+                                          # NOW() - 1 day but Gamma's closed-list
+                                          # endpoint never picked up. Lever F of the
+                                          # 2026-05-17 backfill plan, run as a
+                                          # standalone cadence so the 6h
+                                          # full_backfill no longer owns it alone.
 
 REDIS_MARKET_RESOLVED_CHANNEL = "market:resolved"
 
@@ -204,18 +211,27 @@ async def refresh_gamma_markets(pool: asyncpg.Pool, *, max_pages: int = 30) -> t
                     if isinstance(tokens, list) and len(tokens) >= 2:
                         token_yes = str(tokens[0])
                         token_no = str(tokens[1])
+                    # Derive active from Gamma's `closed` flag. When
+                    # closed=TRUE we MUST flip active=FALSE so the
+                    # sweep + downstream gates respect the resolution.
+                    # When closed is falsy we preserve the existing
+                    # active value — the previous behaviour of forcing
+                    # TRUE was re-flipping markets the 30-min sweep had
+                    # just deactivated.
+                    closed = bool(m.get("closed"))
+                    active_preserve = not closed
                     res = await conn.execute(
                         """
                         UPDATE markets SET
                             end_date = COALESCE($2::timestamptz, end_date),
                             volume_24h = $3::numeric,
-                            active = TRUE,
+                            active = CASE WHEN $6::boolean THEN markets.active ELSE FALSE END,
                             token_yes = COALESCE($4::varchar, token_yes),
                             token_no = COALESCE($5::varchar, token_no),
                             updated_at = NOW()
                         WHERE market_id = $1::varchar
                         """,
-                        cid, end_date, vol, token_yes, token_no,
+                        cid, end_date, vol, token_yes, token_no, active_preserve,
                     )
                     if res.startswith("UPDATE 0"):
                         with suppress(Exception):
@@ -225,11 +241,11 @@ async def refresh_gamma_markets(pool: asyncpg.Pool, *, max_pages: int = 30) -> t
                                     (market_id, question, end_date, volume_24h,
                                      active, token_yes, token_no, updated_at)
                                 VALUES ($1::varchar, $2::text, $3::timestamptz, $4::numeric,
-                                        TRUE, $5::varchar, $6::varchar, NOW())
+                                        $7::boolean, $5::varchar, $6::varchar, NOW())
                                 ON CONFLICT (market_id) DO NOTHING
                                 """,
                                 cid, m.get("question", "")[:1000],
-                                end_date, vol, token_yes, token_no,
+                                end_date, vol, token_yes, token_no, active_preserve,
                             )
                             inserted += 1
                     else:
@@ -324,6 +340,35 @@ async def backfill_resolved_outcomes(
         offset += limit
 
     return fetched, resolved
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Job: sweep expired-but-still-active markets (Lever F, recurring)
+# ──────────────────────────────────────────────────────────────────────
+
+
+async def sweep_expired_active_markets(pool: asyncpg.Pool) -> int:
+    """Flip ``active=FALSE`` for every market whose ``end_date`` slipped
+    past ``NOW() - 1 day`` but the flag was never updated.
+
+    Mirrors ``scripts/backfill_gamma_resolutions_2026_05_17.sweep_expired_active_markets``
+    on a 30-min cadence so a long observer/engine outage no longer keeps
+    thousands of dead markets in the active set. Idempotent.
+    """
+    async with pool.acquire() as conn:
+        res = await conn.execute(
+            """
+            UPDATE markets
+            SET active = FALSE,
+                updated_at = NOW()
+            WHERE end_date < NOW() - INTERVAL '1 day'
+              AND active = TRUE
+            """
+        )
+    try:
+        return int(res.split()[-1])
+    except (IndexError, ValueError):
+        return 0
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -560,6 +605,13 @@ async def reconcile_profiles(pool: asyncpg.Pool) -> int:
 
     The behavior_profiler is supposed to maintain this, but it lags or
     misses when daemons restart. We backfill from the source of truth.
+
+    The ``sub.cnt > COALESCE(lp.trades_observed, 0)`` guard was removed
+    on 2026-05-17 — it prevented ``last_updated`` from refreshing for
+    leaders whose 90d trade count was unchanged, stranding 702 stale
+    profiles that the dashboard then surfaced as "no recent activity".
+    The set ``trades_observed = sub.cnt`` is idempotent when the count
+    matches so dropping the guard is safe.
     """
     async with pool.acquire() as conn:
         res = await conn.execute(
@@ -574,7 +626,6 @@ async def reconcile_profiles(pool: asyncpg.Pool) -> int:
                 GROUP BY wallet_address
             ) sub
             WHERE lp.wallet_address = sub.wallet_address
-              AND sub.cnt > COALESCE(lp.trades_observed, 0)
             """
         )
     return int(res.split()[-1]) if res else 0
@@ -790,6 +841,13 @@ async def main():
     )
     _log(f"[startup] gamma updated={gamma_u} inserted={gamma_i}")
 
+    # Sweep AFTER the gamma refresh so any end_date we just learned gets
+    # honoured on the first tick instead of waiting 30 min.
+    sweep_n = await run_with_recovery(
+        "sweep_expired", sweep_expired_active_markets, pool,
+    ) or 0
+    _log(f"[startup] sweep_expired flipped={sweep_n}")
+
     # First-tick backfill so historical resolutions get populated quickly
     # — paper_trader's resolved-close path needs this to avoid the 30d
     # defer-until-timeout failure mode.
@@ -854,11 +912,20 @@ async def main():
         "resolutions": time.monotonic(),
         "orphan_close": time.monotonic(),
         "promote_watchlist": time.monotonic(),
-        "full_backfill": time.monotonic(),
+        # Init at 0 so the 6h full_backfill (which contains
+        # sweep_expired_active_markets) fires within 30s of daemon
+        # restart — without this, 5000+ expired markets stay
+        # active=TRUE for up to 6 hours after every deploy.
+        "full_backfill": 0.0,
         # Initialise at 0 so the first tick happens within 30s of
         # daemon start — sport markets that became live during a
         # restart get flagged immediately.
         "event_times": 0.0,
+        # Init at 0 so the first tick fires within 30s — the startup
+        # call has already run, but if startup is short-circuited (e.g.
+        # SIGTERM mid-startup) we still want the very next loop pass
+        # to flip stale rows instead of waiting 30 min.
+        "sweep_expired": 0.0,
     }
 
     while _running:
@@ -955,6 +1022,13 @@ async def main():
                 _log(f"event_times: {summary}")
             asyncio.create_task(_bg_event_times())
             last_run["event_times"] = now
+
+        if now - last_run["sweep_expired"] > SWEEP_EXPIRED_INTERVAL_S:
+            n = await run_with_recovery(
+                "sweep_expired", sweep_expired_active_markets, pool,
+            ) or 0
+            _log(f"sweep_expired: flipped={n}")
+            last_run["sweep_expired"] = now
 
         if now - last_run["full_backfill"] > FULL_BACKFILL_INTERVAL_S:
             # Don't block the maintenance loop on a multi-minute scan
