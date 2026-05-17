@@ -241,6 +241,32 @@ def format_drawdown_threshold(payload: dict) -> str:
     )
 
 
+def format_backfill_lag_alert(payload: dict) -> str:
+    """``backfill_resolved_outcomes`` lag exceeds operator threshold.
+
+    Fired when the 30-min maintenance pass finishes and the count of
+    markets with ``active=FALSE AND resolved_outcome IS NULL`` is still
+    above ``BACKFILL_LAG_ALERT_THRESHOLD``. Indicates Gamma is rate-
+    limiting us, the batch size is too small for the inflow, or the
+    endpoint is degraded — operator should investigate.
+    """
+    missing = payload.get("missing_count", "?")
+    threshold = payload.get("threshold", "?")
+    try:
+        missing_str = f"{int(missing):,}"
+    except (TypeError, ValueError):
+        missing_str = str(missing)
+    try:
+        thr_str = f"{int(threshold):,}"
+    except (TypeError, ValueError):
+        thr_str = str(threshold)
+    return (
+        f"🚧 BACKFILL LAG — resolved_outcome catch-up falling behind\n"
+        f"missing: {missing_str}  threshold: {thr_str}\n"
+        f"check Gamma 429s / batch size / endpoint health"
+    )
+
+
 def format_drift_detected(payload: dict) -> str:
     """Profiler CUSUM drift detection event."""
     wallet = _short(payload.get("wallet"), n=10)

@@ -30,6 +30,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import random
 import signal
 import sys
 import time
@@ -39,6 +40,8 @@ from datetime import datetime, timezone
 import aiohttp
 import asyncpg
 import redis.asyncio as redis_async
+
+from src.config import settings
 
 DB_URL = os.environ.get("DATABASE_URL")
 REDIS_URL = os.environ.get("REDIS_URL", "redis://redis:6379/0")
@@ -100,6 +103,17 @@ SWEEP_EXPIRED_INTERVAL_S = 1800           # 30 min — flip ``active=FALSE`` on 
                                           # full_backfill no longer owns it alone.
 
 REDIS_MARKET_RESOLVED_CHANNEL = "market:resolved"
+REDIS_BACKFILL_LAG_ALERT_CHANNEL = "engine:backfill:lag_alert"
+
+# Hard cap on consecutive HTTP 429 hits on the SAME endpoint before we
+# bail out and log ERROR. Prevents a degraded Gamma from monopolising
+# the maintenance loop's 30-min slot. Note: this is consecutive — a
+# single success resets the counter.
+BACKFILL_MAX_CONSECUTIVE_429 = 5
+
+# Jitter band on the computed backoff. Picked at ±20% so worst-case the
+# next attempt fires at 1.2× the nominal sleep — well under cap.
+BACKFILL_RETRY_JITTER = 0.20
 
 _running = True
 
@@ -261,7 +275,12 @@ async def refresh_gamma_markets(pool: asyncpg.Pool, *, max_pages: int = 30) -> t
 
 async def _fetch_gamma_closed_page(session, offset, limit=500):
     """Paginate Gamma closed markets. Returns [] on any failure so the
-    caller can log + skip without crashing the loop."""
+    caller can log + skip without crashing the loop.
+
+    Kept for back-compat with ``close_orphan_resolved_positions`` which
+    is happy with a swallow-all-errors paginator. The robust backfill
+    path uses ``_fetch_gamma_closed_page_robust`` for retry semantics.
+    """
     params = {
         "limit": limit, "offset": offset,
         "closed": "true", "active": "false",
@@ -278,50 +297,235 @@ async def _fetch_gamma_closed_page(session, offset, limit=500):
         return []
 
 
+def _compute_backoff(attempt: int, *, initial: float, cap: float) -> float:
+    """Exponential backoff with ±BACKFILL_RETRY_JITTER jitter.
+
+    ``attempt`` is 0-indexed for the first failure. The base delay is
+    ``initial × 2**attempt`` clamped to ``cap``. Jitter is applied
+    multiplicatively (1 - j .. 1 + j) so the spread is symmetric and
+    never produces negative sleeps even for tiny initial values.
+    """
+    base = min(cap, initial * (2 ** max(0, attempt)))
+    j = BACKFILL_RETRY_JITTER
+    factor = 1.0 + random.uniform(-j, j)
+    return max(0.0, min(cap, base * factor))
+
+
+async def _fetch_gamma_closed_page_robust(
+    session: aiohttp.ClientSession,
+    *,
+    offset: int,
+    limit: int,
+    initial_backoff_s: float,
+    max_backoff_s: float,
+) -> tuple[list[dict], int]:
+    """Paginate Gamma closed markets WITH retry semantics on HTTP 429.
+
+    Order matters for the backfill: we ask Gamma for the oldest-resolved
+    first (``order=endDate&ascending=true``) so stable resolutions get
+    populated before fresh ones. The endpoint occasionally rate-limits;
+    we obey ``Retry-After`` when present and otherwise fall back to
+    exponential backoff with jitter.
+
+    Returns ``(markets, retries_consumed)``. If the same endpoint hits
+    HTTP 429 more than ``BACKFILL_MAX_CONSECUTIVE_429`` times we give
+    up and return ``([], retries_consumed)`` so the caller can log ERROR
+    and move on.
+    """
+    params = {
+        "limit": str(limit), "offset": str(offset),
+        "closed": "true", "active": "false",
+        "order": "endDate", "ascending": "true",
+    }
+    consecutive_429 = 0
+    retries = 0
+    attempt = 0
+
+    while consecutive_429 < BACKFILL_MAX_CONSECUTIVE_429:
+        try:
+            async with session.get(
+                GAMMA_URL, params=params,
+                timeout=aiohttp.ClientTimeout(total=30),
+            ) as resp:
+                if resp.status == 429:
+                    consecutive_429 += 1
+                    retries += 1
+                    retry_after = resp.headers.get("Retry-After")
+                    sleep_s: float
+                    if retry_after:
+                        try:
+                            sleep_s = max(0.0, min(max_backoff_s, float(retry_after)))
+                        except (TypeError, ValueError):
+                            sleep_s = _compute_backoff(
+                                attempt, initial=initial_backoff_s, cap=max_backoff_s,
+                            )
+                    else:
+                        sleep_s = _compute_backoff(
+                            attempt, initial=initial_backoff_s, cap=max_backoff_s,
+                        )
+                    _log(
+                        f"[backfill_resolved] 429 offset={offset} "
+                        f"attempt={attempt + 1}/{BACKFILL_MAX_CONSECUTIVE_429} "
+                        f"sleep={sleep_s:.1f}s (retry_after={retry_after!r})"
+                    )
+                    attempt += 1
+                    await asyncio.sleep(sleep_s)
+                    continue
+                if resp.status != 200:
+                    _log(
+                        f"[backfill_resolved] non-200 status={resp.status} "
+                        f"offset={offset}; skipping page"
+                    )
+                    return [], retries
+                payload = await resp.json()
+                if not isinstance(payload, list):
+                    _log(
+                        f"[backfill_resolved] unexpected payload type "
+                        f"{type(payload).__name__} at offset={offset}"
+                    )
+                    return [], retries
+                return payload, retries
+        except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+            # Treat network errors like a 429 (transient) so a single
+            # blip doesn't abort the run. Same consecutive counter.
+            consecutive_429 += 1
+            retries += 1
+            sleep_s = _compute_backoff(
+                attempt, initial=initial_backoff_s, cap=max_backoff_s,
+            )
+            _log(
+                f"[backfill_resolved] network error offset={offset} "
+                f"attempt={attempt + 1}: {type(exc).__name__}: {exc}; "
+                f"sleep={sleep_s:.1f}s"
+            )
+            attempt += 1
+            await asyncio.sleep(sleep_s)
+            continue
+
+    _log(
+        f"[backfill_resolved] giving up on offset={offset} after "
+        f"{BACKFILL_MAX_CONSECUTIVE_429} consecutive 429s/errors"
+    )
+    return [], retries
+
+
+def _parse_resolved_outcome(market: dict) -> str | None:
+    """Robustly extract the resolved outcome from a Gamma market payload.
+
+    Returns "yes" / "no" or None when the payload is malformed (missing
+    field, unparseable JSON, non-numeric prices). Callers should log
+    a warning + skip the row on None — never crash the run.
+
+    Convention (Polymarket binary markets): ``outcomes[0]`` is YES,
+    ``outcomes[1]`` is NO. ``outcomePrices[0] > 0.5`` ⇒ YES winner.
+    """
+    prices = market.get("outcomePrices")
+    if isinstance(prices, str):
+        try:
+            prices = json.loads(prices)
+        except (ValueError, TypeError):
+            return None
+    if not isinstance(prices, list) or len(prices) < 1:
+        return None
+    try:
+        yes_terminal = float(prices[0])
+    except (TypeError, ValueError):
+        return None
+    return "yes" if yes_terminal > 0.5 else "no"
+
+
 async def backfill_resolved_outcomes(
-    pool: asyncpg.Pool, session: aiohttp.ClientSession,
-) -> tuple[int, int]:
+    pool: asyncpg.Pool,
+    session: aiohttp.ClientSession,
+    *,
+    redis_client=None,
+    batch_size: int | None = None,
+    lag_alert_threshold: int | None = None,
+    initial_backoff_s: float | None = None,
+    max_backoff_s: float | None = None,
+) -> dict:
     """Populate markets.resolved_outcome from Gamma closed-market data.
 
     Without this, paper_trader's resolved-market close path defers
     indefinitely (up to a 30-day timeout) because it can't read a
     terminal value for the YES/NO outcome. We mirror Gamma's
-    `outcomePrices[0]` → "yes" if > 0.5 else "no".
+    ``outcomePrices[0]`` → "yes" if > 0.5 else "no".
 
-    Only UPSERT where resolved_outcome IS NULL — preserves manual
-    operator overrides. Idempotent and hot-deploy safe.
+    Robust rewrite (2026-05-17): paginated fetch, exponential backoff
+    with jitter on HTTP 429, ``Retry-After`` honoured, idempotent UPDATE
+    (``WHERE resolved_outcome IS NULL``), parse-or-skip on malformed
+    payloads, lag alert via Redis when the post-run remaining count
+    exceeds ``BACKFILL_LAG_ALERT_THRESHOLD``.
+
+    Returns a metrics dict ``{scanned, fetched, populated,
+    skipped_malformed, retried_429, run_duration_s, missing_after,
+    lag_alert_fired}``. Kept for parity with the rest of the
+    maintenance jobs which all surface their counters via the log line
+    emitted by ``run_with_recovery``.
     """
-    fetched = 0
-    resolved = 0
-    offset = 0
-    limit = 500
-    # Hard cap on pages so a Gamma misbehavior can't stall the loop.
-    max_pages = 50
+    started_monotonic = time.monotonic()
+    cfg_batch = int(batch_size if batch_size is not None else settings.BACKFILL_BATCH_SIZE)
+    cfg_thr = int(
+        lag_alert_threshold if lag_alert_threshold is not None
+        else settings.BACKFILL_LAG_ALERT_THRESHOLD
+    )
+    cfg_init = float(
+        initial_backoff_s if initial_backoff_s is not None
+        else settings.BACKFILL_RETRY_INITIAL_S
+    )
+    cfg_max = float(
+        max_backoff_s if max_backoff_s is not None
+        else settings.BACKFILL_RETRY_MAX_S
+    )
 
-    for _ in range(max_pages):
-        markets = await _fetch_gamma_closed_page(session, offset=offset, limit=limit)
+    page_size = 100  # Gamma's stable page size for closed-market scans
+    offset = 0
+    scanned = 0
+    fetched = 0
+    populated = 0
+    skipped_malformed = 0
+    retried_429 = 0
+
+    while scanned < cfg_batch:
+        # Cap the last page so we never request more than the remaining
+        # batch budget — Gamma will happily return 100 rows we'd then
+        # have to throw away.
+        page_limit = min(page_size, cfg_batch - scanned)
+        markets, retries = await _fetch_gamma_closed_page_robust(
+            session,
+            offset=offset,
+            limit=page_limit,
+            initial_backoff_s=cfg_init,
+            max_backoff_s=cfg_max,
+        )
+        retried_429 += retries
         if not markets:
             break
+        scanned += len(markets)
         fetched += len(markets)
 
         async with pool.acquire() as conn:
             for m in markets:
                 if not m.get("closed"):
+                    # Defensive: filter on the caller side too in case
+                    # Gamma starts returning mixed pages.
                     continue
                 cid = m.get("conditionId") or m.get("condition_id")
                 if not cid:
+                    skipped_malformed += 1
+                    _log(
+                        f"[backfill_resolved] skipped malformed: "
+                        f"missing conditionId"
+                    )
                     continue
-                prices = m.get("outcomePrices")
-                if isinstance(prices, str):
-                    with suppress(Exception):
-                        prices = json.loads(prices)
-                if not isinstance(prices, list) or len(prices) < 1:
+                outcome = _parse_resolved_outcome(m)
+                if outcome is None:
+                    skipped_malformed += 1
+                    _log(
+                        f"[backfill_resolved] skipped malformed market="
+                        f"{cid}: outcomePrices unparseable"
+                    )
                     continue
-                try:
-                    yes_terminal = float(prices[0])
-                except (TypeError, ValueError):
-                    continue
-                outcome = "yes" if yes_terminal > 0.5 else "no"
                 res = await conn.execute(
                     """
                     UPDATE markets
@@ -332,14 +536,71 @@ async def backfill_resolved_outcomes(
                     """,
                     cid, outcome,
                 )
-                if res and not res.endswith("0"):
-                    resolved += 1
+                # asyncpg returns "UPDATE <n>"; only count actual writes.
+                if res and not res.endswith(" 0"):
+                    populated += 1
 
-        if len(markets) < limit:
+        if len(markets) < page_limit:
+            # Tail page — Gamma had nothing more for our filter window.
             break
-        offset += limit
+        offset += len(markets)
 
-    return fetched, resolved
+    # Lag accounting: how many rows still need a resolved_outcome?
+    # The SQL is cheap (indexed scan on a partial filter); we always run
+    # it so the operator can see "we're catching up" in the log even on
+    # quiet runs where no alert fires.
+    missing_after = 0
+    try:
+        async with pool.acquire() as conn:
+            missing_after = int(
+                await conn.fetchval(
+                    """
+                    SELECT COUNT(*) FROM markets
+                    WHERE active = FALSE AND resolved_outcome IS NULL
+                    """
+                ) or 0
+            )
+    except Exception as exc:
+        _log(f"[backfill_resolved] missing-count probe failed: {exc}")
+
+    lag_alert_fired = False
+    if missing_after > cfg_thr and redis_client is not None:
+        envelope = {
+            "type": "backfill_resolved_outcomes_lag",
+            "missing_count": missing_after,
+            "threshold": cfg_thr,
+            "ts": datetime.now(timezone.utc).isoformat(),
+        }
+        try:
+            await redis_client.publish(
+                REDIS_BACKFILL_LAG_ALERT_CHANNEL, json.dumps(envelope)
+            )
+            lag_alert_fired = True
+            _log(
+                f"[backfill_resolved] LAG ALERT — missing_after="
+                f"{missing_after} threshold={cfg_thr}"
+            )
+        except Exception as exc:
+            _log(f"[backfill_resolved] lag-alert publish failed: {exc}")
+
+    duration_s = round(time.monotonic() - started_monotonic, 2)
+    _log(
+        f"[backfill_resolved] scanned={scanned} fetched={fetched} "
+        f"populated={populated} skipped_malformed={skipped_malformed} "
+        f"retried_429={retried_429} missing_after={missing_after} "
+        f"lag_alert={lag_alert_fired} run_duration_s={duration_s}"
+    )
+
+    return {
+        "scanned": scanned,
+        "fetched": fetched,
+        "populated": populated,
+        "skipped_malformed": skipped_malformed,
+        "retried_429": retried_429,
+        "run_duration_s": duration_s,
+        "missing_after": missing_after,
+        "lag_alert_fired": lag_alert_fired,
+    }
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -851,15 +1112,14 @@ async def main():
     # First-tick backfill so historical resolutions get populated quickly
     # — paper_trader's resolved-close path needs this to avoid the 30d
     # defer-until-timeout failure mode.
-    res_fetched, res_resolved = (
+    res_summary = (
         await run_with_recovery(
-            "resolutions", backfill_resolved_outcomes, pool, http_session,
+            "resolutions", backfill_resolved_outcomes,
+            pool, http_session, redis_client=redis_client,
         )
-        or (0, 0)
+        or {}
     )
-    _log(
-        f"[startup] resolutions fetched={res_fetched} populated={res_resolved}"
-    )
+    _log(f"[startup] resolutions {res_summary}")
 
     prof_n = await run_with_recovery("profiles", reconcile_profiles, pool) or 0
     _log(f"[startup] profiles updated={prof_n}")
@@ -973,14 +1233,14 @@ async def main():
             last_run["trim"] = now
 
         if now - last_run["resolutions"] > RESOLUTION_BACKFILL_INTERVAL_S:
-            f, r = (
+            summary = (
                 await run_with_recovery(
                     "resolutions", backfill_resolved_outcomes,
-                    pool, http_session,
+                    pool, http_session, redis_client=redis_client,
                 )
-                or (0, 0)
+                or {}
             )
-            _log(f"resolutions: fetched={f} populated={r}")
+            _log(f"resolutions: {summary}")
             last_run["resolutions"] = now
 
         if now - last_run["orphan_close"] > ORPHAN_CLOSE_INTERVAL_S:

@@ -22,6 +22,7 @@ Channel coverage by tier (filtered against settings.TELEGRAM_VERBOSITY):
     profiler:phase:upgraded
     engine:watchdog:restarted
     engine:position:market_resolved
+    engine:backfill:lag_alert
 
   INFO (sent in "verbose" and above):
     positions:paper_opened, positions:paper_closed
@@ -103,6 +104,10 @@ CHANNEL_LEADER_EXCLUDED = "registry:leader:excluded"
 CHANNEL_RUNTIME_CONFIG_CHANGED = "runtime_config:changed"
 # A market we hold a position in resolved. Includes outcome + our PnL.
 CHANNEL_MARKET_RESOLVED_POSITION = "engine:position:market_resolved"
+# maintenance_loop.backfill_resolved_outcomes lag exceeds threshold:
+# Gamma is rate-limiting us or the endpoint is degraded and the
+# (active=FALSE AND resolved_outcome IS NULL) count is still climbing.
+CHANNEL_BACKFILL_LAG_ALERT = "engine:backfill:lag_alert"
 
 
 ALL_CHANNELS: tuple[str, ...] = (
@@ -124,6 +129,7 @@ ALL_CHANNELS: tuple[str, ...] = (
     CHANNEL_LEADER_EXCLUDED,
     CHANNEL_RUNTIME_CONFIG_CHANGED,
     CHANNEL_MARKET_RESOLVED_POSITION,
+    CHANNEL_BACKFILL_LAG_ALERT,
 )
 
 
@@ -147,6 +153,7 @@ CHANNEL_TIER: dict[str, int] = {
     CHANNEL_PHASE_UPGRADED: TIER_ALERT,
     CHANNEL_WATCHDOG_RESTART: TIER_ALERT,
     CHANNEL_MARKET_RESOLVED_POSITION: TIER_ALERT,
+    CHANNEL_BACKFILL_LAG_ALERT: TIER_ALERT,
 
     CHANNEL_PAPER_OPENED: TIER_INFO,
     CHANNEL_PAPER_CLOSED: TIER_INFO,
@@ -387,6 +394,8 @@ class TelegramNotifier:
             return formatters.format_runtime_config_changed(payload)
         if channel == CHANNEL_MARKET_RESOLVED_POSITION:
             return formatters.format_market_resolved_position(payload)
+        if channel == CHANNEL_BACKFILL_LAG_ALERT:
+            return formatters.format_backfill_lag_alert(payload)
         logger.warning(f"TelegramNotifier: unknown channel {channel!r}")
         return None
 

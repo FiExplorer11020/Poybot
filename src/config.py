@@ -293,6 +293,17 @@ class Settings(BaseSettings):
     # gating signal generation (looser is fine), the paper trader is
     # gating real money (effectively).
     MAX_BOOK_AGE_PAPER_S: float = 60.0
+    # ── Audit 2026-05-17 (QW4) — book-spread sanity gate ───────────────
+    # `_get_book_quote` already gated on staleness (B2) and on the basic
+    # invariant `bid < ask`, but it still accepted books like
+    # ``best_bid=0.001, best_ask=0.999`` — the typical pre-UMA binary
+    # wall. A mid built from such a book is meaningless; using it to
+    # trigger TP/SL in the monitor loop produced the May 15 pattern A
+    # (mid-biased phantom-win closes). Reject any quote whose
+    # ``(ask - bid) / mid`` exceeds this fraction. The B2 staleness
+    # gate stays intact: spread is checked AFTER the existing freshness
+    # + bid<ask invariants. Default 0.30 = 30%.
+    MAX_BOOK_SPREAD_PCT: float = 0.30
     # Upper bound on entry_ask (the actual fill price) for BOTH FOLLOW
     # and FADE. The legacy FOLLOW-only check left a hole on FADE — buying
     # the opposite token at 0.85 has the same asymmetric loss profile.
@@ -1462,6 +1473,24 @@ class Settings(BaseSettings):
     CALIBRATION_TELEGRAM_RATE_LIMIT_S: float = 3600.0
     # Initial cold-start backfill window for the daemon.
     CALIBRATION_INITIAL_BACKFILL_DAYS: int = 90
+
+    # ------------------------------------------------------------------ #
+    # Maintenance loop — backfill_resolved_outcomes (S2-A robust rewrite) #
+    # ------------------------------------------------------------------ #
+    # Max number of markets the 30-min backfill processes per run. At
+    # 500 markets × 48 ticks/day → ~24k/day, so the 103k-row prod backlog
+    # drains in ~4-5 days. Tunable at runtime via env override.
+    BACKFILL_BATCH_SIZE: int = 500
+    # Exponential backoff on Gamma HTTP 429. Starts at INITIAL_S, doubles
+    # on each consecutive failure up to MAX_S. We honour the `Retry-After`
+    # header when present (overrides the computed delay).
+    BACKFILL_RETRY_INITIAL_S: float = 5.0
+    BACKFILL_RETRY_MAX_S: float = 600.0
+    # If after a run the remaining (active=FALSE AND resolved_outcome
+    # IS NULL) count exceeds this threshold, publish an alert envelope on
+    # ``engine:backfill:lag_alert`` and log ERROR. Triggers operator
+    # attention so a stalled Gamma endpoint doesn't silently grow the lag.
+    BACKFILL_LAG_ALERT_THRESHOLD: int = 1000
 
     @field_validator("CALIBRATION_DRIFT_Z_THRESHOLD")
     @classmethod
