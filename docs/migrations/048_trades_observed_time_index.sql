@@ -1,0 +1,33 @@
+-- ============================================================================
+-- 048_trades_observed_time_index.sql
+--
+-- Add a btree index on trades_observed.time alone.
+--
+-- 2026-05-17 LAB diagnostic: the R10 RelatedMarketResolver (called
+-- hourly by the new causal_instruments_hourly scheduler job) does
+--   SELECT DISTINCT wallet_address, market_id
+--   FROM trades_observed
+--   WHERE time >= NOW() - INTERVAL '1 day'
+--     AND source IS DISTINCT FROM 'onchain'
+-- and times out (>60s) because `time` is only present as a TRAILING
+-- column in the existing composite indexes:
+--   * trades_observed_new_pkey         (id, time)
+--   * uq_trades_observed_natural_key   (wallet_address, market_id, time, side, price, size_usdc)
+--   * idx_trades_observed_token_id_time (token_id, time DESC)
+-- None of these can be used for a leading `WHERE time >= …` seek,
+-- so the planner falls back to a sequential scan over millions of rows.
+--
+-- A standalone btree on `time` makes the range scan O(log n) + the
+-- DISTINCT pass on a much smaller working set.
+--
+-- CONCURRENTLY: zero-downtime — the table stays writeable during the
+-- build. PostgreSQL builds the index in a separate transaction, so this
+-- migration is NOT wrapped in BEGIN/COMMIT.
+--
+-- IF NOT EXISTS: idempotent — re-applying the migration is a no-op,
+-- which lets the maintenance loop bootstrap_db pass run it every
+-- container boot without failing on the second run.
+-- ============================================================================
+
+CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_trades_observed_time
+    ON trades_observed (time);
