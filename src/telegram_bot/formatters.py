@@ -267,6 +267,57 @@ def format_backfill_lag_alert(payload: dict) -> str:
     )
 
 
+def format_paper_audit_divergence(payload: dict) -> str:
+    """Pillar 2 nightly reconciliation — one or more divergences inscribed.
+
+    Payload: {"type": "reconciliation_nightly", "run_id": str,
+              "scanned": int, "divergences": {flag: count},
+              "total_db_pnl": float, "total_truth_pnl": float,
+              "discrepancy": float, "alarming": bool,
+              "top_3_worst": [{trade_id, flag, delta, market_id,
+              direction}, ...], "ts": str}
+    """
+    scanned = payload.get("scanned", "?")
+    divergences = payload.get("divergences") or {}
+    total_db = payload.get("total_db_pnl")
+    total_truth = payload.get("total_truth_pnl")
+    discrepancy = payload.get("discrepancy")
+    alarming = bool(payload.get("alarming"))
+    top_3 = payload.get("top_3_worst") or []
+
+    if isinstance(divergences, dict) and divergences:
+        n_total = sum(int(v) for v in divergences.values() if isinstance(v, (int, float)))
+        flag_str = ", ".join(
+            f"{int(v)} {k}" for k, v in divergences.items() if isinstance(v, (int, float))
+        )
+    else:
+        n_total = 0
+        flag_str = "(none)"
+
+    icon = "🚨" if alarming else "📊"
+    header = f"{icon} NIGHTLY RECONCILIATION — divergences detected"
+    lines = [
+        header,
+        f"scanned: {scanned} closed trades",
+        f"divergences: {n_total} ({flag_str})",
+        f"total DB:    {_money(total_db)}",
+        f"total truth: {_money(total_truth)}",
+        f"discrepancy: {_money(discrepancy)}",
+    ]
+    if top_3:
+        lines.append("")
+        lines.append("top 3 worst:")
+        for entry in top_3[:3]:
+            if not isinstance(entry, dict):
+                continue
+            tid = entry.get("trade_id", "?")
+            flag = entry.get("flag", "?")
+            delta = entry.get("delta")
+            mkt = _short(entry.get("market_id"))
+            lines.append(f"#{tid}  {flag}  {_money(delta)} ({mkt})")
+    return "\n".join(lines)
+
+
 def format_drift_detected(payload: dict) -> str:
     """Profiler CUSUM drift detection event."""
     wallet = _short(payload.get("wallet"), n=10)

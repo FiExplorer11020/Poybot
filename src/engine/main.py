@@ -497,6 +497,47 @@ async def main() -> None:
         logger.warning(
             f"Scheduler: skipping causal_instruments_hourly registration: {exc}"
         )
+
+    # Pillar 2 (audit 2026-05-17) — Gamma reconciliation nightly.
+    # Runs at 04:00 UTC, AFTER backfill_resolved_outcomes has had a
+    # chance to populate markets.resolved_outcome from the closed-page
+    # paginator. The reconciliation pass replays every paper trade
+    # closed within the last 30 days, computes the theoretical PnL
+    # Polymarket would settle, and UPSERTs into paper_close_divergences
+    # when |db - truth| > 2 USDC. Publishes paper:audit:divergence to
+    # Redis with the top-3-worst when at least one new divergence is
+    # inscribed — the Telegram notifier picks it up (ALERT tier).
+    try:
+        from scripts.reconciliation import reconcile_closed_trades
+        from src.database import connection as _db_conn
+
+        async def _reconcile_closed_trades_job() -> None:
+            pool = _db_conn._pool
+            if pool is None:
+                logger.warning(
+                    "Scheduler: reconcile_closed_trades skipped — DB pool not initialized"
+                )
+                return
+            # Reuse the PriceOracle's owned aiohttp session — it's
+            # already kept alive for Gamma /markets cache; no need to
+            # spin up a separate connection pool for nightly work.
+            session = await price_oracle._ensure_session()
+            await reconcile_closed_trades(
+                pool=pool,
+                redis_client=redis_client,
+                http_session=session,
+            )
+
+        scheduler.add_cron(
+            "reconcile_closed_trades",
+            _reconcile_closed_trades_job,
+            hour=4,
+            minute=0,
+        )
+    except Exception as exc:  # pragma: no cover — graceful degrade
+        logger.warning(
+            f"Scheduler: skipping reconcile_closed_trades registration: {exc}"
+        )
     await scheduler.start()
     # ------------------------------------------------------------------- #
 

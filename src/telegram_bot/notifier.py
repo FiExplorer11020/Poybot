@@ -23,6 +23,7 @@ Channel coverage by tier (filtered against settings.TELEGRAM_VERBOSITY):
     engine:watchdog:restarted
     engine:position:market_resolved
     engine:backfill:lag_alert
+    paper:audit:divergence
 
   INFO (sent in "verbose" and above):
     positions:paper_opened, positions:paper_closed
@@ -108,6 +109,11 @@ CHANNEL_MARKET_RESOLVED_POSITION = "engine:position:market_resolved"
 # Gamma is rate-limiting us or the endpoint is degraded and the
 # (active=FALSE AND resolved_outcome IS NULL) count is still climbing.
 CHANNEL_BACKFILL_LAG_ALERT = "engine:backfill:lag_alert"
+# Pillar 2 (audit 2026-05-17) — nightly Gamma reconciliation emitted a
+# new ``paper_close_divergences`` row. Carries flag distribution +
+# top-3-worst so the operator can spot the +39,784 USDC class of
+# phantom PnL without scrolling the dashboard.
+CHANNEL_PAPER_AUDIT_DIVERGENCE = "paper:audit:divergence"
 
 
 ALL_CHANNELS: tuple[str, ...] = (
@@ -130,6 +136,7 @@ ALL_CHANNELS: tuple[str, ...] = (
     CHANNEL_RUNTIME_CONFIG_CHANGED,
     CHANNEL_MARKET_RESOLVED_POSITION,
     CHANNEL_BACKFILL_LAG_ALERT,
+    CHANNEL_PAPER_AUDIT_DIVERGENCE,
 )
 
 
@@ -154,6 +161,7 @@ CHANNEL_TIER: dict[str, int] = {
     CHANNEL_WATCHDOG_RESTART: TIER_ALERT,
     CHANNEL_MARKET_RESOLVED_POSITION: TIER_ALERT,
     CHANNEL_BACKFILL_LAG_ALERT: TIER_ALERT,
+    CHANNEL_PAPER_AUDIT_DIVERGENCE: TIER_ALERT,
 
     CHANNEL_PAPER_OPENED: TIER_INFO,
     CHANNEL_PAPER_CLOSED: TIER_INFO,
@@ -396,6 +404,8 @@ class TelegramNotifier:
             return formatters.format_market_resolved_position(payload)
         if channel == CHANNEL_BACKFILL_LAG_ALERT:
             return formatters.format_backfill_lag_alert(payload)
+        if channel == CHANNEL_PAPER_AUDIT_DIVERGENCE:
+            return formatters.format_paper_audit_divergence(payload)
         logger.warning(f"TelegramNotifier: unknown channel {channel!r}")
         return None
 
