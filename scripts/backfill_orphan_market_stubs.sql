@@ -34,12 +34,20 @@
 
 \timing on
 
+-- Stubs are inserted with active=FALSE: they are placeholders for trades
+-- whose real market metadata is either unknown (Wave-3 onchain rows whose
+-- market_id is really a token_id) or temporarily missing. A stub marked
+-- active=TRUE would inflate the data_quality "unmapped_tokens" counter
+-- (which filters by markets.active=TRUE) by tens of thousands and obscure
+-- the real backlog of genuinely-active live markets that still need
+-- enrichment.
 WITH inserted AS (
-    INSERT INTO markets (market_id, question, category)
+    INSERT INTO markets (market_id, question, category, active)
     SELECT DISTINCT
         t.market_id,
         'Market ' || substring(t.market_id, 1, 30) || '…' AS question,
-        'unknown' AS category
+        'unknown' AS category,
+        FALSE AS active
     FROM trades_observed t
     LEFT JOIN markets m USING (market_id)
     WHERE m.market_id IS NULL
@@ -47,3 +55,15 @@ WITH inserted AS (
     RETURNING 1
 )
 SELECT COUNT(*) AS orphan_stubs_created FROM inserted;
+
+-- Safety net: if anyone re-runs this script after stubs already exist
+-- (e.g., earlier version of the script without the `active=FALSE` in
+-- the INSERT, or a future operator who accidentally flips them back),
+-- this idempotent UPDATE keeps the invariant clean. Targets ONLY rows
+-- that look like our stubs (unknown category + both tokens NULL).
+UPDATE markets
+SET active = FALSE
+WHERE category = 'unknown'
+  AND token_yes IS NULL
+  AND token_no IS NULL
+  AND active = TRUE;
