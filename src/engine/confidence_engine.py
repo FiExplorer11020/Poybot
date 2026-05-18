@@ -229,6 +229,28 @@ class ConfidenceEngine:
             )
             return None
 
+        # ── Plan 2026-05-19 P1-3 — leader_sell_side pre-filter ─────────
+        # The paper_trader rejects leader_sell_side at open_trade() with
+        # reason `leader_sell_side`, but the engine doesn't pre-filter.
+        # This was costing us a full Kelly + signal_audit DB read per
+        # rejected SELL. Filter at the engine head so SELL trades never
+        # reach the decision-emission path. Keep the log so the
+        # dashboard counter (~24% rejection rate when leaders trim
+        # positions) is visible.
+        leader_side = (trade.get("side") or "").lower()
+        if leader_side == "sell":
+            await self._log_decision(
+                wallet,
+                market_id,
+                "skip",
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                "leader_sell_side",
+            )
+            return None
+
         trade_time, trade_age_s = self._trade_age_s(trade)
         if trade_age_s > float(settings.LIVE_DECISION_MAX_TRADE_AGE_S):
             # 2026-05-17 round 2 diagnosis: this gate was silently dropping
@@ -327,7 +349,27 @@ class ConfidenceEngine:
                             volume_source = "trades_observed.last_24h"
         except Exception:
             market_volume = 0.0
-        if market_volume < 5000.0:
+        # Plan 2026-05-19 P0-4: liquidity floor is now runtime-tunable.
+        # The legacy hardcoded 5000.0 was producing 24% of skip reasons
+        # on fresh markets where leaders were actively trading
+        # (live diagnostic 2026-05-18 showed vol24h<80$ markets being
+        # rejected). Default lowered to 1000 USDC; falls back to settings
+        # if runtime_config is unreachable.
+        try:
+            from src.control.runtime_config import get_runtime_config
+            _liq_cfg = get_runtime_config()
+            _eff_cfg = await _liq_cfg.effective()
+            min_liquidity = float(
+                _eff_cfg.get(
+                    "min_market_liquidity_usdc",
+                    getattr(settings, "MIN_MARKET_LIQUIDITY_USDC", 1_000.0),
+                )
+            )
+        except Exception:
+            min_liquidity = float(
+                getattr(settings, "MIN_MARKET_LIQUIDITY_USDC", 1_000.0)
+            )
+        if market_volume < min_liquidity:
             if market_volume == 0.0 and observed_volume == 0.0:
                 logger.debug(
                     f"low_market_liquidity DUAL ZERO market={market_id} "
@@ -342,7 +384,7 @@ class ConfidenceEngine:
                 0.0,
                 0.0,
                 market_volume,
-                f"low_market_liquidity|vol24h={market_volume:.0f}|src={volume_source}",
+                f"low_market_liquidity|vol24h={market_volume:.0f}|src={volume_source}|min={min_liquidity:.0f}",
             )
             return None
 
@@ -767,6 +809,46 @@ class ConfidenceEngine:
         context_penalty = follow_penalty if action == "follow" else fade_penalty
         selected_codes = follow_reason_codes if action == "follow" else fade_reason_codes
 
+        # ── Plan 2026-05-19 P1+P2 — market context sizing penalties ────
+        # Populate the contributor inputs into trade_context. P1 adds
+        # liquidity / near-resolution / high-price / partial-live-match
+        # zones. P2 layers microstructure (OFI alignment) + social (recent
+        # exit signal) + cross-market (op position correlation) features
+        # from the existing per-feature stores that the standalone
+        # daemons populate but the engine never read.
+        trade_context.setdefault("market_volume_24h", market_volume)
+        trade_context.setdefault("entry_price", entry_price)
+        trade_context.setdefault("leader_side", (trade.get("side") or "").lower())
+        try:
+            from src.engine.market_context import fetch_market_context
+            mkt_ctx = await fetch_market_context(
+                market_id=market_id,
+                token_id=token_id,
+                wallet=wallet,
+                asof=trade_time,
+            )
+            for k, v in mkt_ctx.items():
+                trade_context.setdefault(k, v)
+        except Exception as _exc:
+            logger.debug(
+                f"market_context: fetch failed for wallet={wallet} "
+                f"market={market_id}: {_exc}"
+            )
+        try:
+            from src.engine.sizing_penalties import (
+                compute_market_context_penalty,
+            )
+            market_pen, market_codes = compute_market_context_penalty(
+                trade_context
+            )
+            if market_pen > 0.001:
+                context_penalty = min(0.85, context_penalty + market_pen)
+                selected_codes = list(selected_codes) + market_codes
+        except Exception as _exc:
+            logger.debug(
+                f"sizing_penalties: market-context penalty read failed: {_exc}"
+            )
+
         # Tunable floor — was 0.25, lowered to 0.05 to unblock cold-start
         # decisions when profiler hasn't accumulated stability data yet.
         # The behavioral-penalty path (follow_penalty/fade_penalty above)
@@ -915,6 +997,38 @@ class ConfidenceEngine:
         )
         decision.signal_audit = await self._build_signal_audit(decision)
         trade_context["signal_audit"] = decision.signal_audit
+
+        # ── Plan 2026-05-19 P1-4 — signal_audit short-circuit at engine ──
+        # Previously the engine emitted the decision even when
+        # signal_audit.accepted == False (missing_fee_snapshot,
+        # missing_token_map, stale_book, etc.) and the paper_trader was
+        # responsible for the rejection. Live diagnostic 2026-05-18 showed
+        # this was the dominant 0-trade root cause: 158 actionable
+        # decisions emitted / 0 paper trades inserted in 24h, all
+        # rejected at the paper-side audit. Logging the decision as
+        # `skip|signal_audit_rejected_at_engine|<reason>` keeps the
+        # operator dashboards accurate without polluting downstream
+        # routers with decisions that can't fire.
+        audit = decision.signal_audit or {}
+        if audit and audit.get("accepted") is False:
+            audit_reason = (
+                str(audit.get("reason") or audit.get("code") or "unknown").strip()
+                or "unknown"
+            )
+            await self._log_decision(
+                wallet,
+                market_id,
+                "skip",
+                thompson_follow,
+                thompson_fade,
+                0.0,
+                confidence,
+                f"signal_audit_rejected_at_engine|{audit_reason}",
+                signal_audit=decision.signal_audit,
+                strategy_track=decision.strategy_track,
+                economic_model_version=decision.economic_model_version,
+            )
+            return None
 
         await self._log_decision(
             wallet,

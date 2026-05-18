@@ -5,10 +5,10 @@
 // Goal: replace Babel-in-browser with a single precompiled bundle so the
 // operator dashboard cold-starts in <1s instead of 3–5s.
 //
-// V1 source-of-truth files are bundled. V2 files are NOT bundled — they're
-// runtime-fetched + Babel-transformed by templates/dashboard.html only when
-// localStorage.poybot_v2_lab === '1'. Keeps V2 truly lab-only per memory
-// project_v1_vs_v2_terminal.md.
+// All dashboard files (V1 tabs + Wallet Graph V3) are bundled. The old V2
+// dashboard overlay (Cosmograph + lightweight-charts) was removed in WG-A6
+// (2026-05-19); the new Wallet Graph V3 lives in static/dashboard/walletgraph_v3/
+// and is bundled via _entry.jsx like every other dashboard module.
 //
 // Usage:
 //   node scripts/build_dashboard.mjs            # one-shot build
@@ -29,9 +29,9 @@ const OUT_FILE = resolve(OUT_DIR, 'dashboard.bundle.js');
 
 mkdirSync(OUT_DIR, { recursive: true });
 
-// ── Synthesize an entry that concatenates the four V1 files in load order ───
-// Each file uses its own IIFE wrapper for namespace isolation. We mirror the
-// legacy templates/dashboard.html load-order so behaviour is identical.
+// ── Entry point ────────────────────────────────────────────────────────────
+// static/dashboard/_entry.jsx concatenates the dashboard modules in load order:
+// api-client → dashboard-components → walletgraph_v3/* → dashboard-tabs → dashboard-app.
 const ENTRY_PATH = resolve(SRC, '_entry.jsx');
 if (!existsSync(ENTRY_PATH)) {
   console.error('[build_dashboard] missing entry:', ENTRY_PATH);
@@ -62,7 +62,7 @@ const buildOpts = {
     'process.env.NODE_ENV': JSON.stringify(isDev ? 'development' : 'production'),
   },
   banner: {
-    js: `// Poybot dashboard bundle — V1 source of truth. V2 lab files loaded separately. Built ${new Date().toISOString()}`,
+    js: `// Poybot dashboard bundle — V1 tabs + Wallet Graph V3 (universe). Built ${new Date().toISOString()}`,
   },
   logLevel: 'info',
 };

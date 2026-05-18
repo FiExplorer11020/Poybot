@@ -2537,40 +2537,59 @@ async def alpha_extras(conn) -> dict:
         readiness      : top leaders closest to triggering FOLLOW or FADE,
                          with what's missing and an ETA in hours.
         learning_totals: cumulative counts (current state) for headline KPIs.
+
+    Resilience (B1 fix, 2026-05-19): the timeline query scans 12 buckets
+    × 4 correlated subqueries over `trades_observed` (~60M rows) and
+    routinely runs 35-45s under load — past the 30s pool default. We
+    raise the per-statement timeout to 60s via `SET LOCAL` (scope ends
+    with the implicit transaction at function return) and wrap each
+    fetch in try/except, identical to the `ml_diagnostics` pattern, so
+    one slow aggregate never 500s the whole endpoint.
     """
+    # Bump per-statement timeout for this call only. `SET LOCAL` is
+    # transaction-scoped and avoids touching the shared pool config.
+    try:
+        await conn.execute("SET LOCAL statement_timeout = '60s'")
+    except Exception as exc:
+        logger.warning(f"alpha_extras: SET LOCAL statement_timeout failed: {exc}")
+
     # ---- 24h timeline (12 buckets of 2h) -------------------------------- #
-    timeline_rows = await conn.fetch(
-        """
-        WITH buckets AS (
-            SELECT generate_series(
-                date_trunc('hour', NOW()) - INTERVAL '22 hours',
-                date_trunc('hour', NOW()),
-                INTERVAL '2 hours'
-            ) AS bucket_start
+    try:
+        timeline_rows = await conn.fetch(
+            """
+            WITH buckets AS (
+                SELECT generate_series(
+                    date_trunc('hour', NOW()) - INTERVAL '22 hours',
+                    date_trunc('hour', NOW()),
+                    INTERVAL '2 hours'
+                ) AS bucket_start
+            )
+            SELECT
+                b.bucket_start,
+                COALESCE((
+                    SELECT COUNT(*) FROM trades_observed t
+                    WHERE t.time >= b.bucket_start AND t.time < b.bucket_start + INTERVAL '2 hours'
+                ), 0) AS trades,
+                COALESCE((
+                    SELECT COUNT(*) FROM trades_observed t
+                    WHERE t.time >= b.bucket_start AND t.time < b.bucket_start + INTERVAL '2 hours'
+                      AND t.is_leader = TRUE
+                ), 0) AS leader_trades,
+                COALESCE((
+                    SELECT COUNT(*) FROM positions_reconstructed p
+                    WHERE p.close_time >= b.bucket_start AND p.close_time < b.bucket_start + INTERVAL '2 hours'
+                ), 0) AS positions_resolved,
+                COALESCE((
+                    SELECT COUNT(*) FROM follower_edges e
+                    WHERE e.last_observed >= b.bucket_start AND e.last_observed < b.bucket_start + INTERVAL '2 hours'
+                ), 0) AS edges_active
+            FROM buckets b
+            ORDER BY b.bucket_start ASC
+            """
         )
-        SELECT
-            b.bucket_start,
-            COALESCE((
-                SELECT COUNT(*) FROM trades_observed t
-                WHERE t.time >= b.bucket_start AND t.time < b.bucket_start + INTERVAL '2 hours'
-            ), 0) AS trades,
-            COALESCE((
-                SELECT COUNT(*) FROM trades_observed t
-                WHERE t.time >= b.bucket_start AND t.time < b.bucket_start + INTERVAL '2 hours'
-                  AND t.is_leader = TRUE
-            ), 0) AS leader_trades,
-            COALESCE((
-                SELECT COUNT(*) FROM positions_reconstructed p
-                WHERE p.close_time >= b.bucket_start AND p.close_time < b.bucket_start + INTERVAL '2 hours'
-            ), 0) AS positions_resolved,
-            COALESCE((
-                SELECT COUNT(*) FROM follower_edges e
-                WHERE e.last_observed >= b.bucket_start AND e.last_observed < b.bucket_start + INTERVAL '2 hours'
-            ), 0) AS edges_active
-        FROM buckets b
-        ORDER BY b.bucket_start ASC
-        """
-    )
+    except Exception as exc:
+        logger.warning(f"alpha_extras.timeline failed: {exc}")
+        timeline_rows = []
     timeline = [
         {
             "t": _row_get(r, "bucket_start").isoformat() if _row_get(r, "bucket_start") else None,
@@ -2586,55 +2605,59 @@ async def alpha_extras(conn) -> dict:
     # Thresholds from settings: FOLLOW needs 50 trades + 5 confirmed
     # followers + 10 resolved positions. We rank leaders by how few of
     # these gates remain.
-    follow_rows = await conn.fetch(
-        f"""
-        WITH counts AS (
+    try:
+        follow_rows = await conn.fetch(
+            f"""
+            WITH counts AS (
+                SELECT
+                    lp.wallet_address,
+                    lp.trades_observed,
+                    lp.positions_resolved,
+                    lp.profile_maturity,
+                    lp.error_model_phase,
+                    COALESCE((
+                        SELECT COUNT(*) FROM follower_edges e
+                        WHERE e.leader_wallet = lp.wallet_address
+                          AND e.co_occurrences >= 5
+                          AND e.same_direction_rate >= 0.7
+                    ), 0) AS confirmed_followers,
+                    COALESCE((
+                        SELECT COUNT(*) FROM trades_observed t
+                        WHERE t.wallet_address = lp.wallet_address
+                          AND t.time >= NOW() - INTERVAL '24 hours'
+                    ), 0) AS trades_24h,
+                    COALESCE(l.falcon_score, 0) AS falcon_score,
+                    l.classification_json
+                FROM leader_profiles lp
+                JOIN leaders l USING (wallet_address)
+                WHERE l.excluded = FALSE
+                  AND l.on_watchlist = TRUE
+            )
             SELECT
-                lp.wallet_address,
-                lp.trades_observed,
-                lp.positions_resolved,
-                lp.profile_maturity,
-                lp.error_model_phase,
-                COALESCE((
-                    SELECT COUNT(*) FROM follower_edges e
-                    WHERE e.leader_wallet = lp.wallet_address
-                      AND e.co_occurrences >= 5
-                      AND e.same_direction_rate >= 0.7
-                ), 0) AS confirmed_followers,
-                COALESCE((
-                    SELECT COUNT(*) FROM trades_observed t
-                    WHERE t.wallet_address = lp.wallet_address
-                      AND t.time >= NOW() - INTERVAL '24 hours'
-                ), 0) AS trades_24h,
-                COALESCE(l.falcon_score, 0) AS falcon_score,
-                l.classification_json
-            FROM leader_profiles lp
-            JOIN leaders l USING (wallet_address)
-            WHERE l.excluded = FALSE
-              AND l.on_watchlist = TRUE
+                wallet_address,
+                trades_observed,
+                positions_resolved,
+                confirmed_followers,
+                profile_maturity,
+                error_model_phase,
+                trades_24h,
+                falcon_score,
+                classification_json
+            FROM counts
+            ORDER BY
+                -- Score: lower = closer to ready. Each gate contributes its
+                -- gap (clamped to 0 once met). We weight followers more since
+                -- they're the slowest to come online.
+                (GREATEST(0, 50 - trades_observed)
+                  + GREATEST(0, 10 - positions_resolved) * 2
+                  + GREATEST(0, 5 - confirmed_followers) * 5) ASC,
+                falcon_score DESC
+            LIMIT 6
+            """
         )
-        SELECT
-            wallet_address,
-            trades_observed,
-            positions_resolved,
-            confirmed_followers,
-            profile_maturity,
-            error_model_phase,
-            trades_24h,
-            falcon_score,
-            classification_json
-        FROM counts
-        ORDER BY
-            -- Score: lower = closer to ready. Each gate contributes its
-            -- gap (clamped to 0 once met). We weight followers more since
-            -- they're the slowest to come online.
-            (GREATEST(0, 50 - trades_observed)
-              + GREATEST(0, 10 - positions_resolved) * 2
-              + GREATEST(0, 5 - confirmed_followers) * 5) ASC,
-            falcon_score DESC
-        LIMIT 6
-        """
-    )
+    except Exception as exc:
+        logger.warning(f"alpha_extras.follow_rows failed: {exc}")
+        follow_rows = []
     follow_ready: list[dict] = []
     for r in follow_rows:
         trades = _to_int(_row_get(r, "trades_observed"), 0)
@@ -2675,20 +2698,24 @@ async def alpha_extras(conn) -> dict:
         )
 
     # ---- Learning totals (current state snapshot) ----------------------- #
-    totals_row = await conn.fetchrow(
-        """
-        SELECT
-            (SELECT COUNT(*) FROM trades_observed) AS trades_total,
-            (SELECT COUNT(*) FROM positions_reconstructed WHERE close_time IS NOT NULL) AS positions_resolved_total,
-            (SELECT COUNT(*) FROM follower_edges) AS edges_total,
-            (SELECT COUNT(*) FROM follower_edges WHERE co_occurrences >= 5 AND same_direction_rate >= 0.7) AS edges_confirmed,
-            (SELECT COALESCE(AVG(profile_maturity), 0) FROM leader_profiles) AS avg_maturity,
-            (SELECT COUNT(*) FROM leader_profiles) AS profiles_total,
-            (SELECT COUNT(*) FROM leader_profiles WHERE error_model_phase = 1) AS phase1,
-            (SELECT COUNT(*) FROM leader_profiles WHERE error_model_phase = 2) AS phase2,
-            (SELECT COUNT(*) FROM leader_profiles WHERE error_model_phase = 3) AS phase3
-        """
-    )
+    try:
+        totals_row = await conn.fetchrow(
+            """
+            SELECT
+                (SELECT COUNT(*) FROM trades_observed) AS trades_total,
+                (SELECT COUNT(*) FROM positions_reconstructed WHERE close_time IS NOT NULL) AS positions_resolved_total,
+                (SELECT COUNT(*) FROM follower_edges) AS edges_total,
+                (SELECT COUNT(*) FROM follower_edges WHERE co_occurrences >= 5 AND same_direction_rate >= 0.7) AS edges_confirmed,
+                (SELECT COALESCE(AVG(profile_maturity), 0) FROM leader_profiles) AS avg_maturity,
+                (SELECT COUNT(*) FROM leader_profiles) AS profiles_total,
+                (SELECT COUNT(*) FROM leader_profiles WHERE error_model_phase = 1) AS phase1,
+                (SELECT COUNT(*) FROM leader_profiles WHERE error_model_phase = 2) AS phase2,
+                (SELECT COUNT(*) FROM leader_profiles WHERE error_model_phase = 3) AS phase3
+            """
+        )
+    except Exception as exc:
+        logger.warning(f"alpha_extras.totals failed: {exc}")
+        totals_row = None
 
     return {
         "timeline": timeline,

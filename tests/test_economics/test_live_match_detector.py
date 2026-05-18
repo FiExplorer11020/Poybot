@@ -85,6 +85,23 @@ def _stub_runtime_volume_threshold():
         yield
 
 
+@pytest.fixture(autouse=True)
+def _stub_runtime_required_signals():
+    """Plan 2026-05-19 P0-5 — legacy single-signal-tests fixture.
+
+    The detector's new default requires >=2 concurrent signals; this
+    fixture pins the threshold to 1 so the original 18 legacy tests
+    (which exercise one signal at a time) continue to assert the
+    expected single-signal True/False outcomes. New multi-signal tests
+    (TestMultiSignalThreshold below) override this fixture locally.
+    """
+    with patch(
+        "src.economics.live_match_detector._resolve_required_signals",
+        AsyncMock(return_value=1),
+    ):
+        yield
+
+
 # --------------------------------------------------------------------------- #
 # Signal #1 — Authoritative Gamma flag                                        #
 # --------------------------------------------------------------------------- #
@@ -510,3 +527,93 @@ class TestLiveMatchBlockEnabled:
             )
             mock_get.return_value = mock_cfg
             assert await live_match_block_enabled() is False
+
+
+# --------------------------------------------------------------------------- #
+# Plan 2026-05-19 P0-5 — multi-signal threshold (NEW)                          #
+# --------------------------------------------------------------------------- #
+
+
+class TestMultiSignalThreshold:
+    """The new default requires >=2 signals before blocking. These tests
+    pin the runtime threshold to 2 (production default) and verify the
+    new behaviour: gamma_flag alone, regex alone, volume_spike alone all
+    return (False, partial). Two co-firing signals return (True, joined).
+    """
+
+    @pytest.fixture(autouse=True)
+    def _require_two_signals(self):
+        with patch(
+            "src.economics.live_match_detector._resolve_required_signals",
+            AsyncMock(return_value=2),
+        ):
+            yield
+
+    @pytest.mark.asyncio
+    async def test_gamma_flag_alone_does_not_block(self):
+        """The 18/05 prod-diagnostic finding: gamma_flag was 24% of skip
+        reasons. With threshold=2, gamma_flag alone no longer blocks
+        and the reason is suffixed with `|signals=1/2` for visibility."""
+        row = _row(
+            question="Champions League final 2027 winner?",
+            category="sports",
+            volume_24h=10_000.0,
+            is_live_match_flag=True,
+        )
+        is_live, reason = await is_live_match("mkt-multi-1", row)
+        assert is_live is False
+        assert reason == "gamma_flag|signals=1/2"
+
+    @pytest.mark.asyncio
+    async def test_gamma_flag_plus_volume_spike_blocks(self):
+        """Two co-firing signals (the genuine live-match scenario)
+        return True with both reasons joined."""
+        row = _row(
+            question="Real Madrid vs Liverpool",
+            category="sports",
+            volume_24h=200_000.0,  # volume_spike fires
+            is_live_match_flag=True,    # gamma_flag fires
+        )
+        is_live, reason = await is_live_match("mkt-multi-2", row)
+        assert is_live is True
+        assert reason == "gamma_flag+volume_spike|signals=2/2"
+
+    @pytest.mark.asyncio
+    async def test_regex_map_plus_today_blocks(self):
+        """Two non-gamma signals also block when both fire."""
+        today = datetime(2026, 5, 19, tzinfo=timezone.utc)
+        row = _row(
+            question="Map 1 of finals on 2026-05-19",
+            category="sports",
+            volume_24h=5_000.0,
+            is_live_match_flag=False,
+        )
+        is_live, reason = await is_live_match("mkt-multi-3", row, now=today)
+        assert is_live is True
+        assert "regex_map" in reason
+        assert "regex_today" in reason
+        assert "signals=2/2" in reason
+
+    @pytest.mark.asyncio
+    async def test_regex_alone_does_not_block(self):
+        row = _row(
+            question="Map 1 winner",
+            category="sports",
+            volume_24h=5_000.0,
+            is_live_match_flag=None,
+        )
+        is_live, reason = await is_live_match("mkt-multi-4", row)
+        assert is_live is False
+        assert reason == "regex_map|signals=1/2"
+
+    @pytest.mark.asyncio
+    async def test_no_signals_returns_no_match(self):
+        row = _row(
+            question="Will the Fed cut rates by Q3 2027?",
+            category="macro",
+            volume_24h=80_000.0,
+            is_live_match_flag=None,
+        )
+        is_live, reason = await is_live_match("mkt-multi-5", row)
+        assert is_live is False
+        assert reason == "no_match"

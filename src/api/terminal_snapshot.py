@@ -554,7 +554,7 @@ def _build_bot_payload(
         "latency_ms": round(last_msg_age_s * 1000, 2),
         "cycle_latency_ms": _to_float(runtime.get("cycle_latency_ms"), 0.0) or 0.0,
         "started_at": runtime.get("started_at"),
-        "accumulated_run_seconds": _to_int(runtime.get("uptime_seconds"), 0),
+        "accumulated_run_seconds": _to_int(runtime.get("accumulated_run_seconds"), 0),
         "last_command_at": runtime.get("last_command_at"),
         "paper_only": mode_raw == "paper",
         "control_available": bool(runtime.get("control_available", False)),

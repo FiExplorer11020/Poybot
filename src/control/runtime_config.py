@@ -296,6 +296,29 @@ ALLOWED_KEYS: dict[str, str] = {
         "Strategy 2026-05-17 round 2: minimum confirmed_followers (OR "
         "with falcon_score) to qualify for Tier B. Default 3."
     ),
+    # ── Plan 2026-05-19 P0-4: market liquidity floor (runtime-tunable) ──
+    # Replaces the hardcoded 5000.0 in confidence_engine.py. The 18/05
+    # live diagnostic showed `low_market_liquidity` at 24% of skip
+    # reasons with vol24h<80$ markets where leaders were trading. Default
+    # 1000 USDC catches genuine zero-liquidity markets without starving
+    # the bot on fresh-but-active markets.
+    "min_market_liquidity_usdc": (
+        "Plan 2026-05-19 P0-4: minimum market liquidity (max of "
+        "markets.volume_24h and last-24h trades_observed sum) for a "
+        "decision to be considered. Default 1000 USDC."
+    ),
+    # ── Plan 2026-05-19 P0-5: live-match multi-signal requirement ────
+    # The 18/05 live diagnostic showed `live_match_blocked|gamma_flag`
+    # at 24% of skip reasons. The Gamma flag on its own is too noisy;
+    # requiring N>=2 concurrent signals cuts false positives while
+    # keeping real live matches blocked. Default 2 keeps the bot
+    # conservative without choking the decision flow on Gamma alone.
+    "live_match_require_signals": (
+        "Plan 2026-05-19 P0-5: minimum number of independent live-match "
+        "signals (gamma_flag, regex_map, regex_period, regex_today, "
+        "volume_spike) that must fire concurrently before the detector "
+        "blocks a trade. Default 2."
+    ),
 }
 
 # Inclusive (min, max) bounds for each editable key. Writes outside the
@@ -410,6 +433,15 @@ BOUNDS: dict[str, tuple[float, float]] = {
     # the heartbeat-vs-tick race), 6h ceiling matches MIN_HOURS_TO_RESOLUTION
     # so we never run urgent for an entire FOLLOW runway.
     "urgent_monitor_hours": (0.1, 6.0),
+    # ── Plan 2026-05-19 P0-4 — market liquidity floor ────────────────
+    # Floor 0 (effectively disables the gate), ceiling 100k (anything
+    # higher and the bot only trades the 50 hottest markets, defeating
+    # the leader-intelligence diversification objective).
+    "min_market_liquidity_usdc": (0.0, 100_000.0),
+    # ── Plan 2026-05-19 P0-5 — live-match signal count threshold ─────
+    # Floor 1 = legacy single-signal behavior; ceiling 4 = require all
+    # five signals minus one (so the gate effectively never fires).
+    "live_match_require_signals": (1, 5),
 }
 
 # Keys that store booleans (not floats). set_overrides coerces these
@@ -459,6 +491,8 @@ INTEGER_KEYS: frozenset[str] = frozenset({
     # Strategy upgrade 2026-05-17 round 3 (quick-win) — cold-start floor
     # is a count of positions.
     "min_leader_total_resolved",
+    # Plan 2026-05-19 P0-5 — multi-signal threshold is an integer.
+    "live_match_require_signals",
 })
 
 REDIS_KEY = "runtime_config:overrides"
@@ -599,6 +633,13 @@ def _defaults_from_settings() -> dict[str, Any]:
         ),
         "urgent_monitor_hours": float(
             getattr(settings, "URGENT_MONITOR_HOURS", 1.0)
+        ),
+        # ── Plan 2026-05-19 P0-4 + P0-5 defaults ────────────────────────
+        "min_market_liquidity_usdc": float(
+            getattr(settings, "MIN_MARKET_LIQUIDITY_USDC", 1_000.0)
+        ),
+        "live_match_require_signals": int(
+            getattr(settings, "LIVE_MATCH_REQUIRE_SIGNALS", 2)
         ),
     }
 

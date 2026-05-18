@@ -30,7 +30,12 @@ from src.registry.falcon_client import FalconClient
 # at 600, projection is ~56/500 (11.2%) at 800 — still well below the 80%
 # soft ceiling. Bumping per docs/autonomous_session_2026_05_17_strategy/
 # 00_DIAGNOSIS_AND_PLAN.md §B.8.
-MAX_OBSERVER_WS_TOKENS = 800
+# Plan 2026-05-19 P5-1 — coverage bump 800 → 2000 to cover ~84% of the
+# 2,369 tier-qualifying leader pool. The DB pool max_size needs to scale
+# proportionally (see src/database/connection.py); 2000 tokens × ~3
+# connections/burst ≈ 6000 connection-slots peak, well within
+# postgres max_connections=500 if the per-process pool stays at <=20.
+MAX_OBSERVER_WS_TOKENS = 2000
 
 
 def _extract_gamma_market_tokens(markets: list[dict[str, Any]]) -> set[str]:

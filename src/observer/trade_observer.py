@@ -2469,6 +2469,20 @@ class TradeObserver:
                         gamma_taker_fee_bps = float(
                             market.get("baseFee") or market.get("fee") or 0.0
                         )
+                    # Plan 2026-05-19 P4-1 — bps↔decimal unit fix.
+                    # Gamma's taker_base_fee field is in BASIS POINTS
+                    # (156 = 1.56%). Downstream consumers
+                    # (calculate_polymarket_fee in src/economics/fees.py)
+                    # expect a DECIMAL fraction (0.0156 for 1.56%). The
+                    # legacy column stored bps directly, multiplying paper-
+                    # trade fees by 10000× on every crypto/sport-fee
+                    # market. Convert at write time so all DB readers see
+                    # a consistent decimal value. Migration 054 normalises
+                    # pre-existing rows. Bound at [0, 1] to defend against
+                    # a degenerate Gamma payload.
+                    gamma_taker_fee_decimal = max(
+                        0.0, min(1.0, gamma_taker_fee_bps / 10_000.0)
+                    )
                     return {
                         "question": question,
                         "category": market.get("category") or "unknown",
@@ -2477,9 +2491,10 @@ class TradeObserver:
                         "end_date": end_date,
                         "volume_24h": float(market.get("volume24hr") or 0.0),
                         "liquidity_score": float(market.get("liquidity") or 0.0),
-                        # Stored in `markets.fee_rate_pct` (legacy column
-                        # name predates the maker/taker split). Semantically
-                        # this is the TAKER base fee in bps.
-                        "fee_rate_pct": gamma_taker_fee_bps,
+                        # Stored in `markets.fee_rate_pct` as a DECIMAL
+                        # fraction (Plan P4-1 fix). Previously stored bps
+                        # directly — the column name predates the unit
+                        # standardisation and is kept for compatibility.
+                        "fee_rate_pct": gamma_taker_fee_decimal,
                     }
         return None

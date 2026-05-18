@@ -145,9 +145,19 @@ def _log(msg: str) -> None:
 # ──────────────────────────────────────────────────────────────────────
 
 async def bootstrap_fee_snapshots(pool: asyncpg.Pool) -> int:
-    """Seed fresh fee_snapshots for every active+liquid market token.
+    """Seed fresh fee_snapshots for every active market token reachable by the engine.
 
     Uses markets.fee_rate_pct (refreshed by gamma) as the source.
+
+    Plan 2026-05-19 P0-1: widened market eligibility. The legacy filter
+    ``volume_24h > 500`` excluded every market where Gamma's volume column
+    was stale or 0 — exactly the set of fresh markets where leader trades
+    most frequently land. The new predicate accepts ANY market with either
+    moderate Gamma-reported volume (``> 100``) OR observed trade activity
+    in the last 24h (``EXISTS trades_observed``). This restores
+    fee_snapshots coverage on the markets the signal_audit gate actually
+    needs to greenlight a paper trade. Stale rows still age out via the
+    7-day DELETE below.
     """
     async with pool.acquire() as conn:
         # YES side
@@ -160,7 +170,16 @@ async def bootstrap_fee_snapshots(pool: asyncpg.Pool) -> int:
                    'maintenance_loop', NOW()
             FROM markets m
             WHERE m.active=TRUE AND m.end_date > NOW()
-              AND m.volume_24h > 500 AND m.token_yes IS NOT NULL
+              AND m.token_yes IS NOT NULL
+              AND (
+                m.volume_24h > 100
+                OR EXISTS (
+                    SELECT 1 FROM trades_observed t
+                    WHERE t.market_id = m.market_id
+                      AND t.time > NOW() - INTERVAL '24 hours'
+                    LIMIT 1
+                )
+              )
             ON CONFLICT (market_id, token_id, captured_at, source) DO NOTHING
             """
         )
@@ -174,7 +193,16 @@ async def bootstrap_fee_snapshots(pool: asyncpg.Pool) -> int:
                    'maintenance_loop', NOW()
             FROM markets m
             WHERE m.active=TRUE AND m.end_date > NOW()
-              AND m.volume_24h > 500 AND m.token_no IS NOT NULL
+              AND m.token_no IS NOT NULL
+              AND (
+                m.volume_24h > 100
+                OR EXISTS (
+                    SELECT 1 FROM trades_observed t
+                    WHERE t.market_id = m.market_id
+                      AND t.time > NOW() - INTERVAL '24 hours'
+                    LIMIT 1
+                )
+              )
             ON CONFLICT (market_id, token_id, captured_at, source) DO NOTHING
             """
         )

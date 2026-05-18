@@ -221,9 +221,20 @@ async def _check_audit_log(conn) -> dict[str, Any]:
     rows_24h = int(row["rows_24h"] or 0)
     fallback_24h = int(row["fallback_24h"] or 0)
     closed_paper_24h = int(closed_paper_24h or 0)
-    # ok when audit rows >= closed trades (every close should be audited),
-    # OR no trades closed in 24h.
-    ok = closed_paper_24h == 0 or rows_24h >= closed_paper_24h
+    # B6 fix (2026-05-19): when no paper closes happened in 24h there's
+    # nothing to audit — the prior "0 rows · 0 fallbacks" string read
+    # like a failure on the gauge. Surface a "warming up" signal instead
+    # so operators don't chase a phantom red light during quiet windows.
+    if closed_paper_24h == 0:
+        return {
+            "ok": True,
+            "detail": "WARMING UP — no closes attempted yet",
+            "rows_24h": rows_24h,
+            "phantom_count_24h": fallback_24h,
+            "fallback_count_24h": fallback_24h,
+        }
+    # ok when audit rows >= closed trades (every close should be audited).
+    ok = rows_24h >= closed_paper_24h
     detail = f"{rows_24h} rows · {fallback_24h} fallbacks"
     if not ok:
         detail = f"{rows_24h} rows for {closed_paper_24h} closes (audit gap)"

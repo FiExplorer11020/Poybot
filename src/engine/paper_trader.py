@@ -98,6 +98,13 @@ class PaperTrader:
         self._running = False
         self._stop_event = asyncio.Event()
         self._open_trades: list[OpenPaperTrade] = []
+        # Plan 2026-05-19 P3 — in-memory peak PnL tracking for the
+        # trailing-stop trigger. Keyed by trade.id, value = max PnL
+        # observed so far on that trade. Reset to {} on container
+        # restart — the trailing-stop will re-arm from current PnL,
+        # which is the safe behavior (no false-positive triggers from
+        # a stale peak).
+        self._trade_peak_pnl: dict[int, float] = {}
         # These defaults are only used before `load_persisted_state()` has run
         # (or in unit tests that bypass it).  Real values come from the
         # `portfolio_state` table on start().
@@ -510,14 +517,45 @@ class PaperTrader:
             trade_category = await self._resolve_trade_category(trade)
             is_sport = trade_category == SPORT_CATEGORY
 
-            # --- Holding cap (24h default) ---
+            # Plan 2026-05-19 P3 — adapt the holding cap to the leader's
+            # classified horizon. A scalper leader holding 1h should not
+            # have their copy held 12h. We only adapt NON-sport markets;
+            # sport markets keep the original generic cap (12h) at this
+            # branch and fall through to the existing sport-specific
+            # branch downstream (which fires AFTER market_resolved per
+            # the structural fix plan priority ordering).
+            try:
+                from src.engine.exit_strategy import (
+                    resolve_holding_cap_for_horizon,
+                )
+                leader_horizon = await self._resolve_leader_horizon(
+                    trade.leader_wallet
+                )
+                if is_sport:
+                    adaptive_cap_s = holding_cap_s
+                else:
+                    adaptive_cap_s = resolve_holding_cap_for_horizon(
+                        default_cap_s=holding_cap_s,
+                        horizon=leader_horizon,
+                        is_sport=False,
+                        sport_cap_s=sport_holding_cap_s,
+                    )
+            except Exception:
+                adaptive_cap_s = holding_cap_s
+                leader_horizon = None
+
+            # --- Holding cap (horizon-adaptive) ---
             # MUST fire BEFORE the absolute 30d timeout so a position that
-            # crosses the 24h boundary doesn't sit until the broader cap
+            # crosses the cap boundary doesn't sit until the broader cap
             # fires. If the market has resolved by the holding-cap moment,
             # use the terminal value; otherwise the oracle's exit_price.
-            if trade.opened_at and holding_cap_s > 0:
+            # Plan P3: when the trade is on a sport market AND the cap
+            # equals the sport cap (the sport guardrail wins on sport),
+            # tag the close reason as ``holding_cap_sport`` so the
+            # dashboard counter + operator alerts remain accurate.
+            if trade.opened_at and adaptive_cap_s > 0:
                 held_for_s = (now - trade.opened_at).total_seconds()
-                if held_for_s >= holding_cap_s:
+                if held_for_s >= adaptive_cap_s:
                     cap_price = exit_price
                     cap_quote = quote
                     if await self._is_market_resolved(trade.market_id):
@@ -720,6 +758,47 @@ class PaperTrader:
                 stop = STOP_LOSS_FOLLOW
             take = TAKE_PROFIT_FADE if trade.strategy == "fade" else TAKE_PROFIT_FOLLOW
 
+            # Plan 2026-05-19 P3 — momentum-aware trailing stop. Runs
+            # BEFORE the static stop_loss/take_profit so a profitable
+            # position that's retreated from its peak exits cleanly
+            # without waiting for the -8% absolute drawdown. Once PnL
+            # has crossed +5% the trail arms; it then exits when PnL
+            # retreats past `peak - trail_distance(horizon)`. The
+            # trailing distance scales with the leader's horizon
+            # (scalper 2%, swing 4%, holder 6%) so we don't exit a
+            # holder on normal short-term wobble.
+            try:
+                from src.engine.exit_strategy import check_trailing_stop
+                # bid_pnl_pct is the more conservative measure (what we'd
+                # actually realize on a sell) — use it to feed the
+                # trailing logic so the bot exits on the realized curve
+                # rather than the mid-implied one.
+                prior_peak = self._trade_peak_pnl.get(trade.id)
+                trail = check_trailing_stop(
+                    pnl_pct=bid_pnl_pct,
+                    peak_pnl_pct=prior_peak,
+                    horizon=leader_horizon if 'leader_horizon' in locals() else None,
+                    is_sport=is_sport,
+                )
+                if trail.active:
+                    self._trade_peak_pnl[trade.id] = trail.new_peak
+                if trail.triggered:
+                    await self.close_trade(
+                        trade.id,
+                        exit_price,
+                        trail.reason or "trailing_stop",
+                        price_quote=quote,
+                    )
+                    # Clean up the peak so a re-open of the same ID (unlikely
+                    # but possible after a force_close) starts fresh.
+                    self._trade_peak_pnl.pop(trade.id, None)
+                    continue
+            except Exception as _trail_exc:
+                logger.debug(
+                    f"PaperTrader: trailing-stop check failed for "
+                    f"#{trade.id}: {_trail_exc}"
+                )
+
             # Stop-loss: use the WORSE of mid or bid-implied PnL. A wide
             # spread should accelerate not delay the stop.
             effective_stop_pnl = min(pnl_pct, bid_pnl_pct)
@@ -727,6 +806,7 @@ class PaperTrader:
                 await self.close_trade(
                     trade.id, exit_price, "stop_loss", price_quote=quote
                 )
+                self._trade_peak_pnl.pop(trade.id, None)
             # Take-profit: require BOTH mid and bid to clear the
             # threshold. A take_profit at the spread-induced mid that
             # actually books a bid loss is the bug that produced
@@ -1037,10 +1117,16 @@ class PaperTrader:
                 getattr(settings, "MAX_ENTRY_PRICE", 0.92),
             )
         )
+        # Plan 2026-05-19 P0-6: aligned fallback from 0.40 → settings
+        # value (currently 0.30 in config.py:317). The legacy 0.40
+        # fallback caused a silent cross-layer mismatch: confidence_engine
+        # had no MIN_ENTRY_PRICE floor and would emit decisions in the
+        # [0.30, 0.40) range that paper_trader then rejected, wasting
+        # Kelly/signal_audit cycles.
         min_entry_price = float(
             await self._read_runtime_setting(
                 "min_entry_price",
-                getattr(settings, "MIN_ENTRY_PRICE", 0.40),
+                getattr(settings, "MIN_ENTRY_PRICE", 0.30),
             )
         )
         if entry_price >= max_entry_price:
@@ -1261,12 +1347,50 @@ class PaperTrader:
                 fees_enabled=True,
             )
         )
+
+        # Plan 2026-05-19 P4-2 — model exit slippage.
+        # ``calculate_long_pnl`` accepts a ``slippage_usdc`` parameter
+        # that was never being passed by callers. The paper trader's
+        # close path booked at the oracle's quote (the MID when
+        # source=book) instead of the realistic bid, overstating PnL
+        # by ~spread/2 on every wide-book exit. Now we compute the
+        # half-spread cost (``shares × (mid - best_bid) / 2``) and pass
+        # it as slippage. Falls back to 0 when bid/ask aren't available
+        # — never raises on a missing price_quote attribute.
+        slippage_usdc = 0.0
+        try:
+            if price_quote is not None:
+                best_bid = getattr(price_quote, "best_bid", None)
+                best_ask = getattr(price_quote, "best_ask", None)
+                if best_bid is not None and best_ask is not None:
+                    mid_price = (float(best_ask) + float(best_bid)) / 2.0
+                    if mid_price > float(best_bid):
+                        # Half-spread × shares = realistic exit cost.
+                        slippage_usdc = float(size_shares) * (
+                            mid_price - float(best_bid)
+                        )
+                        # Defensive cap: slippage > 50% notional indicates
+                        # a degenerate spread (already blocked upstream by
+                        # the spread gate, but defense in depth here).
+                        slippage_usdc = min(
+                            slippage_usdc,
+                            float(size_shares) * float(trade.entry_price) * 0.5,
+                        )
+                        slippage_usdc = max(0.0, slippage_usdc)
+        except Exception as _slip_exc:
+            logger.debug(
+                f"PaperTrader: slippage compute failed for #{trade_id}: "
+                f"{_slip_exc}"
+            )
+            slippage_usdc = 0.0
+
         pnl = calculate_long_pnl(
             entry_price=trade.entry_price,
             exit_price=exit_price,
             size_shares=size_shares,
             entry_fee_usdc=trade.entry_fee_usdc,
             exit_fee_usdc=exit_fee,
+            slippage_usdc=slippage_usdc,
         )
         pnl_usdc = float(pnl.net_pnl_usdc)
         gross_pnl_usdc = float(pnl.gross_pnl_usdc)
@@ -2285,6 +2409,40 @@ class PaperTrader:
         except Exception:
             pass
         return "unknown"
+
+    async def _resolve_leader_horizon(self, leader_wallet: str | None) -> str | None:
+        """Plan 2026-05-19 P3 — return leader's classified horizon.
+
+        Reads ``leaders.classification_json -> 'horizon'`` for the
+        wallet. Returns one of ``scalper`` / ``swing`` / ``holder`` or
+        ``None`` when the lookup fails or the classification is absent.
+        Used by ``_check_open_positions`` to scale the holding cap and
+        the trailing-stop distance.
+        """
+        if not leader_wallet:
+            return None
+        try:
+            async with get_db() as conn:
+                row = await conn.fetchrow(
+                    """
+                    SELECT classification_json->>'horizon' AS horizon
+                    FROM leaders
+                    WHERE wallet_address = $1
+                    """,
+                    leader_wallet,
+                )
+        except Exception as exc:
+            logger.debug(
+                f"PaperTrader: classification lookup failed for "
+                f"{leader_wallet}: {exc}"
+            )
+            return None
+        if row is None:
+            return None
+        horizon = row["horizon"]
+        if not horizon:
+            return None
+        return str(horizon).strip().lower()
 
     async def _read_runtime_setting(self, key: str, fallback):
         """Best-effort read of a single RuntimeConfig override.

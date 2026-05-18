@@ -9,16 +9,20 @@
 <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:ital,wght@0,300;0,400;0,500;0,600;0,700;1,400&display=swap" rel="stylesheet">
 <script src="https://unpkg.com/react@18.3.1/umd/react.development.js" integrity="sha384-hD6/rw4ppMLGNu3tX5cjIb+uRZ7UkRJ6BPkLpg4hAu/6onKUg4lLsHAs9EBPT82L" crossorigin="anonymous"></script>
 <script src="https://unpkg.com/react-dom@18.3.1/umd/react-dom.development.js" integrity="sha384-u6aeetuaXnQ38mYT8rp6sbXaQe3NL9t+IBXmnYxwkUI2Hw4bsp2Wvmx4yRQF1uAm" crossorigin="anonymous"></script>
+<!-- Wallet Graph V3 deps — UMD CDN. react-force-graph-2d exposes window.ForceGraph2D -->
+<script src="https://unpkg.com/prop-types@15.8.1/prop-types.min.js" crossorigin="anonymous"></script>
+<script src="https://unpkg.com/d3-force-3d@3.0.5/dist/d3-force-3d.min.js" crossorigin="anonymous"></script>
+<script src="https://unpkg.com/force-graph@1.49.0/dist/force-graph.min.js" crossorigin="anonymous"></script>
+<script src="https://unpkg.com/react-force-graph-2d@1.27.0/dist/react-force-graph-2d.min.js" crossorigin="anonymous"></script>
 <!--
-  PLAN-UIA-001 (2026-05-18) — V1 source of truth. V2 dashboard files are
-  ONLY loaded when localStorage.poybot_v2_lab === '1' (toggle inside the
-  LAB tab). This keeps the page weight light and prevents the V2 portfolio
-  from silently rebinding window.LivePortfolio on cold load.
-  See memory: project_v1_vs_v2_terminal.md.
+  WG-A6 (2026-05-19) — V2 dashboard overlay removed. Wallet Graph is now V3
+  ("univers"), bundled into /static/dashboard/dist/dashboard.bundle.js via
+  static/dashboard/walletgraph_v3/*.jsx. No more localStorage.poybot_v2_lab
+  toggle, no more Cosmograph CDN, no more on-demand Babel transform for V2.
 
-  Babel is NOT loaded here. The V1 dashboard ships precompiled at
+  Babel is NOT loaded here. The dashboard ships precompiled at
   /static/dashboard/dist/dashboard.bundle.js (see scripts/build_dashboard.mjs).
-  When V2 lab is enabled, Babel is injected on-demand below.
+  A dev fallback path below uses runtime Babel only if the bundle is missing.
 -->
 <style>
   *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
@@ -109,96 +113,9 @@
     }
   }
 
-  // ── V2 lab overlay ─────────────────────────────────────────────────────
-  // Only loaded when the operator explicitly opted in via the LAB tab.
-  // See memory: project_v1_vs_v2_terminal.md ("V1 = source of truth ;
-  // V2 = lab gated OFF, ne pas migrer").
-  if (localStorage.getItem('poybot_v2_lab') !== '1') return;
-
-  document.title = '⚗ POYBOT // V2 LAB MODE';
-
-  // Wait until V1 has booted React (window.LiveStore + window.LivePortfolio
-  // must exist before V2 rebinds them — otherwise the rebind no-ops).
-  await new Promise(res => {
-    if (window.LiveStore && window.LivePortfolio) return res();
-    const id = setInterval(() => {
-      if (window.LiveStore && window.LivePortfolio) { clearInterval(id); res(); }
-    }, 50);
-  });
-
-  try {
-    // Inject CSS + heavy CDN deps now (not on cold load).
-    const head = document.head;
-    const css = document.createElement('link');
-    css.rel = 'stylesheet';
-    css.href = '/static/dashboard/v2/theme.css';
-    head.appendChild(css);
-
-    // Ensure Babel is loaded (if we hit the dev-fallback path above, it
-    // already is; if we went via the bundle path, we still need it for
-    // the runtime-transformed V2 JSX).
-    if (!window.Babel) {
-      await new Promise((res, rej) => {
-        const s = document.createElement('script');
-        s.src = 'https://unpkg.com/@babel/standalone@7.29.0/babel.min.js';
-        s.crossOrigin = 'anonymous';
-        s.onload = res; s.onerror = rej;
-        head.appendChild(s);
-      });
-    }
-    await new Promise((res, rej) => {
-      const s = document.createElement('script');
-      s.src = 'https://unpkg.com/lightweight-charts@4.1.3/dist/lightweight-charts.standalone.production.js';
-      s.crossOrigin = 'anonymous';
-      s.onload = res; s.onerror = rej;
-      head.appendChild(s);
-    });
-    // Cosmograph is an ESM module — load via a dynamic <script type=module>.
-    const cosmoScript = document.createElement('script');
-    cosmoScript.type = 'module';
-    cosmoScript.textContent = `
-      import { Cosmograph } from 'https://esm.sh/@cosmograph/cosmograph@1.4.2';
-      window.Cosmograph = Cosmograph;
-      window.__cosmographReady = true;
-      window.dispatchEvent(new Event('cosmograph:ready'));
-    `;
-    head.appendChild(cosmoScript);
-
-    const v2Files = [
-      '/static/dashboard/v2/WalletGraph.jsx',
-      '/static/dashboard/v2/components/primitives/Panel.jsx',
-      '/static/dashboard/v2/components/primitives/Pill.jsx',
-      '/static/dashboard/v2/components/primitives/Stat.jsx',
-      '/static/dashboard/v2/components/primitives/StatusPill.jsx',
-      '/static/dashboard/v2/components/primitives/Sparkline.jsx',
-      '/static/dashboard/v2/components/primitives/KpiTile.jsx',
-      '/static/dashboard/v2/components/primitives/TimeframeSelector.jsx',
-      '/static/dashboard/v2/components/portfolio/PipelineStatus.jsx',
-      '/static/dashboard/v2/components/portfolio/KpiRow.jsx',
-      '/static/dashboard/v2/components/portfolio/EquityTimeline.jsx',
-      '/static/dashboard/v2/components/portfolio/PnLTicks.jsx',
-      '/static/dashboard/v2/components/portfolio/MarketPriceOverlay.jsx',
-      '/static/dashboard/v2/components/portfolio/TradeList.jsx',
-      '/static/dashboard/v2/components/portfolio/AllocationBar.jsx',
-      '/static/dashboard/v2/LivePortfolio.jsx',
-    ];
-
-    let combined = '';
-    for (const f of v2Files) {
-      try {
-        const text = await fetch(f).then(r => r.ok ? r.text() : Promise.reject('HTTP ' + r.status));
-        combined += '\n// ===== ' + f + ' =====\n;(function(){\n' + text + '\n})();\n';
-      } catch (e) {
-        console.error('[v2-lab] failed to load ' + f, e);
-      }
-    }
-
-    const code = Babel.transform(combined, { presets: ['react'], filename: 'v2-lab.jsx' }).code;
-    new Function(code)();
-    console.log('[v2-lab] ✓ V2 overlay loaded');
-  } catch (e) {
-    console.error('[v2-lab] init failed:', e);
-  }
+  // WG-A6 (2026-05-19) — V2 lab overlay removed. Wallet Graph V3 ships
+  // bundled in /static/dashboard/dist/dashboard.bundle.js; no more on-demand
+  // loaders, no more localStorage.poybot_v2_lab toggle.
 })();
 </script>
 </body>

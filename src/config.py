@@ -271,7 +271,13 @@ class Settings(BaseSettings):
     # killing 99.6 % of leader trades. Downstream paper_trader has its own
     # `stale_book` + `high_entry_ask_blocked` gates to handle out-of-date
     # entry prices, so 600 s here is safe.
-    LIVE_DECISION_MAX_TRADE_AGE_S: int = 600
+    # Plan 2026-05-19 P0-3: raised 600 → 1200. The data-acquisition audit
+    # measured Falcon REST per-wallet sweep p95 at 40-60s, p99 well past
+    # 600s when the per-wallet semaphore (20 concurrency) backs up. Live
+    # diagnostic showed `stale_trade>600s` as 24% of skip reasons. 1200s
+    # gives ~3x p95 headroom while paper_trader still rejects on its
+    # tighter `MAX_BOOK_AGE_PAPER_S=60s` book staleness check.
+    LIVE_DECISION_MAX_TRADE_AGE_S: int = 1200
 
     # ------------------------------------------------------------------ #
     # Paper Trading + Risk (CLAUDE.md § 9)                                #
@@ -315,6 +321,18 @@ class Settings(BaseSettings):
     # captures the high-PnL low-price entries while still excluding the
     # [0.0, 0.3) long-tail that loses money on average.
     MIN_ENTRY_PRICE: float = 0.30
+    # Plan 2026-05-19 P0-4 — market liquidity floor (default 1000 USDC,
+    # tunable via runtime_config knob `min_market_liquidity_usdc`).
+    # Replaces the hardcoded 5000.0 in confidence_engine.py that was
+    # producing 24% of skip reasons on fresh markets where leaders
+    # were actively trading.
+    MIN_MARKET_LIQUIDITY_USDC: float = 1_000.0
+    # Plan 2026-05-19 P0-5 — live-match multi-signal requirement.
+    # The legacy single-signal detector blocked 24% of decisions on
+    # gamma_flag alone; requiring 2 concurrent signals (gamma_flag +
+    # regex/volume) cuts the false-positive rate while keeping the
+    # genuinely-live matches blocked.
+    LIVE_MATCH_REQUIRE_SIGNALS: int = 2
     # Maximum allowed drift between leader's signal price and the bot's
     # actual entry ask (after the FADE flip). Without this gate the bot
     # has been booking "wins" against stale-cache exit prices that

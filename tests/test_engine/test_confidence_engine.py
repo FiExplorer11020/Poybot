@@ -84,14 +84,20 @@ class TestKellySize:
         if follow_size == follow_cap:
             assert abs(fade_size - fade_cap) < 0.01
 
-    def test_kelly_size_below_min_returns_zero(self):
-        """Very small Kelly fraction (<MIN_POSITION_USDC after multiply) → both zero."""
+    def test_kelly_size_below_min_returns_floor(self):
+        """Plan 2026-05-19 P6 fix: with cold-start floor (alpha+beta <= 6
+        AND kelly < 0.005 → floor to 0.005), a uniform prior no longer
+        returns zero — it returns the MIN_POSITION_USDC floor so the
+        learning loop accumulates outcomes. Previously this test
+        expected (0, 0); the cold-start floor was added intentionally
+        by the 2026-05 strategy fix and is the correct behavior now.
+        """
         engine = make_engine()
-        # p close to 0.5 with heavy uncertainty → tiny f* → size below floor
-        # Use alpha=1, beta_=1 (uniform prior, p=0.5, f*=0, size=0)
         kelly_frac, size_usdc = engine._kelly_size("follow", alpha=1.0, beta_=1.0)
-        assert size_usdc == 0.0
-        assert kelly_frac == 0.0
+        # With kelly_fraction floor of 0.005 and capital $10k → size = $50,
+        # then floored to MIN_POSITION_USDC = $50.
+        assert size_usdc == settings.MIN_POSITION_USDC
+        assert kelly_frac > 0.0
 
     def test_kelly_size_zero_for_degenerate_p(self):
         """alpha or beta near 0 should not crash and should return zeros."""
@@ -177,6 +183,40 @@ class TestThompsonSampling:
 # ---------------------------------------------------------------------------
 
 
+@pytest.fixture
+def _high_liquidity_db():
+    """Plan 2026-05-19 P6 — patch get_db so the low_market_liquidity
+    gate sees a 10k market volume and passes. Used by happy-path
+    TestEvaluate cases that don't otherwise mock the DB.
+    """
+    @asynccontextmanager
+    async def _ctx():
+        conn = AsyncMock()
+        conn.fetchrow = AsyncMock(return_value={"volume_24h": 10_000.0})
+        conn.fetchval = AsyncMock(return_value=42)
+        conn.execute = AsyncMock()
+        yield conn
+
+    with patch(
+        "src.engine.confidence_engine.get_db", side_effect=_ctx
+    ):
+        yield
+
+
+@pytest.fixture
+def _accept_signal_audit():
+    """Plan 2026-05-19 P6 — bypass the signal_audit short-circuit
+    introduced by P1-4 so happy-path engine tests still produce a
+    Decision. Production callers MUST flip accepted=True only when
+    fee_snapshots + token_map + book are fresh; in tests we just
+    pretend that's the case."""
+    yield {
+        "accepted": True,
+        "strategy_track": "leader_swing",
+        "reason": "test_accepted",
+    }
+
+
 class TestEvaluate:
     @pytest.mark.asyncio
     async def test_evaluate_skips_insufficient_data(self):
@@ -213,7 +253,13 @@ class TestEvaluate:
 
     @pytest.mark.asyncio
     async def test_evaluate_ignores_stale_trade_events(self):
-        """Historical backfill trades should not create decisions or logs."""
+        """Historical backfill trades should not create decisions, but
+        the 2026-05-17 audit explicitly added decision_log visibility on
+        the stale_trade gate (`we log to decision_log now so future
+        operators can SEE the gate fire instead of silent-skipping`).
+        Plan 2026-05-19 P6: update assertion to reflect current correct
+        behavior — `_log_decision` IS awaited once with action='skip' +
+        reason='stale_trade|...'."""
         engine = make_engine()
         engine._get_readiness = AsyncMock()
         engine._log_decision = AsyncMock()
@@ -231,10 +277,16 @@ class TestEvaluate:
 
         assert result is None
         engine._get_readiness.assert_not_awaited()
-        engine._log_decision.assert_not_awaited()
+        engine._log_decision.assert_awaited_once()
+        call_args = engine._log_decision.await_args[0]
+        # signature: (wallet, market_id, action, ..., reason)
+        assert "skip" in call_args
+        # Reason is the last positional arg before keyword args.
+        reason_arg = call_args[-1]
+        assert "stale_trade" in str(reason_arg)
 
     @pytest.mark.asyncio
-    async def test_evaluate_returns_follow_when_follow_ready(self):
+    async def test_evaluate_returns_follow_when_follow_ready(self, _high_liquidity_db, _accept_signal_audit):
         """Follow-ready leader with thompson_follow > thompson_fade → action='follow'."""
         engine = make_engine()
         wallet = "0xBBB"
@@ -256,6 +308,7 @@ class TestEvaluate:
         # Suppress DB/Redis side-effects
         engine._log_decision = AsyncMock()
         engine._emit = AsyncMock()
+        engine._build_signal_audit = AsyncMock(return_value=_accept_signal_audit)
 
         # Force exploration OFF so Thompson drives the decision
         with patch("numpy.random.random", return_value=1.0):  # > any exploration floor
@@ -275,7 +328,7 @@ class TestEvaluate:
         assert decision.leader_wallet == wallet
 
     @pytest.mark.asyncio
-    async def test_evaluate_returns_fade_when_only_fade_ready(self):
+    async def test_evaluate_returns_fade_when_only_fade_ready(self, _high_liquidity_db, _accept_signal_audit):
         """Only fade_ready (follow not ready) → action must be 'fade'."""
         engine = make_engine()
         wallet = "0xCCC"
@@ -289,6 +342,7 @@ class TestEvaluate:
         )
         engine._log_decision = AsyncMock()
         engine._emit = AsyncMock()
+        engine._build_signal_audit = AsyncMock(return_value=_accept_signal_audit)
 
         # Force exploration OFF
         with patch("numpy.random.random", return_value=1.0):
@@ -306,7 +360,7 @@ class TestEvaluate:
         assert decision.action == "fade"
 
     @pytest.mark.asyncio
-    async def test_evaluate_exploration_floor_still_returns_valid_action(self):
+    async def test_evaluate_exploration_floor_still_returns_valid_action(self, _high_liquidity_db, _accept_signal_audit):
         """When forced into exploration, returned action must still be a valid string."""
         engine = make_engine()
         wallet = "0xDDD"
@@ -320,6 +374,7 @@ class TestEvaluate:
         )
         engine._log_decision = AsyncMock()
         engine._emit = AsyncMock()
+        engine._build_signal_audit = AsyncMock(return_value=_accept_signal_audit)
 
         # Force random() < exploration_floor to trigger exploration branch
         with patch("numpy.random.random", return_value=0.0):
@@ -377,7 +432,7 @@ class TestEvaluate:
         assert "skip" in call_args
 
     @pytest.mark.asyncio
-    async def test_evaluate_logs_every_follow_decision(self):
+    async def test_evaluate_logs_every_follow_decision(self, _high_liquidity_db, _accept_signal_audit):
         """Every non-None decision must result in exactly one _log_decision call."""
         engine = make_engine()
         wallet = "0xFFF"
@@ -391,6 +446,7 @@ class TestEvaluate:
         )
         engine._log_decision = AsyncMock()
         engine._emit = AsyncMock()
+        engine._build_signal_audit = AsyncMock(return_value=_accept_signal_audit)
 
         with patch("numpy.random.random", return_value=1.0):
             with patch("numpy.random.beta", side_effect=[0.9, 0.1]):
@@ -407,7 +463,16 @@ class TestEvaluate:
         engine._log_decision.assert_awaited_once()
 
     @pytest.mark.asyncio
-    async def test_evaluate_attaches_signal_audit_before_logging_decision(self):
+    async def test_evaluate_short_circuits_when_signal_audit_rejected(self, _high_liquidity_db):
+        """Plan 2026-05-19 P1-4: when `signal_audit.accepted=False`,
+        the engine must short-circuit and emit a 'skip' decision instead
+        of emitting an actionable decision that paper_trader would
+        then reject. Previously the engine emitted the decision even
+        with accepted=False — this caused 158 actionable/0 paper trades
+        in the 18/05 live diagnostic. The fix is verified here: decision
+        is None, _log_decision called with reason containing
+        'signal_audit_rejected_at_engine'.
+        """
         engine = make_engine()
         wallet = "0xAUDIT"
         engine._get_readiness = AsyncMock(
@@ -428,6 +493,7 @@ class TestEvaluate:
             return_value={
                 "accepted": False,
                 "reject_reason": "missing_fee_snapshot",
+                "reason": "missing_fee_snapshot",
                 "strategy_track": "leader_swing",
             }
         )
@@ -444,10 +510,17 @@ class TestEvaluate:
                     }
                 )
 
-        assert decision is not None
-        assert decision.signal_audit["reject_reason"] == "missing_fee_snapshot"
+        assert decision is None
         engine._build_signal_audit.assert_awaited_once()
-        assert engine._log_decision.await_args.kwargs["signal_audit"]["accepted"] is False
+        engine._log_decision.assert_awaited()
+        # The final call to _log_decision (the short-circuit) must
+        # carry the rejection reason in its positional args.
+        last_call_args = engine._log_decision.await_args[0]
+        assert "skip" in last_call_args
+        assert any(
+            "signal_audit_rejected_at_engine" in str(a)
+            for a in last_call_args
+        )
 
 
 class TestDecisionEmission:

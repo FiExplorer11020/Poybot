@@ -133,6 +133,22 @@ async def main() -> None:
     )
     redis_client = redis_async.from_url(settings.REDIS_URL, decode_responses=True)
 
+    # B3 fix (2026-05-19): publish a persistent engine-boot timestamp so
+    # the API (a separate, often-restarted container) can compute a real
+    # uptime instead of resetting to 0 every time the API process is
+    # recycled. SET NX = "set only if missing" — the value survives API
+    # restarts but is intentionally rewritten on engine cold-starts so
+    # operator-driven engine restarts surface as a fresh uptime.
+    try:
+        import time as _time_mod
+        await redis_client.set(
+            "bot:engine:started_at",
+            str(_time_mod.time()),
+        )
+        logger.info("bot:engine:started_at written to Redis")
+    except Exception as exc:
+        logger.warning(f"Failed to write bot:engine:started_at: {exc}")
+
     # Killswitch service shared across components — the Telegram bot
     # mutates it via /killswitch and /pause /resume, RiskManager reads
     # it on every trade attempt.

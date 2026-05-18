@@ -314,6 +314,14 @@ async def _health_checks(force: bool = False) -> dict:
         pipeline_stage_health: dict = {}
         ws_msgs_last_minute: int = 0
 
+        # B7+B8 fix (2026-05-19): when either the DB acquire or the
+        # pipeline-stage snapshot raises, we must surface "unknown" in
+        # the downstream stage_status rather than silently report
+        # "blocked" / "empty" (which the dashboard renders as RED — the
+        # operator then chases a phantom failure that's really a DB
+        # timeout). Track the failure explicitly so the stage_status
+        # block below can fall back to "unknown".
+        pipeline_health_failed = False
         try:
             async with _pool.acquire() as conn:
                 last = await conn.fetchval(
@@ -324,12 +332,15 @@ async def _health_checks(force: bool = False) -> dict:
                     pipeline_stage_health = await _db_pipeline_stage_health_snapshot(conn)
                 except Exception as exc:
                     logger.warning(f"Pipeline stage health check failed: {exc}")
+                    pipeline_health_failed = True
+                    pipeline_stage_health = {}
             db_ok = True
             last_trade_age_s = float(last) if last is not None else None
             data_accumulation_counts = db_quality.get("counts", {})
         except Exception as e:
             logger.warning(f"DB health check failed: {e}")
             db_quality = {}
+            pipeline_health_failed = True
 
         try:
             await _redis.ping()
@@ -374,18 +385,28 @@ async def _health_checks(force: bool = False) -> dict:
 
         pipeline_stage_health["signal_rejections_1h"] = rejected_signals_1h
         pipeline_stage_health["paper_rejections_1h"] = paper_rejections_1h
-        pipeline_stage_health["stage_status"] = {
-            "book_capture": (
+        # B7+B8 fix (2026-05-19): differentiate "unknown" (DB / snapshot
+        # query failed) from "blocked" / "empty" (DB returned but the
+        # counters were zero). Without this, a DB timeout silently
+        # presents as a hard failure on the dashboard.
+        if pipeline_health_failed:
+            book_capture_status = "unknown"
+            readiness_status = "unknown"
+        else:
+            book_capture_status = (
                 "healthy"
                 if book_age_p95_s is not None
                 and int(pipeline_stage_health.get("book_quality_snapshots_5m") or 0) > 0
                 else "blocked"
-            ),
-            "readiness_persistence": (
+            )
+            readiness_status = (
                 "active"
                 if int(pipeline_stage_health.get("market_belief_states") or 0) > 0
                 else "empty"
-            ),
+            )
+        pipeline_stage_health["stage_status"] = {
+            "book_capture": book_capture_status,
+            "readiness_persistence": readiness_status,
             "signal_gate": "active" if rejected_signals_1h else "idle",
             "paper_execution": "active" if paper_rejections_1h else "idle",
         }
@@ -1335,12 +1356,25 @@ async def api_overview():
 
     # --- Bot block (light — no terminal snapshot needed) ---------------- #
     health = await _health_checks()
-    # Process uptime — computed from module load time (same source the
-    # terminal snapshot uses, just inlined to avoid the snapshot cost).
+    # Process uptime — B3 fix (2026-05-19): prefer the engine-boot
+    # timestamp persisted in Redis (`bot:engine:started_at`, set by
+    # `src/engine/main.py`) so the value survives API container restarts.
+    # The API container is short-lived (frequent rebuilds); the engine
+    # container is the source-of-truth for "bot has been running for X
+    # seconds". Fallback: API module-load time, then 0.
+    uptime_seconds = 0
     try:
-        uptime_seconds = int((datetime.now(timezone.utc) - _api_started_at).total_seconds())
-    except Exception:
-        uptime_seconds = 0
+        if _redis is not None:
+            engine_ts_raw = await _redis.get("bot:engine:started_at")
+            if engine_ts_raw is not None:
+                uptime_seconds = max(0, int(time.time() - float(engine_ts_raw)))
+    except Exception as exc:
+        logger.warning(f"uptime: failed to read bot:engine:started_at: {exc}")
+    if uptime_seconds == 0:
+        try:
+            uptime_seconds = int((datetime.now(timezone.utc) - _api_started_at).total_seconds())
+        except Exception:
+            uptime_seconds = 0
     # `_health_checks()` exposes booleans under keys 'db' + 'redis'
     # (not 'database'). Treat the bot as 'running' if both backends
     # respond AND the WS hasn't gone silent (last message < 60s ago).
