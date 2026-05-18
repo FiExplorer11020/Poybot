@@ -3152,6 +3152,12 @@ async def inspector_snapshot(conn, redis_client=None, limit: int = 80) -> dict:
     if redis_client is not None:
         try:
             ts = await redis_client.get("ws:market:last_message_ts")
+            # FIX (post-deploy 2026-05-19): mark Redis reachable as soon as
+            # the FIRST get succeeds — otherwise a later sub-fetch (PUBSUB
+            # NUMSUB, etc.) raising an exception would keep redis_reachable
+            # = False even though Redis is clearly alive. The dashboard's
+            # "Redis reachable: DOWN" false-negative came from this.
+            pipeline["redis_reachable"] = True
             if ts is not None:
                 pipeline["ws_last_message_age_s"] = max(0.0, now.timestamp() - float(ts))
             # KEY MISMATCH FIX (Batch 2 / A7): the producer in
@@ -3196,7 +3202,6 @@ async def inspector_snapshot(conn, redis_client=None, limit: int = 80) -> dict:
                     pipeline["trades_pubsub_subscribers"] = int(channels[1])
             except Exception:
                 pass
-            pipeline["redis_reachable"] = True
         except Exception as exc:
             logger.warning(f"inspector_snapshot redis fetch failed: {exc}")
 
@@ -3842,18 +3847,25 @@ async def ml_diagnostics(conn) -> dict:
     out: dict = {}
 
     # 1. Close-method distribution (validates merge detection per CLAUDE.md §14)
-    cm_rows = await conn.fetch(
-        """
-        SELECT COALESCE(close_method, 'open') AS method,
-               COUNT(*)::int AS n,
-               AVG(holding_period_s)::int AS avg_holding_s,
-               PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY holding_period_s)::int AS median_holding_s
-        FROM positions_reconstructed
-        WHERE open_time > NOW() - INTERVAL '30 days'
-        GROUP BY 1
-        ORDER BY n DESC
-        """
-    )
+    # Resilience: each ml_diagnostics SQL query is independently wrapped so
+    # one slow aggregate (statement timeout) doesn't 500 the whole endpoint.
+    # Empty list = section absent from response; downstream iterators handle it.
+    try:
+        cm_rows = await conn.fetch(
+            """
+            SELECT COALESCE(close_method, 'open') AS method,
+                   COUNT(*)::int AS n,
+                   AVG(holding_period_s)::int AS avg_holding_s,
+                   PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY holding_period_s)::int AS median_holding_s
+            FROM positions_reconstructed
+            WHERE open_time > NOW() - INTERVAL '30 days'
+            GROUP BY 1
+            ORDER BY n DESC
+            """
+        )
+    except Exception as exc:
+        logger.warning(f"ml_diagnostics.close_methods failed: {exc}")
+        cm_rows = []
     total_pos = sum(_to_int(_row_get(r, "n"), 0) for r in cm_rows) or 1
     out["close_methods"] = [
         {
@@ -3868,15 +3880,19 @@ async def ml_diagnostics(conn) -> dict:
 
     # 2. Sample efficiency: positions_resolved / trades_observed per leader,
     #    aggregated. Low ratio = lots of activity but few reconstructable cycles.
-    eff_row = await conn.fetchrow(
-        """
-        SELECT
-            SUM(trades_observed)::int   AS sum_trades,
-            SUM(positions_resolved)::int AS sum_resolved,
-            COUNT(*) FILTER (WHERE trades_observed > 0)::int AS active_profiles
-        FROM leader_profiles
-        """
-    )
+    try:
+        eff_row = await conn.fetchrow(
+            """
+            SELECT
+                SUM(trades_observed)::int   AS sum_trades,
+                SUM(positions_resolved)::int AS sum_resolved,
+                COUNT(*) FILTER (WHERE trades_observed > 0)::int AS active_profiles
+            FROM leader_profiles
+            """
+        )
+    except Exception as exc:
+        logger.warning(f"ml_diagnostics.sample_efficiency failed: {exc}")
+        eff_row = None
     sum_trades = _to_int(_row_get(eff_row, "sum_trades"), 0) or 1
     sum_resolved = _to_int(_row_get(eff_row, "sum_resolved"), 0)
     out["sample_efficiency"] = {
@@ -3887,20 +3903,24 @@ async def ml_diagnostics(conn) -> dict:
     }
 
     # 3. Holding period by phase (when did the position open).
-    hp_rows = await conn.fetch(
-        """
-        SELECT lp.error_model_phase AS phase,
-               PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY p.holding_period_s)::int AS median_s,
-               PERCENTILE_CONT(0.9) WITHIN GROUP (ORDER BY p.holding_period_s)::int AS p90_s,
-               COUNT(*)::int AS n
-        FROM positions_reconstructed p
-        JOIN leader_profiles lp ON lp.wallet_address = p.wallet_address
-        WHERE p.holding_period_s IS NOT NULL AND p.holding_period_s > 0
-          AND p.open_time > NOW() - INTERVAL '30 days'
-        GROUP BY 1
-        ORDER BY 1
-        """
-    )
+    try:
+        hp_rows = await conn.fetch(
+            """
+            SELECT lp.error_model_phase AS phase,
+                   PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY p.holding_period_s)::int AS median_s,
+                   PERCENTILE_CONT(0.9) WITHIN GROUP (ORDER BY p.holding_period_s)::int AS p90_s,
+                   COUNT(*)::int AS n
+            FROM positions_reconstructed p
+            JOIN leader_profiles lp ON lp.wallet_address = p.wallet_address
+            WHERE p.holding_period_s IS NOT NULL AND p.holding_period_s > 0
+              AND p.open_time > NOW() - INTERVAL '30 days'
+            GROUP BY 1
+            ORDER BY 1
+            """
+        )
+    except Exception as exc:
+        logger.warning(f"ml_diagnostics.holding_by_phase failed: {exc}")
+        hp_rows = []
     out["holding_by_phase"] = [
         {
             "phase": _to_int(_row_get(r, "phase"), 1),
@@ -3913,20 +3933,28 @@ async def ml_diagnostics(conn) -> dict:
 
     # 4. Category coverage trend — % of trades with a non-unknown category,
     #    bucketed per day for the last 14 days.
-    cov_rows = await conn.fetch(
-        """
-        SELECT DATE_TRUNC('day', time)::date AS day,
-               COUNT(*)::int AS total,
-               COUNT(*) FILTER (
-                   WHERE category IS NOT NULL
-                     AND category NOT IN ('', 'unknown', 'none', 'null')
-               )::int AS known
-        FROM trades_observed
-        WHERE time > NOW() - INTERVAL '14 days'
-        GROUP BY 1
-        ORDER BY 1
-        """
-    )
+    # NOTE: this scans 14 days of trades_observed (60M+ rows). Statement
+    # timeout is expected on cold partitions; wrap so a slow scan doesn't
+    # nuke the entire ML diagnostics endpoint. Card "CATEGORY COVERAGE · 14D"
+    # will render empty when this section fails.
+    try:
+        cov_rows = await conn.fetch(
+            """
+            SELECT DATE_TRUNC('day', time)::date AS day,
+                   COUNT(*)::int AS total,
+                   COUNT(*) FILTER (
+                       WHERE category IS NOT NULL
+                         AND category NOT IN ('', 'unknown', 'none', 'null')
+                   )::int AS known
+            FROM trades_observed
+            WHERE time > NOW() - INTERVAL '14 days'
+            GROUP BY 1
+            ORDER BY 1
+            """
+        )
+    except Exception as exc:
+        logger.warning(f"ml_diagnostics.category_coverage failed: {exc}")
+        cov_rows = []
     out["category_coverage"] = [
         {
             "day": _row_get(r, "day").isoformat() if _row_get(r, "day") else None,
@@ -3947,15 +3975,19 @@ async def ml_diagnostics(conn) -> dict:
     # converges with reconciliation regardless of which producer wrote
     # the row. Without this the dashboard's "DECISIONS 24H" card
     # showed 0 when the engine was emitting only legacy actions.
-    dec_rows = await conn.fetch(
-        """
-        SELECT LOWER(action) AS action, COUNT(*)::int AS n
-        FROM decision_log
-        WHERE time > NOW() - INTERVAL '24 hours'
-          AND action IS NOT NULL
-        GROUP BY LOWER(action)
-        """
-    )
+    try:
+        dec_rows = await conn.fetch(
+            """
+            SELECT LOWER(action) AS action, COUNT(*)::int AS n
+            FROM decision_log
+            WHERE time > NOW() - INTERVAL '24 hours'
+              AND action IS NOT NULL
+            GROUP BY LOWER(action)
+            """
+        )
+    except Exception as exc:
+        logger.warning(f"ml_diagnostics.decisions_24h failed: {exc}")
+        dec_rows = []
     total_dec_raw = sum(_to_int(_row_get(r, "n"), 0) for r in dec_rows)
     total_dec = total_dec_raw or 1  # guard against /0 in pct calc
     out["decisions_24h"] = {
@@ -3972,23 +4004,27 @@ async def ml_diagnostics(conn) -> dict:
 
     # 6. Falcon enrichment lag — for leaders who got a wallet360, how long
     #    did it take from first_seen to last_refresh.
-    lag_row = await conn.fetchrow(
-        """
-        SELECT
-            PERCENTILE_CONT(0.5) WITHIN GROUP (
-                ORDER BY EXTRACT(EPOCH FROM (last_refresh - first_seen))
-            )::int AS median_s,
-            PERCENTILE_CONT(0.9) WITHIN GROUP (
-                ORDER BY EXTRACT(EPOCH FROM (last_refresh - first_seen))
-            )::int AS p90_s,
-            COUNT(*) FILTER (WHERE wallet360_json IS NOT NULL)::int AS enriched,
-            COUNT(*) FILTER (
-                WHERE wallet360_json IS NULL AND excluded = FALSE
-            )::int AS pending
-        FROM leaders
-        WHERE last_refresh IS NOT NULL AND first_seen IS NOT NULL
-        """
-    )
+    try:
+        lag_row = await conn.fetchrow(
+            """
+            SELECT
+                PERCENTILE_CONT(0.5) WITHIN GROUP (
+                    ORDER BY EXTRACT(EPOCH FROM (last_refresh - first_seen))
+                )::int AS median_s,
+                PERCENTILE_CONT(0.9) WITHIN GROUP (
+                    ORDER BY EXTRACT(EPOCH FROM (last_refresh - first_seen))
+                )::int AS p90_s,
+                COUNT(*) FILTER (WHERE wallet360_json IS NOT NULL)::int AS enriched,
+                COUNT(*) FILTER (
+                    WHERE wallet360_json IS NULL AND excluded = FALSE
+                )::int AS pending
+            FROM leaders
+            WHERE last_refresh IS NOT NULL AND first_seen IS NOT NULL
+            """
+        )
+    except Exception as exc:
+        logger.warning(f"ml_diagnostics.falcon_enrichment_lag failed: {exc}")
+        lag_row = None
     out["falcon_enrichment_lag"] = {
         "median_s": _to_int(_row_get(lag_row, "median_s"), 0),
         "p90_s": _to_int(_row_get(lag_row, "p90_s"), 0),
@@ -3998,29 +4034,33 @@ async def ml_diagnostics(conn) -> dict:
 
     # 7. Phase progression ETA — how many days to reach P2 / P3 at current
     #    velocity. Estimated as (target - current) / (current_per_day).
-    phase_rows = await conn.fetch(
-        """
-        WITH velocity AS (
-            SELECT lp.wallet_address,
-                   lp.error_model_phase,
-                   lp.positions_resolved,
-                   COUNT(p.id) FILTER (
-                       WHERE p.close_time > NOW() - INTERVAL '7 days'
-                   )::float AS resolved_7d
-            FROM leader_profiles lp
-            LEFT JOIN positions_reconstructed p USING (wallet_address)
-            WHERE lp.error_model_phase < 3
-            GROUP BY lp.wallet_address, lp.error_model_phase, lp.positions_resolved
+    try:
+        phase_rows = await conn.fetch(
+            """
+            WITH velocity AS (
+                SELECT lp.wallet_address,
+                       lp.error_model_phase,
+                       lp.positions_resolved,
+                       COUNT(p.id) FILTER (
+                           WHERE p.close_time > NOW() - INTERVAL '7 days'
+                       )::float AS resolved_7d
+                FROM leader_profiles lp
+                LEFT JOIN positions_reconstructed p USING (wallet_address)
+                WHERE lp.error_model_phase < 3
+                GROUP BY lp.wallet_address, lp.error_model_phase, lp.positions_resolved
+            )
+            SELECT wallet_address,
+                   error_model_phase,
+                   positions_resolved,
+                   resolved_7d
+            FROM velocity
+            ORDER BY resolved_7d DESC NULLS LAST
+            LIMIT 6
+            """
         )
-        SELECT wallet_address,
-               error_model_phase,
-               positions_resolved,
-               resolved_7d
-        FROM velocity
-        ORDER BY resolved_7d DESC NULLS LAST
-        LIMIT 6
-        """
-    )
+    except Exception as exc:
+        logger.warning(f"ml_diagnostics.phase_eta failed: {exc}")
+        phase_rows = []
     eta_list = []
     for r in phase_rows:
         phase = _to_int(_row_get(r, "error_model_phase"), 1)

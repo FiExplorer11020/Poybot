@@ -47,7 +47,7 @@ from src.engine.neural_readiness import ReadinessInputs, build_neural_readiness_
 # bridge subscribes to the pubsub channel for push-fanout.
 SNAPSHOT_REDIS_KEY = "snapshot:live_summary"
 SNAPSHOT_BUILT_AT_KEY = "snapshot:live_summary:built_at"
-SNAPSHOT_TTL_S = 120
+SNAPSHOT_TTL_S = 300  # 5min — survives a slow rebuild (90-130s, see A7)
 SNAPSHOT_PUBSUB_CHANNEL = "snapshot:live_summary:updated"
 
 # Singleton in-process lock — guarantees that overlapping maintenance
