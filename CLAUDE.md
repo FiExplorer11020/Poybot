@@ -638,6 +638,16 @@ a git checkout). Postgres user/db are `polymarket` (NOT `postgres`).
 | telegram_bot/alerts         | IMPLEMENTED | règles configurables (drawdown / daily_loss / win_rate_below / idle_minutes), cooldown 30min, persistance Redis |
 | monitoring/metrics          | IMPLEMENTED | health and runtime support utilities                                                      |
 | Frontend (8 tabs)           | IMPLEMENTED | Alpha Terminal, ML Progression, Wallet Graph (incl. Wallet Scanner table), Live Portfolio, Decision Engine, Inspector, Risk & Config, Bot Health |
+| Frontend (LAB tab)          | IMPLEMENTED | R7/R8/R9/R10 cockpit + V2 dashboard overlay toggle (localStorage.poybot_v2_lab) |
+| Reconciliation API          | IMPLEMENTED | `/api/inspector/reconciliation` + `/trades` + `/run` (src/api/reconciliation_queries.py); verdict ok<$25, warn<$250, critical≥$250 |
+| Pillars health API          | IMPLEMENTED | `/api/health/pillars` exposes 5-pillar status (oracle/recon/backfill/spread_gates/audit_log); src/api/pillars_queries.py |
+| Emergency halt API          | IMPLEMENTED | `POST /api/control/halt` = killswitch off + Redis pubsub `control:halt` → PaperTrader.force_close_all_positions |
+| UI RECON chip + ModeChip    | IMPLEMENTED | Sidebar always-rendered chip + 3-state mode badge with drift suffix |
+| UI Reconciliation panel     | IMPLEMENTED | Inspector tab — hero delta, sparkline, phantom/premature counts, drift drill-down modal |
+| UI 5-pillars gauge          | IMPLEMENTED | Bot Health tab — overall_ok = AND of all 5 |
+| UI category risk badges     | IMPLEMENTED | dashboard-components.jsx categoryRisk helper; flagged at 4 sites |
+| UI honest controls          | IMPLEMENTED | ENABLE/DISABLE TRADING (killswitch) + distinct EMERGENCY HALT |
+| JSX precompile (esbuild)    | IMPLEMENTED | static/dashboard/dist/dashboard.bundle.js (160KB, 19ms build); Babel-on-the-fly removed (dev fallback preserved) |
 
 ---
 
@@ -724,6 +734,30 @@ INGEST_ALERT_COOLDOWN_S=300                 # per-source for ingest_gap
 The following items were delivered this session and are reflected in the
 sections above. Keep this changelog concise — old entries get pruned
 when they become "the way it has always worked".
+
+- **UI mission alignment (2026-05-18, PLAN-UIA-001)** : Operator dashboard
+  rebuilt to expose paper-truth reconciliation per memory
+  `project_paper_trading_truth.md` (audit found +$39 784 displayed vs
+  −$2 062 real). V2 dashboard now correctly gated by
+  `localStorage.poybot_v2_lab` (default OFF — V1 source of truth per memory
+  `project_v1_vs_v2_terminal.md`); LAB tab provides toggle. New backend:
+  `/api/inspector/reconciliation` (summary + drift trades + run-now),
+  `/api/health/pillars` (5-pillar gauge), `/api/control/halt` (killswitch
+  off + force_close_all_positions via Redis pubsub `control:halt`).
+  Snapshot now includes `bot.execution_mode` (paper/live/dual), `reconciliation`
+  (verdict), `health_pillars`. New UI surfaces: sidebar RECON chip (always
+  rendered per ADR-PMK-014.10), Inspector → Paper Truth Reconciliation panel
+  + drift drill-down, Bot Health → 5-pillars gauge, LivePortfolio
+  reconciliation stamp, ModeChip (PAPER · OK / WARN / DRIFT / LIVE / DUAL),
+  category risk badges on crypto/high-fee markets, Win Rate first in sidebar
+  (mission KPI, was PnL), honest controls (ENABLE/DISABLE TRADING + distinct
+  EMERGENCY HALT). Dead code removed: MarketScanner (167 LOC), Tweaks panel,
+  `PoybotNav.go` typo replaced with `setActiveTab`. Topbar latency now shows
+  WS lag (`ws_last_message_age_s`) not `bot.latency_ms`. Keyboard shortcut
+  `g l` added for LAB. JSX precompiled via esbuild →
+  `static/dashboard/dist/dashboard.bundle.js` (162KB minified, 19ms build);
+  Babel-on-the-fly removed from cold path (dev fallback preserved in
+  `templates/dashboard.html`). 35 new pytest cases pass. ADR-PMK-014 + runbook.
 
 - **Data quality** : `enrich_leaders` now stamps `excluded=TRUE,
   on_watchlist=FALSE` for `falcon_no_data` wallets. `sync_markets` skips

@@ -49,6 +49,7 @@ services:
   postgres:
     image: postgres:15
     container_name: polymarket_db
+    restart: unless-stopped
     # Dev default. Prod override in docker-compose.prod.yml raises
     # max_connections to 500 (2026-05-17): the observer's expanded
     # subscription pool (MAX_OBSERVER_WS_TOKENS 100→400, wallet_limit
@@ -71,6 +72,7 @@ services:
   redis:
     image: redis:7.2-alpine
     container_name: polymarket_redis
+    restart: unless-stopped
     command: redis-server --appendonly yes --maxmemory 128mb --maxmemory-policy allkeys-lru
     ports:
       - "6379:6379"
@@ -407,7 +409,7 @@ services:
       - "--port"
       - "8080"
     ports:
-      - "8080:8080"
+      - "8088:8080"
     healthcheck:
       # API has its own /healthz endpoint — prefer that over the
       # generic Redis+DB probe.

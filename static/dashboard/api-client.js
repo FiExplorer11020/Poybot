@@ -147,11 +147,26 @@
   const poll = () => { if (!alive) return; loadSnap().finally(() => alive && setTimeout(poll, 5000)); };
 
   // ── Public API actions ─────────────────────────────────────────────────────
+  // PLAN-UIA-001: honest controls. Three distinct verbs that map to two
+  // distinct backend endpoints:
+  //   enable  → POST /api/control/killswitch {enabled: true}
+  //   disable → POST /api/control/killswitch {enabled: false}
+  //   halt    → POST /api/control/halt  (killswitch + force_close_all_positions)
+  // The old aliases (start/stop/pause/resume) all flipped the same killswitch
+  // bit, which was operator-confusing. Stripped.
   window.PoybotAPI = {
     botControl: async (cmd) => {
-      // /api/control/killswitch is the only control surface exposed by the
-      // backend; map dashboard verbs to its enabled flag.
-      const enabledByCmd = { start: true, resume: true, stop: false, pause: false, halt: false };
+      if (cmd === 'halt') {
+        const r = await fetch(`${API_BASE}/api/control/halt`, {
+          method: 'POST',
+          headers: hdrs(),
+          body: JSON.stringify({ reason: 'dashboard:halt', actor: 'dashboard' }),
+        });
+        if (!r.ok) throw new Error(`HTTP ${r.status}: ${await r.text()}`);
+        loadSnap();
+        return r.json();
+      }
+      const enabledByCmd = { enable: true, disable: false };
       if (!(cmd in enabledByCmd)) throw new Error(`Unknown control command: ${cmd}`);
       const r = await fetch(`${API_BASE}/api/control/killswitch`, {
         method: 'POST',

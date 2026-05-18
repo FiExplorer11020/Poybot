@@ -106,7 +106,8 @@ class TelegramBot:
 
     async def start(self) -> None:
         if not self._enabled:
-            logger.info("TelegramBot disabled (config), skipping start")
+            logger.info("TelegramBot disabled (config), idling start coroutine")
+            await asyncio.Event().wait()
             return
         if self._running:
             return

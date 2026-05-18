@@ -24,3 +24,10 @@ research/duckdb/
 # ./models docker-compose volume. Pickles can be 1-10 MB binary;
 # train each environment from its own labels.
 models/
+
+# PLAN-UIA-001 — JSX precompile output (scripts/build_dashboard.mjs)
+node_modules/
+static/dashboard/dist/
+# Playwright outputs
+test-results/
+playwright-report/

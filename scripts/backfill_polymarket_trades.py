@@ -88,9 +88,10 @@ def _normalize_trade(raw: dict) -> tuple | None:
         wallet = (raw.get("proxyWallet") or "").strip()
         market_id = (raw.get("conditionId") or "").strip()
         token_id = (raw.get("asset") or "").strip()
-        side = (raw.get("side") or "").strip().lower()
-        if side not in ("buy", "sell"):
+        side_raw = (raw.get("side") or "").strip().lower()
+        if side_raw not in ("buy", "sell"):
             return None
+        side = side_raw.upper()  # canonical UPPERCASE — matches api_market/api_wallet inserts and engine `side == "BUY"/"SELL"` checks
         if not (wallet and market_id and token_id):
             return None
         price = Decimal(str(raw.get("price") or 0))
@@ -114,8 +115,8 @@ def _normalize_trade(raw: dict) -> tuple | None:
         price,
         size_usdc,
         "backfill",  # 8 chars — fits trades_observed.source VARCHAR(10)
-        False,  # is_leader — let the live pipeline re-flag on the next refresh
-        "unknown",  # category — markets row may not exist; left to refiner
+        True,  # is_leader — all wallets sourced from wallet_universe are leader candidates; downstream gates (profiler, error_model) require is_leader=TRUE
+        "unknown",  # category — markets row may not exist; live UPDATE from markets table post-run handles enrichment
     )
 
 
@@ -286,6 +287,25 @@ async def run(args: argparse.Namespace) -> int:
             f"{total_fetched} fetched, {total_inserted} inserted "
             f"({total_fetched - total_inserted} duplicates skipped)"
         )
+
+        # Post-run enrichment: backfill inserts with category='unknown' by
+        # default (markets row may not exist at insert time). Re-resolve
+        # against the current markets table so downstream category
+        # whitelist gates see the correct value.
+        async with pool.acquire() as conn:
+            cat_result = await conn.execute(
+                """
+                UPDATE trades_observed t
+                SET category = m.category
+                FROM markets m
+                WHERE t.market_id = m.market_id
+                  AND t.source = 'backfill'
+                  AND m.category IS NOT NULL
+                  AND m.category != ''
+                  AND t.category = 'unknown'
+                """
+            )
+            logger.info(f"Post-run category enrichment: {cat_result}")
     finally:
         await pool.close()
     return 0

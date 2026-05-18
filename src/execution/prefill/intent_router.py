@@ -169,6 +169,12 @@ class IntentRouter:
             f"IntentRouter started: stream={self._stream_name} "
             f"group={self._consumer_group} consumer={self._consumer_name}"
         )
+        # Idle until stop() — prevents the watchdog from treating
+        # start() returning as a crash.
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            raise
 
     async def stop(self) -> None:
         """Cancel background tasks + close the consumer. Idempotent."""

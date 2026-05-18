@@ -6,6 +6,7 @@ const {
   Badge, MiniBar, ScoreBar, Dot, KpiStrip, TH, TD, SectionLabel, Sparkline, ProgressBar,
   short, fmtAge, fmtPnl, fmtPct, fmtMs, fmtNum,
   pnlColor, sideColor, actionType,
+  CategoryRiskBadge,  // PLAN-UIA-001
 } = window;
 
 // ─── ALPHA TERMINAL ───────────────────────────────────────────────────────────
@@ -31,13 +32,26 @@ const AlphaTerminal = () => {
   const leader24h    = leaderSpark.reduce((a, b) => a + b, 0);
   const positions24h = positionsSpark.reduce((a, b) => a + b, 0);
 
-  // Hero KPIs with sparklines
+  // PLAN-UIA-001 — Win Rate first (mission KPI 28→70%), Net PnL second
+  // with reconciliation-aware coloring so the operator never reads a
+  // trustable-looking PnL during a drift.
+  const recon = snapshot?.reconciliation || { verdict: 'unknown' };
+  const wrColor = stats.win_rate >= 0.7 ? C.green : stats.win_rate >= 0.5 ? C.amber : stats.win_rate != null ? C.red : C.dim2;
+  const pnlBase = pnlColor(stats.total_pnl);
+  const pnlEffective = recon.verdict === 'critical' ? C.red : pnlBase;
   const kpis = [
+    {
+      label: 'Win Rate',
+      value: stats.win_rate != null ? `${(stats.win_rate * 100).toFixed(1)}%` : '—',
+      color: wrColor,
+      sub: '/ 70% target',
+    },
     {
       label: 'Net PnL',
       value: fmtPnl(stats.total_pnl),
-      color: pnlColor(stats.total_pnl),
-      spark: <Sparkline data={timeline.map(_ => stats.total_pnl || 0)} color={pnlColor(stats.total_pnl)} />,
+      color: pnlEffective,
+      sub: recon.verdict === 'critical' ? '⚠ recon drift' : recon.verdict === 'warn' ? '~ recon warn' : '',
+      spark: <Sparkline data={timeline.map(_ => stats.total_pnl || 0)} color={pnlEffective} />,
     },
     {
       label: 'Portfolio',
@@ -50,11 +64,6 @@ const AlphaTerminal = () => {
       value: stats.open_positions ?? '—',
       color: C.text,
       sub: stats.capital_in_trade != null ? `$${stats.capital_in_trade.toFixed(0)} in trade` : '',
-    },
-    {
-      label: 'Win Rate',
-      value: stats.win_rate != null ? `${(stats.win_rate * 100).toFixed(1)}%` : '—',
-      color: C.amber,
     },
     {
       label: 'Trades 24h',
@@ -193,7 +202,10 @@ const AlphaTerminal = () => {
                   >
                     <span style={{ color: C.dim2, fontSize: 10 }}>{t.timestamp ? new Date(t.timestamp).toLocaleTimeString('en-GB') : '—'}</span>
                     <span style={{ color: sideColor(t.side), fontWeight: 700, fontSize: 10 }}>{t.side}</span>
-                    <span style={{ color: C.text, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{t.market_title}</span>
+                    <span style={{ color: C.text, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                      {t.market_title}
+                      <CategoryRiskBadge category={t.market_category} feeRatePct={t.fee_rate_pct} />
+                    </span>
                     <span style={{ color: C.dim2, textAlign: 'right', fontFamily: 'monospace' }}>{fmtNum(t.price, 3)}</span>
                     <span style={{ color: pnlColor(t.pnl_abs), textAlign: 'right', fontWeight: 600 }}>{fmtPnl(t.pnl_abs)}</span>
                   </div>
@@ -294,173 +306,22 @@ const SmallCell = ({ l, v, c }) => (
   </div>
 );
 
-// ─── MARKET SCANNER ───────────────────────────────────────────────────────────
-// ─── WALLET SCANNER (was MarketScanner) ──────────────────────────────────────
-// Renamed and refocused: instead of scanning markets (the bot's edge is
-// wallet-centric, not market-centric), this view ranks the leaders we
-// profile, sortable by 24h activity / win-rate / readiness / latest action.
-// The old market-based view is preserved under "Markets (legacy)" for
-// debugging until it can be safely removed.
-const MarketScanner = () => {
-  const { snapshot, connectionState } = useLiveStore();
-  const [view, setView]     = useStateT('wallets');
-  const [search, setSearch] = useStateT('');
-  const [sortKey, setSortKey] = useStateT('readiness');
-  const [sortDir, setSortDir] = useStateT('desc');
+// ─── MARKET SCANNER — DELETED (PLAN-UIA-001, 2026-05-18) ─────────────────────
+// Removed from nav 2026-05-17 (folded into Wallet Graph per CLAUDE.md §17).
+// 167 LOC of zombie code purged in this commit per ADR-PMK-014.8.
+// The wallet-centric Wallet Scanner sub-tab inside Wallet Graph is the only
+// intended entry point now. Removed from the Object.assign(window, …) export
+// list at the bottom of this file.
+// END DELETION MARKER — function body removed below.
 
-  const opportunities = snapshot?.analytics?.opportunities || [];
-  const leaderboard   = snapshot?.analytics?.leaderboard   || [];
-  const anaSum        = snapshot?.analytics?.summary       || {};
-  const wallets       = (snapshot?.wallet_graph?.nodes || []).filter(n => n.role === 'leader');
-  const adaptive      = snapshot?.adaptive_thresholds?.values || {};
-  const followMin     = adaptive.FOLLOW_MIN_TRADES || 25;
-  const fadeMin       = adaptive.FADE_MIN_RESOLVED || 25;
+// eslint-disable-next-line no-unused-vars
+const _MarketScanner_DELETED = () => null;
+/* PLAN-UIA-001 — MarketScanner function body deleted.
+   The 167 LOC implementation (data fetch + sort + dual-view render) is
+   gone; the comment above is the only remnant. The wallet-centric Wallet
+   Scanner sub-tab inside Wallet Graph is the live entry point.
+   Removed from Object.assign(window, …) export at the bottom of this file. */
 
-  // Compute readiness as a composite of the gates: trades / resolved /
-  // followers progress towards the FOLLOW gate. 0 = nothing, 1 = passes all.
-  const enrichedWallets = useMemoT(() => wallets.map(w => {
-    const tradesProgress = Math.min(1, (w.trades_observed || 0) / followMin);
-    const resolvedProgress = Math.min(1, (w.positions_resolved || 0) / fadeMin);
-    const maturity = Math.max(0, Math.min(1, w.maturity || 0));
-    const readiness = (tradesProgress * 0.4 + resolvedProgress * 0.4 + maturity * 0.2);
-    return { ...w, readiness };
-  }), [wallets, followMin, fadeMin]);
-
-  const sortedWallets = useMemoT(() => {
-    const arr = [...enrichedWallets];
-    const dir = sortDir === 'asc' ? 1 : -1;
-    arr.sort((a, b) => {
-      const av = a[sortKey] ?? 0;
-      const bv = b[sortKey] ?? 0;
-      if (av === bv) return 0;
-      return av < bv ? -dir : dir;
-    });
-    return arr;
-  }, [enrichedWallets, sortKey, sortDir]);
-
-  const filteredWallets = useMemoT(() =>
-    search ? sortedWallets.filter(w => (w.id || '').toLowerCase().includes(search.toLowerCase())) : sortedWallets,
-    [sortedWallets, search]
-  );
-
-  const rows = view === 'opps' ? opportunities : leaderboard;
-  const filtered = useMemoT(() =>
-    search ? rows.filter(r => r.title?.toLowerCase().includes(search.toLowerCase())) : rows,
-    [rows, search]
-  );
-
-  const setSort = (k) => {
-    if (sortKey === k) setSortDir(sortDir === 'asc' ? 'desc' : 'asc');
-    else { setSortKey(k); setSortDir('desc'); }
-  };
-  const sortIndicator = (k) => sortKey === k ? (sortDir === 'asc' ? ' ↑' : ' ↓') : '';
-
-  return (
-    <div style={{ display: 'flex', flexDirection: 'column', height: '100%', width: '100%', overflow: 'hidden' }}>
-      <ConnBanner state={connectionState} />
-      <KpiStrip items={[
-        { label: 'Wallets Tracked',  value: enrichedWallets.length, color: C.text },
-        { label: 'Active 24h',       value: enrichedWallets.filter(w => (w.trades_24h || 0) > 0).length, color: C.green },
-        { label: 'Phase 2+',         value: enrichedWallets.filter(w => (w.phase || 1) >= 2).length, color: C.amber },
-        { label: 'Phase 3',          value: enrichedWallets.filter(w => (w.phase || 1) >= 3).length, color: C.green },
-        { label: 'Avg Maturity',     value: enrichedWallets.length ? (enrichedWallets.reduce((a, w) => a + (w.maturity || 0), 0) / enrichedWallets.length).toFixed(3) : '—', color: C.purple },
-        { label: 'Top Readiness',    value: enrichedWallets.length ? `${Math.round(Math.max(...enrichedWallets.map(w => w.readiness || 0)) * 100)}%` : '—', color: C.green },
-      ]} />
-
-      <div style={{ padding: '8px 14px', borderBottom: `1px solid ${C.border}`, display: 'flex', gap: 8, alignItems: 'center', flexShrink: 0 }}>
-        {[['wallets', 'Wallets'], ['opps', 'Markets (legacy)']].map(([v, label]) => (
-          <button key={v} onClick={() => setView(v)} style={{
-            background: view === v ? 'rgba(232,160,32,0.1)' : 'transparent',
-            border: `1px solid ${view === v ? C.amber : C.border2}`,
-            color: view === v ? C.amber : C.dim2,
-            padding: '3px 12px', fontSize: 11, cursor: 'pointer',
-          }}>{label}</button>
-        ))}
-        <input value={search} onChange={e => setSearch(e.target.value)} placeholder={view === 'wallets' ? 'Filter by wallet…' : 'Filter by title…'}
-          style={{ background: C.panel2, border: `1px solid ${C.border2}`, color: C.text, padding: '4px 10px', fontSize: 11, flex: 1, maxWidth: 280, outline: 'none' }} />
-        <span style={{ fontSize: 10, color: C.dim2, marginLeft: 'auto' }}>
-          {view === 'wallets' ? `${filteredWallets.length} wallets` : `${filtered.length} markets`}
-        </span>
-      </div>
-
-      {view === 'wallets' ? (
-        <div style={{ flex: 1, overflow: 'auto' }}>
-          <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 11 }}>
-            <thead style={{ position: 'sticky', top: 0, background: C.panel, zIndex: 1 }}>
-              <tr>
-                <TH>Wallet</TH>
-                <TH>Phase</TH>
-                <TH>Strategy</TH>
-                <th style={{ ...S.label, fontWeight: 700, padding: '5px 10px', cursor: 'pointer', borderBottom: `1px solid ${C.border2}` }} onClick={() => setSort('falcon_score')}>Falcon{sortIndicator('falcon_score')}</th>
-                <th style={{ ...S.label, fontWeight: 700, padding: '5px 10px', cursor: 'pointer', borderBottom: `1px solid ${C.border2}` }} onClick={() => setSort('trades_24h')}>24h{sortIndicator('trades_24h')}</th>
-                <th style={{ ...S.label, fontWeight: 700, padding: '5px 10px', cursor: 'pointer', borderBottom: `1px solid ${C.border2}` }} onClick={() => setSort('trades_observed')}>Trades{sortIndicator('trades_observed')}</th>
-                <th style={{ ...S.label, fontWeight: 700, padding: '5px 10px', cursor: 'pointer', borderBottom: `1px solid ${C.border2}` }} onClick={() => setSort('positions_resolved')}>Resolved{sortIndicator('positions_resolved')}</th>
-                <th style={{ ...S.label, fontWeight: 700, padding: '5px 10px', cursor: 'pointer', borderBottom: `1px solid ${C.border2}` }} onClick={() => setSort('win_rate')}>Win%{sortIndicator('win_rate')}</th>
-                <th style={{ ...S.label, fontWeight: 700, padding: '5px 10px', cursor: 'pointer', borderBottom: `1px solid ${C.border2}` }} onClick={() => setSort('pnl_total')}>PnL{sortIndicator('pnl_total')}</th>
-                <th style={{ ...S.label, fontWeight: 700, padding: '5px 10px', cursor: 'pointer', borderBottom: `1px solid ${C.border2}` }} onClick={() => setSort('readiness')}>Readiness{sortIndicator('readiness')}</th>
-                <TH>Last Action</TH>
-              </tr>
-            </thead>
-            <tbody>
-              {filteredWallets.length === 0 && (
-                <tr><td colSpan={11} style={{ padding: '24px', color: C.dim2, textAlign: 'center', fontSize: 11 }}>{snapshot ? 'No leader wallets profiled yet.' : 'Waiting for data…'}</td></tr>
-              )}
-              {filteredWallets.map((w) => (
-                <tr key={w.id}>
-                  <TD style={{ color: C.purple, fontFamily: 'monospace' }}>{w.label}</TD>
-                  <TD><Badge type={w.phase >= 3 ? 'green' : w.phase === 2 ? 'amber' : 'blue'}>P{w.phase}</Badge></TD>
-                  <TD style={{ color: C.dim2 }}>{w.classification || '—'}</TD>
-                  <TD style={{ color: C.amber, fontFamily: 'monospace' }}>{(w.falcon_score || 0).toFixed(2)}</TD>
-                  <TD style={{ color: w.trades_24h > 0 ? C.green : C.dim2, fontWeight: 600 }}>{w.trades_24h || 0}</TD>
-                  <TD style={{ color: C.text }}>{w.trades_observed || 0}</TD>
-                  <TD style={{ color: C.text }}>{w.positions_resolved || 0}</TD>
-                  <TD style={{ color: w.win_rate != null ? (w.win_rate >= 0.5 ? C.green : C.red) : C.dim2 }}>
-                    {w.win_rate != null ? `${(w.win_rate * 100).toFixed(0)}%` : '—'}
-                  </TD>
-                  <TD style={{ color: pnlColor(w.pnl_total), fontWeight: 600 }}>{fmtPnl(w.pnl_total)}</TD>
-                  <TD style={{ minWidth: 120 }}><ScoreBar value={w.readiness || 0} /></TD>
-                  <TD>{w.last_action ? <Badge type={actionType(w.last_action)}>{w.last_action}</Badge> : <span style={{ color: C.dim2 }}>—</span>}</TD>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        </div>
-      ) : (
-        <div style={{ flex: 1, overflow: 'auto' }}>
-          <div style={{ padding: '8px 14px', fontSize: 10, color: C.dim2, borderBottom: `1px solid ${C.border}` }}>
-            ⚠ Legacy market view — kept for debugging. The bot's edge is wallet-centric, not market-centric. Switch to "Wallets" above.
-          </div>
-          <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 11 }}>
-            <thead style={{ position: 'sticky', top: 0, background: C.panel, zIndex: 1 }}>
-              <tr>{['Market','Dir','Mid','Spread','Edge','Threshold','Signal','Z-Score','Regime','Decision','Obs.','Detected'].map(h => <TH key={h}>{h}</TH>)}</tr>
-            </thead>
-            <tbody>
-              {filtered.length === 0 && (
-                <tr><td colSpan={12} style={{ padding: '24px', color: C.dim2, textAlign: 'center', fontSize: 11 }}>{snapshot ? 'No markets available.' : 'Waiting for data…'}</td></tr>
-              )}
-              {filtered.map((m, i) => (
-                <tr key={m.market_id || i}>
-                  <TD style={{ maxWidth: 220 }}><div style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', color: C.text }}>{m.title}</div></TD>
-                  <TD><Badge type={m.direction === 'YES' ? 'green' : m.direction === 'NO' ? 'red' : 'default'}>{m.direction || '—'}</Badge></TD>
-                  <TD style={{ color: C.text, fontFamily: 'monospace' }}>{fmtNum(m.mid_price, 3)}</TD>
-                  <TD style={{ color: m.spread > 0.04 ? C.red : C.green, fontFamily: 'monospace' }}>{fmtNum(m.spread, 4)}</TD>
-                  <TD style={{ color: m.expected_edge > 0 ? C.green : C.dim2, fontWeight: 600 }}>{m.expected_edge != null ? `${(m.expected_edge * 100).toFixed(2)}%` : '—'}</TD>
-                  <TD style={{ color: C.dim2 }}>{m.entry_threshold != null ? `${(m.entry_threshold * 100).toFixed(2)}%` : '—'}</TD>
-                  <TD><ScoreBar value={m.signal_strength || 0} /></TD>
-                  <TD style={{ color: m.z_score != null && Math.abs(m.z_score) > 1.5 ? C.amber : C.dim2, fontFamily: 'monospace' }}>{fmtNum(m.z_score, 2)}</TD>
-                  <TD><Badge type="default">{m.regime || '—'}</Badge></TD>
-                  <TD><Badge type={actionType(m.decision_action)}>{m.decision_action || 'hold'}</Badge></TD>
-                  <TD style={{ color: C.dim2, textAlign: 'right' }}>{m.observations ?? '—'}</TD>
-                  <TD><Dot status={m.detected ? 'ok' : 'off'} /></TD>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        </div>
-      )}
-    </div>
-  );
-};
 
 // ─── LIVE PORTFOLIO ───────────────────────────────────────────────────────────
 const LivePortfolio = () => {
@@ -478,15 +339,24 @@ const LivePortfolio = () => {
   return (
     <div style={{ display: 'flex', flexDirection: 'column', height: '100%', width: '100%', overflow: 'hidden' }}>
       <ConnBanner state={connectionState} />
-      <KpiStrip items={[
-        { label: 'Open Positions',   value: positions.open_count ?? openItems.length, color: C.text },
-        { label: 'Unrealized PnL',   value: fmtPnl(openPnl),              color: pnlColor(openPnl) },
-        { label: 'Capital in Trade', value: positions.capital_in_trade != null ? `$${positions.capital_in_trade.toFixed(0)}` : '—', color: C.amber },
-        { label: 'Exposure %',       value: positions.exposure_pct != null ? `${(positions.exposure_pct * 100).toFixed(1)}%` : '—', color: C.text },
-        { label: 'Net PnL',          value: fmtPnl(stats.total_pnl),      color: pnlColor(stats.total_pnl), spark: <Sparkline data={realizedSeries} color={pnlColor(stats.total_pnl)} /> },
-        { label: 'Equity',           value: stats.portfolio_total != null ? `$${stats.portfolio_total.toFixed(0)}` : '—', color: C.white, spark: <Sparkline data={equitySeries} color={C.white} /> },
-        { label: 'Win Rate',         value: stats.win_rate != null ? `${(stats.win_rate * 100).toFixed(1)}%` : '—', color: C.amber },
-      ]} />
+      {/* PLAN-UIA-001: Win Rate first (mission KPI), Reconciliation stamp visible. */}
+      {(() => {
+        const recon = snapshot?.reconciliation || { verdict: 'unknown' };
+        const verdictGlyph = recon.verdict === 'ok' ? '✓' : recon.verdict === 'critical' ? '✗' : recon.verdict === 'warn' ? '~' : '?';
+        const verdictColor = { ok: C.green, warn: C.amber, critical: C.red, unknown: C.dim2 }[recon.verdict] || C.dim2;
+        return (
+          <KpiStrip items={[
+            { label: 'Win Rate',         value: stats.win_rate != null ? `${(stats.win_rate * 100).toFixed(1)}%` : '—', color: stats.win_rate >= 0.7 ? C.green : C.amber, sub: '/ 70% target' },
+            { label: 'Net PnL',          value: fmtPnl(stats.total_pnl),      color: pnlColor(stats.total_pnl), spark: <Sparkline data={realizedSeries} color={pnlColor(stats.total_pnl)} /> },
+            { label: 'Reconciled',       value: verdictGlyph, color: verdictColor, sub: recon.age_s != null ? `${fmtAge(recon.age_s)} ago` : 'never' },
+            { label: 'Open Positions',   value: positions.open_count ?? openItems.length, color: C.text },
+            { label: 'Unrealized PnL',   value: fmtPnl(openPnl),              color: pnlColor(openPnl) },
+            { label: 'Capital in Trade', value: positions.capital_in_trade != null ? `$${positions.capital_in_trade.toFixed(0)}` : '—', color: C.amber },
+            { label: 'Exposure %',       value: positions.exposure_pct != null ? `${(positions.exposure_pct * 100).toFixed(1)}%` : '—', color: C.text },
+            { label: 'Equity',           value: stats.portfolio_total != null ? `$${stats.portfolio_total.toFixed(0)}` : '—', color: C.white, spark: <Sparkline data={equitySeries} color={C.white} /> },
+          ]} />
+        );
+      })()}
 
       {/* Equity & PnL breakdown panels */}
       {(eq.by_leader.length > 0 || eq.by_strategy.length > 0) && (
@@ -557,7 +427,10 @@ const LivePortfolio = () => {
                     style={{ cursor: wallet ? 'pointer' : 'default', transition: 'background 120ms' }}
                     onMouseEnter={wallet ? e => e.currentTarget.style.background = 'rgba(120,85,192,0.06)' : undefined}
                     onMouseLeave={wallet ? e => e.currentTarget.style.background = 'transparent' : undefined}>
-                  <TD style={{ maxWidth: 220 }}><div style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', color: C.text }}>{p.market_title}</div></TD>
+                  <TD style={{ maxWidth: 220 }}><div style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', color: C.text }}>
+                    {p.market_title}
+                    <CategoryRiskBadge category={p.market_category} feeRatePct={p.fee_rate_pct} />
+                  </div></TD>
                   <TD><Badge type={p.side === 'YES' ? 'green' : 'red'} size="xs">{p.side}</Badge></TD>
                   <TD style={{ color: C.dim2, fontFamily: 'monospace' }}>{fmtNum(p.entry_price, 3)}</TD>
                   <TD style={{ color: C.text }}>{fmtNum(p.size, 0)}</TD>
@@ -581,7 +454,10 @@ const LivePortfolio = () => {
               {trades.map((t, i) => (
                 <tr key={t.id || i}>
                   <TD style={{ color: C.dim2, fontSize: 10, whiteSpace: 'nowrap' }}>{t.timestamp ? new Date(t.timestamp).toLocaleString('en-GB', { month: 'short', day: '2-digit', hour: '2-digit', minute: '2-digit' }) : '—'}</TD>
-                  <TD style={{ maxWidth: 180 }}><div style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', color: C.text }}>{t.market_title}</div></TD>
+                  <TD style={{ maxWidth: 180 }}><div style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', color: C.text }}>
+                    {t.market_title}
+                    <CategoryRiskBadge category={t.market_category} feeRatePct={t.fee_rate_pct} />
+                  </div></TD>
                   <TD><Badge type={t.side === 'BUY' ? 'green' : 'red'} size="xs">{t.side}</Badge></TD>
                   <TD style={{ color: C.dim2, fontFamily: 'monospace' }}>{fmtNum(t.price, 3)}</TD>
                   <TD style={{ color: C.text }}>${fmtNum(t.notional, 2)}</TD>
@@ -789,7 +665,10 @@ const DecisionsFlat = ({ filtered, expanded, toggle, snapshot }) => (
                       textUnderlineOffset: 3,
                     }}>{short(d.leader_wallet) || '—'}</span>
                 </TD>
-                <TD style={{ maxWidth: 220 }}><div style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', color: C.text }}>{d.title}</div></TD>
+                <TD style={{ maxWidth: 220 }}><div style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', color: C.text }}>
+                  {d.title}
+                  <CategoryRiskBadge category={d.category || d.market_category} feeRatePct={d.fee_rate_pct} />
+                </div></TD>
                 <TD><Badge type={actionType(d.action)}>{d.action || '—'}</Badge></TD>
                 <TD><Badge type={d.side === 'YES' ? 'green' : d.side === 'NO' ? 'red' : 'default'} size="xs">{d.side || '—'}</Badge></TD>
                 <TD><ScoreBar value={d.confidence || 0} /></TD>
@@ -955,23 +834,32 @@ const RiskConfig = () => {
             </div>
           </div>
 
-          {/* Bot control */}
+          {/* PLAN-UIA-001: HONEST CONTROLS.
+              Old UI had 3 buttons (START/STOP/PAUSE) that all hit the same
+              killswitch endpoint — same effect, different labels. New UI
+              exposes exactly what the backend supports:
+                • ENABLE/DISABLE TRADING → /api/control/killswitch (gates new trades)
+                • EMERGENCY HALT         → /api/control/halt
+                    (killswitch + force_close_all_positions, distinct endpoint
+                     so the button does what the label promises). */}
           <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
             <div style={{ padding: 14, border: `1px solid ${C.border}` }}>
-              <div style={{ ...S.label, marginBottom: 10 }}>Bot Control</div>
-              {[
-                { cmd: 'start', label: '▶ START', active: controlsAvailable && !isRunning, type: 'green' },
-                { cmd: 'stop',  label: '■ STOP',  active: controlsAvailable && isRunning,  type: 'red'   },
-                { cmd: 'pause', label: '⏸ PAUSE', active: controlsAvailable,                type: 'default' },
-              ].map(({ cmd, label, active, type }) => (
-                <button key={cmd} onClick={() => sendCmd(cmd)} disabled={cmdBusy || !active} style={{
+              <div style={{ ...S.label, marginBottom: 10 }}>Bot Control · honest</div>
+              <button
+                onClick={() => sendCmd(isRunning ? 'disable' : 'enable')}
+                disabled={cmdBusy || !controlsAvailable}
+                style={{
                   display: 'block', width: '100%', marginBottom: 6,
-                  background: active ? `rgba(${type === 'green' ? '40,168,78' : type === 'red' ? '201,53,69' : '255,255,255'},0.1)` : 'transparent',
-                  border: `1px solid ${active ? C[type === 'green' ? 'green' : type === 'red' ? 'red' : 'border2'] : C.border}`,
-                  color: active ? C[type === 'green' ? 'green' : type === 'red' ? 'red' : 'dim2'] : C.dim,
-                  padding: '7px', cursor: active && !cmdBusy ? 'pointer' : 'default', fontSize: 11, fontWeight: 700,
-                }}>{label}</button>
-              ))}
+                  background: controlsAvailable ? (isRunning ? 'rgba(201,53,69,0.1)' : 'rgba(40,168,78,0.1)') : 'transparent',
+                  border: `1px solid ${controlsAvailable ? (isRunning ? C.red : C.green) : C.border}`,
+                  color: controlsAvailable ? (isRunning ? C.red : C.green) : C.dim,
+                  padding: '7px', cursor: controlsAvailable && !cmdBusy ? 'pointer' : 'default', fontSize: 11, fontWeight: 700,
+                }}>
+                {isRunning ? '■ DISABLE TRADING' : '▶ ENABLE TRADING'}
+              </button>
+              <div style={{ fontSize: 9, color: C.dim2, lineHeight: 1.5, marginTop: 4 }}>
+                Flips killswitch. Open positions are not closed — use EMERGENCY HALT for that.
+              </div>
               {!controlsAvailable && (
                 <div style={{ fontSize: 10, color: C.dim2, marginTop: 6 }}>
                   Control actions are not exposed by this backend build.
@@ -980,12 +868,15 @@ const RiskConfig = () => {
             </div>
 
             <div style={{ padding: 14, border: `1px solid ${C.red}`, background: 'rgba(201,53,69,0.03)' }}>
-              <div style={{ ...S.label, color: C.red, marginBottom: 8 }}>Emergency Kill</div>
-              <div style={{ fontSize: 10, color: C.dim2, marginBottom: 10, lineHeight: 1.7 }}>Halts all bot activity immediately.</div>
+              <div style={{ ...S.label, color: C.red, marginBottom: 8 }}>Emergency Halt</div>
+              <div style={{ fontSize: 10, color: C.dim2, marginBottom: 10, lineHeight: 1.7 }}>
+                Flips killswitch AND force-closes every open paper position at the last
+                oracle price. Use when reconciliation goes RED mid-session.
+              </div>
               {!killConfirm
-                ? <button onClick={() => setKillConfirm(true)} disabled={cmdBusy || !controlsAvailable} style={{ width: '100%', background: 'rgba(201,53,69,0.1)', border: `1px solid ${C.red}`, color: controlsAvailable ? C.red : C.dim2, padding: '7px 0', cursor: controlsAvailable ? 'pointer' : 'default', fontSize: 11, fontWeight: 700 }}>KILL SWITCH</button>
+                ? <button onClick={() => setKillConfirm(true)} disabled={cmdBusy || !controlsAvailable} style={{ width: '100%', background: 'rgba(201,53,69,0.1)', border: `1px solid ${C.red}`, color: controlsAvailable ? C.red : C.dim2, padding: '7px 0', cursor: controlsAvailable ? 'pointer' : 'default', fontSize: 11, fontWeight: 700 }}>⚠ EMERGENCY HALT</button>
                 : <div>
-                    <div style={{ fontSize: 11, color: C.red, marginBottom: 8, fontWeight: 700 }}>CONFIRM HALT?</div>
+                    <div style={{ fontSize: 11, color: C.red, marginBottom: 8, fontWeight: 700 }}>CONFIRM HALT? Will close all open positions.</div>
                     <div style={{ display: 'flex', gap: 6 }}>
                       <button onClick={() => sendCmd('halt')} style={{ flex: 1, background: C.red, border: 'none', color: '#fff', padding: '6px 0', cursor: 'pointer', fontSize: 11, fontWeight: 700 }}>CONFIRM</button>
                       <button onClick={() => setKillConfirm(false)} style={{ flex: 1, background: 'transparent', border: `1px solid ${C.border2}`, color: C.dim2, padding: '6px 0', cursor: 'pointer', fontSize: 11 }}>CANCEL</button>
@@ -1045,6 +936,67 @@ const RiskConfig = () => {
             </table>
           </div>
         )}
+      </div>
+    </div>
+  );
+};
+
+// ─── PLAN-UIA-001 — 5-pillars gauge for BotHealth ────────────────────────────
+const PillarsGauge = () => {
+  const [data, setData] = useStateT(null);
+  useEffectT(() => {
+    let cancelled = false;
+    const load = async () => {
+      try {
+        const base = window.PoybotAPI?.getSettings?.()?.API_BASE || '';
+        const r = await fetch(`${base}/api/health/pillars`);
+        if (r.ok && !cancelled) setData(await r.json());
+      } catch (_) { /* keep stale */ }
+    };
+    load();
+    const id = setInterval(load, 30_000);
+    return () => { cancelled = true; clearInterval(id); };
+  }, []);
+
+  if (!data) {
+    return (
+      <div>
+        <SectionLabel>Paper Trading Pillars (5)</SectionLabel>
+        <div style={{ color: C.dim2, fontSize: 11 }}>Loading…</div>
+      </div>
+    );
+  }
+
+  const pillars = data.pillars || {};
+  const items = [
+    { name: 'Price Oracle',    key: 'oracle' },
+    { name: 'Reconciliation',  key: 'reconciliation' },
+    { name: 'Backfill',        key: 'backfill' },
+    { name: 'Spread Gates',    key: 'spread_gates' },
+    { name: 'Close Audit Log', key: 'audit_log' },
+  ];
+
+  return (
+    <div>
+      <SectionLabel>
+        Paper Trading Pillars (5)
+        <span style={{ marginLeft: 8, color: data.overall_ok ? C.green : C.red, fontWeight: 700, fontSize: 10 }}>
+          {data.overall_ok ? '✓ ALL OK' : '✗ DEGRADED'}
+        </span>
+      </SectionLabel>
+      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(5, 1fr)', gap: 1, background: C.border }}>
+        {items.map(it => {
+          const p = pillars[it.key] || { ok: false, detail: 'missing' };
+          return (
+            <div key={it.key} style={{ background: C.panel2, padding: '10px 12px' }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 4 }}>
+                <Dot status={p.ok ? 'ok' : 'err'} />
+                <span style={{ color: C.text, fontSize: 11, fontWeight: 600 }}>{it.name}</span>
+              </div>
+              <div style={{ fontSize: 9, color: C.dim2, fontFamily: 'monospace' }}>{p.detail || '—'}</div>
+            </div>
+          );
+        })}
       </div>
     </div>
   );
@@ -1141,6 +1093,11 @@ const BotHealth = () => {
       ]} />
 
       <div style={{ flex: 1, overflow: 'auto', padding: 14, display: 'flex', flexDirection: 'column', gap: 14 }}>
+
+        {/* PLAN-UIA-001 — 5 paper-trading pillars gauge.
+            Boolean per pillar. overall_ok = AND of all 5. Failing pillar →
+            the operator knows the displayed numbers aren't trustworthy. */}
+        <PillarsGauge />
 
         {/* Data Quality issues drill-down */}
         {dqIssues.length > 0 && (
@@ -2536,6 +2493,198 @@ const WalletProfileSection = ({ loading, profile }) => {
   );
 };
 
+// ─── PLAN-UIA-001 — Reconciliation panel + drill-down modal ──────────────────
+// Lives inside the Inspector tab. The hero delta + sparkline + phantom/
+// premature counts. Click "View N drift trades" to open the modal. Click
+// "↻ Run now" to fire an async recon pass.
+const ReconciliationPanel = () => {
+  const [data, setData]         = useStateT(null);
+  const [loading, setLoading]   = useStateT(true);
+  const [runBusy, setRunBusy]   = useStateT(false);
+  const [msg, setMsg]           = useStateT('');
+  const [drillOpen, setDrillOpen] = useStateT(false);
+
+  const refresh = async () => {
+    try {
+      const base = window.PoybotAPI?.getSettings?.()?.API_BASE || '';
+      const r = await fetch(`${base}/api/inspector/reconciliation`);
+      if (r.ok) setData(await r.json());
+      else setData({ verdict: 'unknown', _error: true });
+    } catch (e) {
+      setData({ verdict: 'unknown', _error: true });
+    }
+    setLoading(false);
+  };
+
+  useEffectT(() => { refresh(); const id = setInterval(refresh, 30_000); return () => clearInterval(id); }, []);
+
+  const runNow = async () => {
+    setRunBusy(true); setMsg('');
+    try {
+      const base = window.PoybotAPI?.getSettings?.()?.API_BASE || '';
+      const r = await fetch(`${base}/api/inspector/reconciliation/run`, { method: 'POST' });
+      if (!r.ok) throw new Error('HTTP ' + r.status);
+      setMsg('✓ queued — refresh in 60-90s');
+      setTimeout(refresh, 30_000);
+    } catch (e) {
+      setMsg('✗ ' + e.message);
+    }
+    setRunBusy(false);
+    setTimeout(() => setMsg(''), 6000);
+  };
+
+  const verdict = data?.verdict || 'unknown';
+  const verdictColor = { ok: C.green, warn: C.amber, critical: C.red, unknown: C.dim2 }[verdict] || C.dim2;
+  const sparkData = (data?.last_5_runs || []).map(r => r.pnl_delta_abs || 0);
+
+  return (
+    <>
+      <div style={{ padding: 12, borderBottom: `1px solid ${C.border}`, background: verdict === 'critical' ? 'rgba(201,53,69,0.05)' : 'transparent' }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 6 }}>
+          <SectionLabel mb={0}>Paper Truth Reconciliation</SectionLabel>
+          {data?.age_s != null && <span style={{ marginLeft: 'auto', fontSize: 9, color: C.dim2, fontFamily: 'monospace' }}>{fmtAge(data.age_s)} ago</span>}
+        </div>
+        {loading ? (
+          <div style={{ color: C.dim2, fontSize: 11 }}>Loading…</div>
+        ) : !data || data._error ? (
+          <div style={{ color: C.red, fontSize: 11 }}>Failed to load.</div>
+        ) : data.trades_evaluated === 0 ? (
+          <div style={{ color: C.dim2, fontSize: 11 }}>
+            No reconciliation has run yet (window {data.window_days}d).
+            <div style={{ marginTop: 6 }}>
+              <button onClick={runNow} disabled={runBusy} style={{ background: 'transparent', border: `1px solid ${C.border2}`, color: C.amber, padding: '3px 10px', fontSize: 10, cursor: runBusy ? 'wait' : 'pointer' }}>
+                {runBusy ? '…' : '↻ Run now'}
+              </button>
+            </div>
+          </div>
+        ) : (
+          <>
+            {/* Hero delta */}
+            <div style={{ marginBottom: 8 }}>
+              <div style={{ fontSize: 20, fontWeight: 700, color: verdictColor, fontFamily: 'monospace', letterSpacing: '-0.02em' }}>
+                {fmtPnl(data.pnl_delta_abs)}
+                <span style={{ fontSize: 10, color: C.dim2, marginLeft: 6, fontWeight: 400 }}>
+                  ({data.pnl_delta_pct >= 0 ? '+' : ''}{(data.pnl_delta_pct * 100).toFixed(2)}%)
+                </span>
+                <Badge type={verdict === 'ok' ? 'green' : verdict === 'warn' ? 'amber' : verdict === 'critical' ? 'red' : 'default'} size="xs">{verdict.toUpperCase()}</Badge>
+              </div>
+              <div style={{ fontSize: 9, color: C.dim2, fontFamily: 'monospace', marginTop: 2 }}>
+                displayed {fmtPnl(data.pnl_displayed_sum)} · oracle {fmtPnl(data.pnl_oracle_sum)}
+              </div>
+            </div>
+            {/* Phantom + premature counts */}
+            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 4, fontSize: 10, marginBottom: 8 }}>
+              <div style={{ background: C.panel2, padding: '4px 7px' }}>
+                <div style={{ ...S.label, fontSize: 8 }}>Phantom</div>
+                <div style={{ color: data.phantom_count > 0 ? C.red : C.dim2, fontWeight: 700, fontFamily: 'monospace' }}>{data.phantom_count}</div>
+              </div>
+              <div style={{ background: C.panel2, padding: '4px 7px' }}>
+                <div style={{ ...S.label, fontSize: 8 }}>Premature</div>
+                <div style={{ color: data.premature_count > 0 ? C.amber : C.dim2, fontWeight: 700, fontFamily: 'monospace' }}>{data.premature_count}</div>
+              </div>
+            </div>
+            {/* Sparkline trend */}
+            {sparkData.length > 0 && (
+              <div style={{ marginBottom: 8 }}>
+                <div style={{ ...S.label, fontSize: 8, marginBottom: 3 }}>Drift, last 5 runs</div>
+                <Sparkline data={sparkData} color={verdictColor} fluid />
+              </div>
+            )}
+            {/* Buttons */}
+            <div style={{ display: 'flex', gap: 6 }}>
+              <button onClick={runNow} disabled={runBusy} title="Trigger a fresh reconciliation pass"
+                style={{ background: 'transparent', border: `1px solid ${C.border2}`, color: C.amber, padding: '3px 10px', fontSize: 10, cursor: runBusy ? 'wait' : 'pointer' }}>
+                {runBusy ? '…' : '↻ Run now'}
+              </button>
+              {data.trades_drift_count > 0 && (
+                <button onClick={() => setDrillOpen(true)} title="Drill into drift trades"
+                  style={{ background: 'transparent', border: `1px solid ${C.border2}`, color: C.blue, padding: '3px 10px', fontSize: 10, cursor: 'pointer' }}>
+                  View {data.trades_drift_count} drift trades →
+                </button>
+              )}
+            </div>
+            {msg && <div style={{ marginTop: 5, fontSize: 10, color: msg.startsWith('✓') ? C.green : C.red, fontFamily: 'monospace' }}>{msg}</div>}
+          </>
+        )}
+      </div>
+      {drillOpen && <ReconciliationDriftModal onClose={() => setDrillOpen(false)} />}
+    </>
+  );
+};
+
+const ReconciliationDriftModal = ({ onClose }) => {
+  const [trades, setTrades]     = useStateT(null);
+  const [filter, setFilter]     = useStateT('all');
+
+  useEffectT(() => {
+    let cancelled = false;
+    const base = window.PoybotAPI?.getSettings?.()?.API_BASE || '';
+    const url = `${base}/api/inspector/reconciliation/trades?limit=100${filter !== 'all' ? `&classification=${filter}` : ''}`;
+    fetch(url)
+      .then(r => r.ok ? r.json() : Promise.reject('HTTP ' + r.status))
+      .then(d => { if (!cancelled) setTrades(d.trades || []); })
+      .catch(() => { if (!cancelled) setTrades([]); });
+    return () => { cancelled = true; };
+  }, [filter]);
+
+  useEffectT(() => {
+    const onKey = e => { if (e.key === 'Escape') onClose(); };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [onClose]);
+
+  return (
+    <div onClick={onClose} style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.6)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 10000, backdropFilter: 'blur(2px)' }}>
+      <div onClick={e => e.stopPropagation()} style={{ background: C.panel, border: `1px solid ${C.border2}`, width: 'min(1000px, 95vw)', maxHeight: '85vh', display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
+        <div style={{ padding: '12px 16px', borderBottom: `1px solid ${C.border}`, display: 'flex', alignItems: 'center', gap: 10 }}>
+          <SectionLabel mb={0}>Reconciliation drift trades</SectionLabel>
+          <div style={{ display: 'flex', gap: 4, marginLeft: 12 }}>
+            {['all', 'phantom', 'premature', 'drift'].map(f => (
+              <button key={f} onClick={() => setFilter(f)} style={{
+                background: filter === f ? 'rgba(232,160,32,0.1)' : 'transparent',
+                border: `1px solid ${filter === f ? C.amber : C.border2}`,
+                color: filter === f ? C.amber : C.dim2,
+                padding: '2px 8px', fontSize: 10, cursor: 'pointer',
+              }}>{f}</button>
+            ))}
+          </div>
+          <span style={{ marginLeft: 'auto', fontSize: 10, color: C.dim2 }}>{(trades || []).length} trades</span>
+          <button onClick={onClose} title="Close (Esc)" style={{ background: 'transparent', border: `1px solid ${C.border2}`, color: C.dim2, fontSize: 12, padding: '2px 9px', cursor: 'pointer' }}>✕</button>
+        </div>
+        <div style={{ flex: 1, overflow: 'auto' }}>
+          {trades === null ? (
+            <div style={{ padding: 30, color: C.dim2, fontSize: 11, textAlign: 'center' }}>Loading…</div>
+          ) : trades.length === 0 ? (
+            <div style={{ padding: 30, color: C.dim2, fontSize: 11, textAlign: 'center' }}>No drift trades match this filter.</div>
+          ) : (
+            <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 11 }}>
+              <thead style={{ position: 'sticky', top: 0, background: C.panel2, zIndex: 1 }}>
+                <tr>{['#', 'Closed', 'Market', 'Dir', 'Displayed', 'Oracle', 'Δ abs', 'Δ %', 'Class', 'Flag'].map(h => <TH key={h}>{h}</TH>)}</tr>
+              </thead>
+              <tbody>
+                {trades.map(t => (
+                  <tr key={t.paper_trade_id}>
+                    <TD style={{ fontFamily: 'monospace', color: C.dim2 }}>{t.paper_trade_id}</TD>
+                    <TD style={{ color: C.dim2, fontSize: 10 }}>{t.closed_at_iso ? new Date(t.closed_at_iso).toLocaleString('en-GB', { month: 'short', day: '2-digit', hour: '2-digit', minute: '2-digit' }) : '—'}</TD>
+                    <TD style={{ maxWidth: 280 }}><div style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', color: C.text }}>{t.market_question || t.market_id?.slice(0, 24)}<CategoryRiskBadge category={t.category} /></div></TD>
+                    <TD><Badge type={t.direction === 'yes' ? 'green' : 'red'} size="xs">{(t.direction || '').toUpperCase()}</Badge></TD>
+                    <TD style={{ color: pnlColor(t.pnl_displayed), fontFamily: 'monospace' }}>{fmtPnl(t.pnl_displayed)}</TD>
+                    <TD style={{ color: pnlColor(t.pnl_oracle), fontFamily: 'monospace' }}>{fmtPnl(t.pnl_oracle)}</TD>
+                    <TD style={{ color: Math.abs(t.delta_abs) > 50 ? C.red : Math.abs(t.delta_abs) > 5 ? C.amber : C.dim2, fontFamily: 'monospace', fontWeight: 700 }}>{fmtPnl(t.delta_abs)}</TD>
+                    <TD style={{ color: C.dim2, fontFamily: 'monospace' }}>{t.delta_pct != null ? `${(t.delta_pct * 100).toFixed(2)}%` : '—'}</TD>
+                    <TD><Badge type={t.classification === 'phantom' ? 'red' : t.classification === 'premature' ? 'amber' : 'default'} size="xs">{t.classification}</Badge></TD>
+                    <TD style={{ color: C.dim2, fontFamily: 'monospace', fontSize: 10 }}>{t.flag || '—'}</TD>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+};
+
 // ─── INSPECTOR ────────────────────────────────────────────────────────────────
 // Pipeline observability tab — surfaces what the server is actually
 // receiving and what it's deciding, so operators can debug attribution
@@ -2663,8 +2812,12 @@ const Inspector = () => {
           )}
         </div>
 
-        {/* Right rail: source mix + pipeline + decisions */}
+        {/* Right rail: reconciliation panel + source mix + pipeline + decisions */}
         <div style={{ overflow: 'auto', display: 'flex', flexDirection: 'column' }}>
+          {/* PLAN-UIA-001 — Paper Truth Reconciliation panel.
+              The whole point of the rebuild lives here. */}
+          <ReconciliationPanel />
+
           <div style={{ padding: 12, borderBottom: `1px solid ${C.border}` }}>
             <SectionLabel>Source Mix · last 5 min</SectionLabel>
             {sourceMix.length === 0 ? (
@@ -2733,6 +2886,48 @@ const PipeRow = ({ label, value, color }) => (
     <span style={{ color, fontWeight: 700, fontFamily: 'monospace' }}>{value}</span>
   </div>
 );
+
+// ─── PLAN-UIA-001 — V2 dashboard overlay toggle (lab-only) ────────────────────
+const V2LabToggle = () => {
+  const [on, setOn] = useStateT(typeof localStorage !== 'undefined' && localStorage.getItem('poybot_v2_lab') === '1');
+  const flip = () => {
+    const next = !on;
+    try { localStorage.setItem('poybot_v2_lab', next ? '1' : '0'); } catch (_) {}
+    setOn(next);
+    if (window.confirm(`V2 dashboard overlay → ${next ? 'ON' : 'OFF'}.\n\nReload now to apply?`)) {
+      location.reload();
+    }
+  };
+  return (
+    <div style={{ background: C.panel, padding: 14, marginBottom: 14, border: `1px solid ${on ? C.amber : C.border}` }}>
+      <div style={{ display: 'flex', alignItems: 'flex-start', gap: 12 }}>
+        <div style={{ flex: 1 }}>
+          <div style={{ display: 'flex', gap: 8, alignItems: 'center', marginBottom: 6 }}>
+            <span style={{ color: C.amber, fontWeight: 700, fontSize: 13, fontFamily: 'monospace' }}>V2</span>
+            <span style={{ color: C.text, fontSize: 13 }}>· Dashboard Overlay (LivePortfolio + WalletGraph)</span>
+            <Badge type={on ? 'amber' : 'default'} size="sm">{on ? 'LAB ON' : 'OFF (V1 source of truth)'}</Badge>
+          </div>
+          <div style={{ color: C.dim2, fontSize: 10, fontFamily: 'monospace', marginBottom: 6 }}>
+            localStorage.poybot_v2_lab
+          </div>
+          <div style={{ color: C.text, fontSize: 11, lineHeight: 1.55, marginBottom: 8 }}>
+            V2 replaces V1 LivePortfolio + WalletGraph with TradingView lightweight-charts (equity timeline + PnL ticks) and Cosmograph (WebGL2 force-directed graph).
+            Per memory <code>project_v1_vs_v2_terminal.md</code>, V2 is lab-only — V1 is the documented source of truth. The V2 portfolio hits a parallel <code>/api/portfolio/*</code> compute path; differences vs V1 are by design (different cache, different windowing).
+          </div>
+          <div style={{ background: C.panel2, padding: 8, fontSize: 10, borderLeft: `2px solid ${C.amber}` }}>
+            <div style={{ color: C.amber, fontWeight: 700, marginBottom: 3 }}>BLOCKER</div>
+            <div style={{ color: C.dim2, lineHeight: 1.45 }}>None — V2 is recoverable code that runs side-by-side with V1 in lab mode. CDN deps (TradingView + Cosmograph) only load when ON.</div>
+          </div>
+        </div>
+        <button onClick={flip} style={{
+          background: on ? C.red : C.green, color: '#000', border: 'none',
+          padding: '6px 16px', fontWeight: 700, fontSize: 11, cursor: 'pointer',
+          fontFamily: 'monospace', alignSelf: 'center',
+        }}>{on ? 'DISABLE V2' : 'ENABLE V2 (RELOAD)'}</button>
+      </div>
+    </div>
+  );
+};
 
 // ─── LAB — R7/R8/R9/R10 runtime gate cockpit ──────────────────────────────────
 // Single-source-of-truth UI for the four V2 features that run shadow-mode
@@ -2842,11 +3037,15 @@ const LabGates = () => {
 
       <div style={{ flex: 1, overflow: 'auto', padding: 14 }}>
         <div style={{ background: C.panel, padding: 12, marginBottom: 14, borderLeft: `3px solid ${C.amber}` }}>
-          <div style={{ color: C.amber, fontWeight: 700, fontSize: 11, marginBottom: 4 }}>⚠ LAB — Runtime gates for V2 features (R7/R8/R9/R10)</div>
+          <div style={{ color: C.amber, fontWeight: 700, fontSize: 11, marginBottom: 4 }}>⚠ LAB — Runtime gates for V2 features (R7/R8/R9/R10) + V2 dashboard overlay</div>
           <div style={{ color: C.dim2, fontSize: 10, lineHeight: 1.5 }}>
             Each gate corresponds to a daemon running in shadow mode. The daemon computes its metric continuously, but the output is ignored by the decision engine until the flag flips. Read the blocker carefully before activating. Toggling is instant (Redis pubsub propagation &lt;5s).
           </div>
         </div>
+
+        {/* PLAN-UIA-001 — V2 dashboard overlay toggle. Per memory project_v1_vs_v2_terminal.md
+            V2 is lab-only; this is the single source of truth for flipping it. */}
+        <V2LabToggle />
 
         <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(440px, 1fr))', gap: 14 }}>
           {GATES.map(gate => {
@@ -2919,7 +3118,7 @@ const LabGates = () => {
           <div style={{ color: C.text, fontWeight: 700, marginBottom: 6 }}>How to validate a gate flip</div>
           <div>1. Enable in LAB → 2. Watch shadow PnL delta vs baseline for 7 days → 3. Compare win-rate with/without via decision_log replay → 4. If gain &gt; 5 pts, keep ON. Otherwise revert.</div>
           <div style={{ marginTop: 6 }}>
-            Audit log: <a href="#" onClick={(e) => { e.preventDefault(); window.PoybotNav?.go?.('risk'); }} style={{ color: C.blue }}>RISK & CONFIG → Audit log</a> (same source — all gate flips logged via risk_config_history)
+            Audit log: <a href="#" onClick={(e) => { e.preventDefault(); window.PoybotNav?.setActiveTab?.('risk'); }} style={{ color: C.blue }}>RISK & CONFIG → Audit log</a> (same source — all gate flips logged via risk_config_history)
           </div>
         </div>
       </div>
@@ -2927,4 +3126,7 @@ const LabGates = () => {
   );
 };
 
-Object.assign(window, { AlphaTerminal, MarketScanner, LivePortfolio, DecisionEngine, RiskConfig, BotHealth, WalletGraph, MLProgression, Inspector, LabGates });
+// PLAN-UIA-001 (2026-05-18) — MarketScanner removed from exports.
+// Already removed from nav 2026-05-17 (folded into Wallet Graph per CLAUDE.md §17).
+// The function definition (167 LOC, around former lines 297-463) is also deleted.
+Object.assign(window, { AlphaTerminal, LivePortfolio, DecisionEngine, RiskConfig, BotHealth, WalletGraph, MLProgression, Inspector, LabGates });

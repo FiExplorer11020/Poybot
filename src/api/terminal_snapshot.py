@@ -447,16 +447,30 @@ def _build_bot_payload(
     health: dict[str, Any],
     runtime: dict[str, Any],
 ) -> dict[str, Any]:
+    # PLAN-UIA-001: surface execution_mode (paper | live | dual) so the
+    # dashboard ModeChip can render the 3-state badge instead of the
+    # old binary PAPER/LIVE one. Falls back to settings.TRADING_MODE
+    # when the runtime override isn't set.
+    mode_raw = (runtime.get("execution_mode") or "").strip().lower()
+    if mode_raw not in ("paper", "live", "dual"):
+        try:
+            mode_raw = (getattr(settings, "TRADING_MODE", "paper") or "paper").lower()
+        except Exception:
+            mode_raw = "paper"
+        if mode_raw not in ("paper", "live", "dual"):
+            mode_raw = "paper"
+
     return {
         "status": _bot_status(health),
         "execution_enabled": False,
+        "execution_mode": mode_raw,
         "uptime_seconds": _to_int(runtime.get("uptime_seconds"), 0),
         "latency_ms": round((_to_float(health.get("last_message_age_s"), 0.0) or 0.0) * 1000, 2),
         "cycle_latency_ms": _to_float(runtime.get("cycle_latency_ms"), 0.0) or 0.0,
         "started_at": runtime.get("started_at"),
         "accumulated_run_seconds": _to_int(runtime.get("uptime_seconds"), 0),
         "last_command_at": runtime.get("last_command_at"),
-        "paper_only": True,
+        "paper_only": mode_raw == "paper",
         "control_available": bool(runtime.get("control_available", False)),
         "config_mutable": bool(runtime.get("config_mutable", False)),
     }
@@ -521,6 +535,11 @@ def build_terminal_snapshot(
     rejections: dict[str, Any] | None = None,
     equity_curve: dict[str, Any] | None = None,
     runtime_overrides: dict[str, Any] | None = None,
+    # PLAN-UIA-001 — fetched in parallel by the caller (api.main) and
+    # passed in synchronously here. None is the safe default and is
+    # what the dashboard treats as "unknown".
+    reconciliation: dict[str, Any] | None = None,
+    health_pillars: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     paper_capital = _to_float(risk.get("paper_capital"), settings.PAPER_CAPITAL_USDC) or settings.PAPER_CAPITAL_USDC
     positions_payload = _build_positions_payload(positions_live, paper_capital)
@@ -570,6 +589,18 @@ def build_terminal_snapshot(
         # the dashboard can show what gates are CURRENTLY in effect and
         # how mature the system is. Updated every 5 min by the engine.
         "adaptive_thresholds": _build_adaptive_thresholds(),
+        # PLAN-UIA-001 — paper-truth surface. None ↔ "unknown" in UI.
+        "reconciliation": reconciliation or {
+            "verdict": "unknown",
+            "pnl_delta_abs": 0.0,
+            "age_s": None,
+            "trades_evaluated": 0,
+        },
+        "health_pillars": health_pillars or {
+            "overall_ok": True,
+            "pillars": {},
+            "computed_at_iso": None,
+        },
         "logs": logs,
     }
 

@@ -43,6 +43,16 @@ import redis.asyncio as redis_async
 
 from src.config import settings
 
+# Optional dependency: snapshot_builder is delivered by Agent A in
+# parallel. Guard the import so the rest of the maintenance loop keeps
+# running even before that module lands. The live_summary job is gated
+# on _HAS_SNAPSHOT_BUILDER and silently skipped when the import fails.
+try:
+    from src.api.snapshot_builder import build_terminal_snapshot
+    _HAS_SNAPSHOT_BUILDER = True
+except ImportError:
+    _HAS_SNAPSHOT_BUILDER = False
+
 DB_URL = os.environ.get("DATABASE_URL")
 REDIS_URL = os.environ.get("REDIS_URL", "redis://redis:6379/0")
 GAMMA_URL = "https://gamma-api.polymarket.com/markets"
@@ -101,6 +111,14 @@ SWEEP_EXPIRED_INTERVAL_S = 1800           # 30 min — flip ``active=FALSE`` on 
                                           # 2026-05-17 backfill plan, run as a
                                           # standalone cadence so the 6h
                                           # full_backfill no longer owns it alone.
+LIVE_SUMMARY_INTERVAL_S = 30.0            # 30 s — rebuild the /api/v1/live-summary
+                                          # snapshot and write it to Redis. Replaces
+                                          # the API's in-process rebuilder so the
+                                          # 17 SQL queries no longer saturate the
+                                          # pool under parallel dashboard load.
+                                          # See docs/autonomous_session_2026_05_17_
+                                          # strategy/04_PRECOMPUTED_SNAPSHOT_
+                                          # ARCHITECTURE.md.
 
 REDIS_MARKET_RESOLVED_CHANNEL = "market:resolved"
 REDIS_BACKFILL_LAG_ALERT_CHANNEL = "engine:backfill:lag_alert"
@@ -1186,6 +1204,10 @@ async def main():
         # SIGTERM mid-startup) we still want the very next loop pass
         # to flip stale rows instead of waiting 30 min.
         "sweep_expired": 0.0,
+        # Init at 0 so the first snapshot build fires on the very next
+        # loop tick after daemon start — the API endpoint returns 503
+        # until the first build lands, so we don't want to wait 30s.
+        "live_summary": 0.0,
     }
 
     while _running:
@@ -1305,6 +1327,31 @@ async def main():
                 _log(f"full_backfill: {summary}")
             asyncio.create_task(_bg_full_backfill())
             last_run["full_backfill"] = now
+
+        # ──────────────────────────────────────────────────────────────
+        # Job: build live-summary snapshot (every 30s)
+        # ──────────────────────────────────────────────────────────────
+        # Replaces the API's in-process `_snapshot_rebuilder_loop`. Runs
+        # the 17 dashboard SQL queries here (single writer, no pool
+        # contention), serialises the result, writes Redis, publishes a
+        # pubsub event. The /api/v1/live-summary endpoint reads from
+        # Redis and returns in <10ms. Gated on _HAS_SNAPSHOT_BUILDER so
+        # we keep working before Agent A's module lands.
+        if (
+            _HAS_SNAPSHOT_BUILDER
+            and (time.monotonic() - last_run["live_summary"]) >= LIVE_SUMMARY_INTERVAL_S
+        ):
+            t0 = time.monotonic()
+            try:
+                await build_terminal_snapshot(pool, redis_client)
+                dur = time.monotonic() - t0
+                _log(f"maintenance_loop: live_summary built in {dur:.2f}s")
+            except Exception as exc:
+                _log(
+                    f"maintenance_loop: live_summary build failed "
+                    f"{type(exc).__name__}: {exc}"
+                )
+            last_run["live_summary"] = time.monotonic()
 
     _log("maintenance_loop: shutting down")
     await http_session.close()

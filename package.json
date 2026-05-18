@@ -1,0 +1,15 @@
+{
+  "name": "polymarket-bot-dashboard",
+  "version": "1.0.0",
+  "private": true,
+  "description": "JSX precompile pipeline for the Poybot operator dashboard. V1 source of truth; V2 lab-only via localStorage.poybot_v2_lab.",
+  "scripts": {
+    "build": "node scripts/build_dashboard.mjs",
+    "watch": "node scripts/build_dashboard.mjs --watch",
+    "test:ui": "playwright test tests/ui"
+  },
+  "devDependencies": {
+    "esbuild": "^0.21.5",
+    "@playwright/test": "^1.45.0"
+  }
+}

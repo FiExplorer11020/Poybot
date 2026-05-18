@@ -37,15 +37,26 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /build
 
-# Copy pyproject first so the layer cache stays warm when source changes.
+# 2026-05-18 cache fix: install Python deps in a SEPARATE layer that
+# does NOT depend on src/. Previous version copied src/ before the pip
+# install, so every src change invalidated the deps layer and re-downloaded
+# lightgbm/scipy/numpy (~8-10 min). New layout:
+#   1. COPY pyproject.toml + create empty src stub  ← rare invalidation
+#   2. pip install (deps + stub package)            ← cached unless pyproject changes
+#   3. COPY real src/                               ← fast (just files)
+# Now src-only changes skip the slow pip layer entirely.
 COPY pyproject.toml README.md ./
-COPY src/ ./src/
+# Stub src package so `pip install ".[backtest]"` resolves package metadata.
+# The real src is COPY'd after, replacing the stub for runtime.
+RUN mkdir -p src && touch src/__init__.py
 
-# Create the venv inside the builder image, install the package + the
-# backtest extra (pandas/pyarrow → required by the nightly batch).
 RUN python -m venv /opt/venv \
     && /opt/venv/bin/pip install --upgrade pip \
     && /opt/venv/bin/pip install ".[backtest]"
+
+# Real source — this layer rebuilds on any src/ change, but the heavy
+# pip install above stays cached.
+COPY src/ ./src/
 
 # --------------------------------------------------------------------------- #
 # Stage 2 — runtime                                                            #

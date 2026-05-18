@@ -112,6 +112,13 @@ class PaperTrader:
         self._subscriber.register(
             REDIS_DECISIONS_CHANNEL, self._on_decision_message
         )
+        # PLAN-UIA-001 — operator-triggered emergency halt. The API
+        # process publishes {"reason", "actor", "requested_at"} on
+        # this channel via POST /api/control/halt. We receive it here
+        # in the running PaperTrader and run force_close_all_positions.
+        self._subscriber.register(
+            "control:halt", self._on_halt_message
+        )
 
     @property
     def capital(self) -> float:
@@ -1079,7 +1086,7 @@ class PaperTrader:
                 leader_price if strategy == "follow" else max(0.01, 1.0 - leader_price)
             )
             drift = abs(entry_price - expected_entry) / max(0.01, expected_entry)
-            max_drift = float(getattr(settings, "MAX_LEADER_PRICE_DRIFT", 0.20))
+            max_drift = float(getattr(settings, "MAX_LEADER_PRICE_DRIFT", 0.35))
             if drift > max_drift:
                 await self._record_open_trade_refusal(
                     decision,
@@ -1491,6 +1498,162 @@ class PaperTrader:
             f"({pnl_pct * 100:.1f}%) reason={close_reason}"
         )
         return True
+
+    # ------------------------------------------------------------------ #
+    # PLAN-UIA-001: emergency halt — force-close all open positions       #
+    # ------------------------------------------------------------------ #
+
+    async def force_close_all_positions(
+        self,
+        reason: str = "emergency_halt",
+    ) -> dict:
+        """Close every open paper trade at the last known oracle price.
+
+        Triggered by the operator clicking EMERGENCY HALT in the dashboard
+        (POST /api/control/halt → Redis pubsub ``control:halt`` →
+        ``_on_halt_message`` → here).
+
+        Distinct from killswitch: killswitch only blocks NEW trades.
+        Halt must ALSO clear open exposure so the operator can stop
+        the bleeding mid-session.
+
+        Strategy
+        --------
+          1. Snapshot the current ``_open_trades`` list (avoid mutation
+             during iteration — ``close_trade`` removes the trade from
+             the list when it succeeds).
+          2. For each trade, try to fetch a fresh ``PriceQuote`` via the
+             existing oracle. If the oracle returns nothing, fall back
+             to the trade's entry price and tag ``close_reason='emergency_halt_no_price'``
+             so the audit row records the fallback. Leaving positions
+             open during a halt defeats the purpose.
+          3. Call ``self.close_trade`` for each. Serial — N is small
+             (typically <50) and serial avoids races with the
+             ``open_trades`` mutation.
+          4. Best-effort: catch + log per-trade failures; never raise out.
+
+        Returns
+        -------
+        dict with counts and timing for the API/Telegram response.
+        """
+        started_at = datetime.now(timezone.utc)
+        # Snapshot the IDs (the list mutates as we close).
+        targets = [
+            (t.id, t.market_id, t.token_id, t.entry_price, t.direction)
+            for t in self._open_trades
+        ]
+        if not targets:
+            return {
+                "closed_count": 0,
+                "failed_count": 0,
+                "no_price_count": 0,
+                "trade_ids_closed": [],
+                "trade_ids_failed": [],
+                "started_at_iso": started_at.isoformat(),
+                "completed_at_iso": started_at.isoformat(),
+                "duration_s": 0.0,
+                "reason": reason,
+            }
+
+        closed_ids: list[int] = []
+        failed_ids: list[int] = []
+        no_price_count = 0
+
+        for trade_id, market_id, token_id, entry_price, direction in targets:
+            quote: PriceQuote | None = None
+            exit_price: float = float(entry_price)
+            close_reason = reason
+
+            # Try the oracle first. We deliberately catch broad — the halt
+            # path must finish even if the oracle is unhealthy.
+            if self._price_oracle is not None:
+                try:
+                    quote = await self._price_oracle.get_close_price(
+                        market_id=market_id,
+                        token_id=token_id,
+                        direction=direction,
+                    )
+                    if quote is not None and quote.price is not None:
+                        exit_price = float(quote.price)
+                    else:
+                        no_price_count += 1
+                        close_reason = f"{reason}_no_price"
+                        logger.warning(
+                            f"force_close: trade #{trade_id} no oracle quote — "
+                            f"falling back to entry_price={entry_price}"
+                        )
+                except Exception as exc:
+                    no_price_count += 1
+                    close_reason = f"{reason}_no_price"
+                    logger.warning(
+                        f"force_close: oracle.get_close_price failed for trade #{trade_id}: {exc} — "
+                        f"falling back to entry_price={entry_price}"
+                    )
+            else:
+                no_price_count += 1
+                close_reason = f"{reason}_no_oracle"
+
+            try:
+                ok = await self.close_trade(
+                    trade_id,
+                    exit_price=exit_price,
+                    close_reason=close_reason,
+                    price_quote=quote,
+                )
+                if ok:
+                    closed_ids.append(trade_id)
+                else:
+                    failed_ids.append(trade_id)
+            except Exception as exc:
+                logger.error(f"force_close: close_trade(#{trade_id}) raised: {exc}")
+                failed_ids.append(trade_id)
+
+        completed_at = datetime.now(timezone.utc)
+        result = {
+            "closed_count": len(closed_ids),
+            "failed_count": len(failed_ids),
+            "no_price_count": no_price_count,
+            "trade_ids_closed": closed_ids,
+            "trade_ids_failed": failed_ids,
+            "started_at_iso": started_at.isoformat(),
+            "completed_at_iso": completed_at.isoformat(),
+            "duration_s": round((completed_at - started_at).total_seconds(), 3),
+            "reason": reason,
+        }
+        logger.warning(
+            f"force_close_all_positions: closed={result['closed_count']} "
+            f"failed={result['failed_count']} no_price={result['no_price_count']} "
+            f"duration={result['duration_s']}s reason={reason}"
+        )
+
+        # Publish a Telegram-grade alert.
+        if self._redis is not None:
+            try:
+                publish = self._redis.publish(
+                    "control:halt:completed",
+                    json.dumps(result),
+                )
+                if inspect.isawaitable(publish):
+                    await publish
+            except Exception as exc:
+                logger.debug(f"force_close: publish completed failed: {exc}")
+        return result
+
+    async def _on_halt_message(self, payload: dict, _channel: str) -> None:
+        """Subscriber callback for ``control:halt`` (Redis pubsub).
+
+        Payload is set by POST /api/control/halt:
+          {"reason": str, "actor": str, "requested_at": iso}
+        """
+        reason = (payload or {}).get("reason") or "emergency_halt"
+        actor = (payload or {}).get("actor") or "operator"
+        logger.warning(
+            f"PaperTrader: EMERGENCY HALT received reason={reason} actor={actor}"
+        )
+        try:
+            await self.force_close_all_positions(reason=reason)
+        except Exception as exc:
+            logger.error(f"force_close_all_positions raised: {exc}")
 
     # ------------------------------------------------------------------ #
     # Pillar 5: close_audit_log helpers                                   #

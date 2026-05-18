@@ -5,9 +5,33 @@ const {
   C, S, useLiveStore, Badge, Dot, SectionLabel,
   fmtAge, fmtPnl, fmtMs, pnlColor,
 } = window;
-const { AlphaTerminal, MarketScanner, LivePortfolio, DecisionEngine, RiskConfig, BotHealth, WalletGraph, MLProgression } = window;
+// PLAN-UIA-001 (2026-05-18): MarketScanner removed from nav + destructure
+// (folded into WalletGraph 2026-05-17, dead code since). See CLAUDE.md §17.
+const { AlphaTerminal, LivePortfolio, DecisionEngine, RiskConfig, BotHealth, WalletGraph, MLProgression } = window;
 
 const { Inspector, LabGates } = window;
+
+// PLAN-UIA-001 — ModeChip: 3-state mode badge (paper/live/dual) with
+// reconciliation suffix so the operator can always tell whether the
+// displayed numbers match Gamma ground truth. Replaces the binary
+// PAPER/LIVE chip that hid the drift case.
+const ModeChip = ({ mode, reconVerdict, size = 'xs' }) => {
+  const cfg = {
+    paper: { type: 'blue', label: 'PAPER' },
+    live:  { type: 'red',  label: 'LIVE'  },
+    dual:  { type: 'amber',label: 'DUAL'  },
+  }[mode] || { type: 'default', label: (mode || '?').toUpperCase() };
+  const showRecon = mode === 'paper' || mode === 'dual';
+  const suffix = !showRecon ? ''
+    : reconVerdict === 'critical' ? ' · DRIFT'
+    : reconVerdict === 'warn'     ? ' · WARN'
+    : reconVerdict === 'ok'       ? ' · OK'
+    : '';
+  // When critical, override the chip color to red regardless of mode.
+  const finalType = (showRecon && reconVerdict === 'critical') ? 'red' : cfg.type;
+  return <Badge type={finalType} size={size}>{cfg.label}{suffix}</Badge>;
+};
+window.ModeChip = ModeChip;
 const NAV = [
   { id: 'alpha',      label: 'ALPHA TERMINAL',  icon: '◈', component: AlphaTerminal },
   { id: 'mlprog',     label: 'ML PROGRESSION',  icon: '◍', component: MLProgression },
@@ -40,10 +64,20 @@ const Sidebar = ({ tab, setTab }) => {
   const bot       = snapshot?.bot       || {};
   const ingestion = snapshot?.ingestion || {};
   const stats     = snapshot?.stats     || {};
+  // PLAN-UIA-001 — paper truth surface.
+  const recon     = snapshot?.reconciliation || { verdict: 'unknown', pnl_delta_abs: 0, age_s: null };
+  const reconVerdict = recon.verdict || 'unknown';
+  const reconColor = { ok: C.green, warn: C.amber, critical: C.red, unknown: C.dim2 }[reconVerdict] || C.dim2;
+  const execMode = (bot.execution_mode || 'paper').toLowerCase();
 
   const connColor = { connected: C.green, reconnecting: C.amber, connecting: C.amber, disconnected: C.red }[connectionState] || C.dim2;
   const connLabel = { connected: 'LIVE', reconnecting: 'RECON…', connecting: 'CONN…', disconnected: 'OFFLINE' }[connectionState] || '—';
   const botColor  = bot.status === 'running' ? C.green : bot.status === 'stopped' ? C.amber : C.red;
+
+  const reconClickHandler = () => {
+    if (window.PoybotNav?.setActiveTab) window.PoybotNav.setActiveTab('inspector');
+    else if (typeof setTab === 'function') setTab('inspector');
+  };
 
   const sysRows = [
     { label: 'BOT',       color: botColor,  value: (bot.status || '—').toUpperCase() },
@@ -52,6 +86,17 @@ const Sidebar = ({ tab, setTab }) => {
       label: 'INGESTION',
       color: (ingestion.live_markets || 0) > 0 ? C.green : C.red,
       value: ingestion.total_markets ? `${ingestion.live_markets || 0}/${ingestion.total_markets}` : '—',
+    },
+    // PLAN-UIA-001 — always-rendered RECON chip per ADR-PMK-014.10.
+    // "Silence implies trustable. Explicit UNKNOWN teaches operator the question exists."
+    {
+      label: 'RECON',
+      color: reconColor,
+      value: reconVerdict === 'unknown' ? 'UNKNOWN'
+           : reconVerdict === 'ok'      ? 'OK'
+           : `Δ ${fmtPnl(recon.pnl_delta_abs)}`,
+      onClick: reconClickHandler,
+      title: 'Paper-trade reconciliation vs Gamma. Click to open Inspector.',
     },
     {
       label: 'EXEC',
@@ -103,31 +148,63 @@ const Sidebar = ({ tab, setTab }) => {
       <div style={{ borderTop: `1px solid ${C.border}`, padding: '10px 12px', fontSize: 10 }}>
         <div style={{ ...S.label, marginBottom: 8 }}>System</div>
         {sysRows.map(r => (
-          <div key={r.label} style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 4 }}>
-            <Dot status={r.color === C.green ? 'ok' : r.color === C.amber ? 'warn' : 'err'} />
+          <div
+            key={r.label}
+            onClick={r.onClick}
+            title={r.title}
+            style={{
+              display: 'flex', alignItems: 'center', gap: 6, marginBottom: 4,
+              cursor: r.onClick ? 'pointer' : 'default',
+            }}
+            onMouseEnter={r.onClick ? e => e.currentTarget.style.background = 'rgba(255,255,255,0.03)' : undefined}
+            onMouseLeave={r.onClick ? e => e.currentTarget.style.background = 'transparent' : undefined}
+          >
+            <Dot status={r.color === C.green ? 'ok' : r.color === C.amber ? 'warn' : r.color === C.red ? 'err' : 'off'} />
             <span style={{ color: C.dim2, minWidth: 58 }}>{r.label}</span>
             <span style={{ color: r.color, marginLeft: 'auto', fontWeight: 600, fontSize: 9, letterSpacing: '0.04em' }}>{r.value}</span>
           </div>
         ))}
 
-        {/* PnL / win rate mini */}
+        {/* PLAN-UIA-001: KPI hierarchy — Win Rate FIRST (mission KPI, 28% → 70%+
+            per memory project_polymarket_bot.md), Net PnL second (currently
+            unreliable per project_paper_trading_truth.md; carries a warning
+            marker when reconciliation is critical). */}
         <div style={{ marginTop: 10, paddingTop: 8, borderTop: `1px solid ${C.border}` }}>
+          {/* Win Rate vs 70% target */}
           <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 3 }}>
-            <span style={{ color: C.dim2 }}>NET PNL</span>
-            <span style={{ color: pnlColor(stats.total_pnl), fontWeight: 700 }}>
-              {stats.total_pnl != null ? `${stats.total_pnl >= 0 ? '+' : ''}$${Math.abs(stats.total_pnl).toFixed(2)}` : '—'}
+            <span style={{ color: C.dim2 }}>WIN RATE</span>
+            <span style={{ color: stats.win_rate >= 0.7 ? C.green : stats.win_rate >= 0.5 ? C.amber : stats.win_rate != null ? C.red : C.dim2, fontWeight: 700 }}>
+              {stats.win_rate != null ? `${(stats.win_rate * 100).toFixed(1)}%` : '—'}
+              <span style={{ color: C.dim2, fontSize: 9, marginLeft: 4, fontWeight: 400 }}>/ 70%</span>
             </span>
           </div>
+          {/* Target progress bar */}
+          <div style={{ height: 2, background: 'rgba(255,255,255,0.05)', marginBottom: 8 }}>
+            <div style={{
+              width: `${Math.min(100, ((stats.win_rate || 0) / 0.70) * 100)}%`,
+              height: '100%',
+              background: stats.win_rate >= 0.7 ? C.green : C.amber,
+              transition: 'width 0.4s',
+            }} />
+          </div>
+          {/* Net PnL with reconciliation warning marker */}
           <div style={{ display: 'flex', justifyContent: 'space-between' }}>
-            <span style={{ color: C.dim2 }}>WIN RATE</span>
-            <span style={{ color: C.amber, fontWeight: 700 }}>
-              {stats.win_rate != null ? `${(stats.win_rate * 100).toFixed(1)}%` : '—'}
+            <span style={{ color: C.dim2 }}>NET PNL</span>
+            <span style={{ color: pnlColor(stats.total_pnl), fontWeight: 600 }}>
+              {stats.total_pnl != null ? `${stats.total_pnl >= 0 ? '+' : ''}$${Math.abs(stats.total_pnl).toFixed(2)}` : '—'}
+              {reconVerdict === 'critical' && (
+                <span title="Reconciliation critical — displayed PnL diverges from Gamma" style={{ color: C.red, fontSize: 10, marginLeft: 4 }}>⚠</span>
+              )}
+              {reconVerdict === 'warn' && (
+                <span title="Reconciliation warning — displayed PnL diverges from Gamma" style={{ color: C.amber, fontSize: 10, marginLeft: 4 }}>·</span>
+              )}
             </span>
           </div>
         </div>
 
+        {/* PLAN-UIA-001: ModeChip replaces binary PAPER/LIVE badge. */}
         <div style={{ marginTop: 8, paddingTop: 8, borderTop: `1px solid ${C.border}`, display: 'flex', gap: 6, alignItems: 'center' }}>
-          <Badge type={bot.execution_enabled ? 'green' : 'default'}>{bot.execution_enabled ? 'LIVE' : 'PAPER'}</Badge>
+          <ModeChip mode={execMode} reconVerdict={reconVerdict} size="xs" />
           <span style={{ fontSize: 9, color: C.dim2 }}>Poybot</span>
           {bot.uptime_seconds != null && (
             <span style={{ fontSize: 9, color: C.dim2, marginLeft: 'auto' }}>↑{fmtAge(bot.uptime_seconds)}</span>
@@ -139,15 +216,11 @@ const Sidebar = ({ tab, setTab }) => {
 };
 
 // ── App ────────────────────────────────────────────────────────────────────────
-const TWEAK_DEFAULTS = /*EDITMODE-BEGIN*/{
-  "accentColor": "#e8a020",
-  "apiBase": "http://localhost:8000"
-}/*EDITMODE-END*/;
+// PLAN-UIA-001: removed the Tweaks panel (CMS-style editor mode toggled via
+// postMessage). It had no place in an operator trading terminal.
 
 const App = () => {
   const [tab, setTab]           = useStateA(() => localStorage.getItem('pmi_tab') || 'alpha');
-  const [showTweaks, setShowTweaks] = useStateA(false);
-  const [tweaks, setTweaks]     = useStateA(TWEAK_DEFAULTS);
   const { snapshot }            = useLiveStore();
   const bot = snapshot?.bot || {};
 
@@ -204,6 +277,7 @@ const App = () => {
     const TAB_BY_KEY = {
       a: 'alpha', m: 'mlprog', w: 'graph', p: 'portfolio',
       d: 'decisions', i: 'inspector', r: 'risk', h: 'health',
+      l: 'lab',  // PLAN-UIA-001
     };
     const onKey = (e) => {
       // Ignore when typing in an editable field.
@@ -242,16 +316,6 @@ const App = () => {
     return () => window.removeEventListener('keydown', onKey);
   }, [showShortcuts]);
 
-
-  useEffectA(() => {
-    const handler = e => {
-      if (e.data?.type === '__activate_edit_mode')   setShowTweaks(true);
-      if (e.data?.type === '__deactivate_edit_mode') setShowTweaks(false);
-    };
-    window.addEventListener('message', handler);
-    window.parent.postMessage({ type: '__edit_mode_available' }, '*');
-    return () => window.removeEventListener('message', handler);
-  }, []);
 
   // UTC clock tick
   const [utc, setUtc] = useStateA(() => new Date().toISOString().slice(11, 19));
@@ -300,15 +364,25 @@ const App = () => {
             {(bot.status || 'offline').toUpperCase()}
           </Badge>
           <span style={{ color: C.border2 }}>│</span>
-          <Badge type={bot.execution_enabled ? 'green' : 'default'} size="xs">
-            {bot.execution_enabled ? 'LIVE EXECUTION' : 'DRY RUN'}
-          </Badge>
-          {bot.latency_ms != null && (
-            <>
-              <span style={{ color: C.border2 }}>│</span>
-              <span style={{ fontSize: 10, color: C.dim2 }}>latency <span style={{ color: C.blue }}>{fmtMs(bot.latency_ms)}</span></span>
-            </>
-          )}
+          {/* PLAN-UIA-001 — ModeChip replaces the old binary LIVE/DRY-RUN badge. */}
+          <ModeChip mode={(snapshot?.bot?.execution_mode || 'paper').toLowerCase()} reconVerdict={snapshot?.reconciliation?.verdict || 'unknown'} size="xs" />
+          {/* PLAN-UIA-001 — WS lag replaces bot.latency_ms. The actually-important
+              latency for a leader-intel bot is "how stale is the most recent trade". */}
+          {(() => {
+            const lag = snapshot?.ingestion?.ws_last_message_age_s ?? snapshot?.ingestion?.avg_freshness_ms;
+            if (lag == null) return null;
+            // ws_last_message_age_s is seconds; avg_freshness_ms is ms.
+            const lagMs = snapshot?.ingestion?.ws_last_message_age_s != null
+              ? snapshot.ingestion.ws_last_message_age_s * 1000
+              : lag;
+            const color = lagMs > 30_000 ? C.red : lagMs > 5_000 ? C.amber : C.green;
+            return (
+              <>
+                <span style={{ color: C.border2 }}>│</span>
+                <span style={{ fontSize: 10, color: C.dim2 }}>ws lag <span style={{ color }}>{fmtMs(lagMs)}</span></span>
+              </>
+            );
+          })()}
 
           <button onClick={() => setShowShortcuts(true)} title="Keyboard shortcuts (?)"
             style={{ marginLeft: 'auto', background: 'transparent', border: `1px solid ${C.border2}`, color: C.dim2, fontSize: 10, padding: '2px 7px', cursor: 'pointer', fontFamily: 'monospace' }}>
@@ -342,44 +416,6 @@ const App = () => {
       {/* Keyboard shortcuts help — toggle with `?` */}
       {showShortcuts && (
         <ShortcutsOverlay nav={NAV} onClose={() => setShowShortcuts(false)} />
-      )}
-
-      {/* Tweaks panel */}
-      {showTweaks && (
-        <div style={{ position: 'fixed', bottom: 20, right: 20, background: C.panel, border: `1px solid ${C.border2}`, padding: 16, zIndex: 9999, minWidth: 270 }}>
-          <div style={{ ...S.label, marginBottom: 14 }}>Tweaks</div>
-
-          <div style={{ marginBottom: 12 }}>
-            <div style={{ ...S.label, marginBottom: 6 }}>Accent Color</div>
-            <input type="color" value={tweaks.accentColor}
-              onChange={e => {
-                const v = { ...tweaks, accentColor: e.target.value };
-                setTweaks(v);
-                window.parent.postMessage({ type: '__edit_mode_set_keys', edits: v }, '*');
-              }}
-              style={{ width: '100%', height: 28, background: 'transparent', border: `1px solid ${C.border2}`, cursor: 'pointer' }}
-            />
-          </div>
-
-          <div style={{ marginBottom: 12 }}>
-            <div style={{ ...S.label, marginBottom: 6 }}>Backend URL</div>
-            <input
-              type="text"
-              defaultValue={window.PoybotAPI?.getSettings?.()?.API_BASE || 'http://localhost:8000'}
-              style={{ background: C.panel2, border: `1px solid ${C.border2}`, color: C.text, padding: '4px 8px', fontSize: 11, width: '100%', outline: 'none' }}
-              onBlur={e => {
-                const v = e.target.value.trim();
-                if (v) window.PoybotAPI?.setSettings?.(v);
-              }}
-            />
-            <div style={{ fontSize: 9, color: C.dim2, marginTop: 3 }}>Blur to apply — reloads page</div>
-          </div>
-
-          <button
-            onClick={() => { window.parent.postMessage({ type: '__edit_mode_dismissed' }, '*'); setShowTweaks(false); }}
-            style={{ background: 'transparent', border: `1px solid ${C.border2}`, color: C.dim2, padding: '4px 12px', cursor: 'pointer', fontSize: 11, width: '100%' }}
-          >CLOSE</button>
-        </div>
       )}
     </div>
   );
@@ -714,6 +750,7 @@ const ShortcutsOverlay = ({ nav, onClose }) => {
     { keys: ['g', 'i'], desc: 'Go to Inspector' },
     { keys: ['g', 'r'], desc: 'Go to Risk & Config' },
     { keys: ['g', 'h'], desc: 'Go to Bot Health' },
+    { keys: ['g', 'l'], desc: 'Go to LAB' },
     { keys: ['?'], desc: 'Toggle this help' },
     { keys: ['Esc'], desc: 'Close any modal/panel' },
   ];

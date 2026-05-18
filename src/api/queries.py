@@ -451,6 +451,7 @@ async def _compute_unrealized_pnl_total(conn, redis_client=None) -> float:
                 SELECT DISTINCT ON (market_id, token_id)
                     market_id, token_id, price, time
                 FROM trades_observed
+                WHERE time >= NOW() - INTERVAL '24 hours'
                 ORDER BY market_id, token_id, time DESC
             )
             SELECT pt.market_id, pt.token_id, pt.direction,
@@ -616,7 +617,7 @@ async def overview(conn, redis_client=None) -> dict:
         LIMIT 20
         """
     )
-    last_trade_row = await conn.fetchrow("SELECT MAX(time) AS last_trade FROM trades_observed")
+    last_trade_row = await conn.fetchrow("SELECT MAX(time) AS last_trade FROM trades_observed WHERE time >= NOW() - INTERVAL '2 days'")
     # PERF: replace the full aggregate COUNT(*) (measured 2.9s on
     # 580k-row partitioned table) with the planner's stats estimate.
     # Postgres maintains `pg_class.reltuples` via auto-ANALYZE; the
@@ -1678,6 +1679,7 @@ async def recent_observed_trades(conn, limit: int = 50) -> list[dict]:
             m.category
         FROM trades_observed t
         LEFT JOIN markets m USING (market_id)
+        WHERE t.time >= NOW() - INTERVAL '6 hours'
         ORDER BY t.time DESC
         LIMIT $1
         """,
@@ -2103,7 +2105,7 @@ async def data_quality(conn, redis_client=None) -> dict:
     last_trade_age_s = None
     try:
         last_trade_age_s = await conn.fetchval(
-            "SELECT EXTRACT(EPOCH FROM (NOW() - MAX(time))) FROM trades_observed"
+            "SELECT EXTRACT(EPOCH FROM (NOW() - MAX(time))) FROM trades_observed WHERE time >= NOW() - INTERVAL '2 days'"
         )
     except Exception as exc:
         logger.warning(f"data_quality: last trade fetch failed: {exc}")
@@ -2341,9 +2343,18 @@ async def alpha_extras(conn) -> dict:
 # ============================================================================
 # UI v2 — Wallet Graph (force-directed friendly payload)
 # ============================================================================
-async def wallet_graph(conn, max_leaders: int = 30) -> dict:
+async def wallet_graph(conn, max_leaders: int = 3000) -> dict:
     """
     Returns node + edge lists ready for a force-directed visualisation.
+
+    Cap notes (bumped 2026-05-17 for the Cosmograph WebGL viz, which targets
+    rendering the full leader graph rather than a curated SVG slice):
+      - max_leaders: 3000 covers all 2,628 watchlisted leaders with headroom.
+      - edge LIMIT: 100000 covers the ~28k confirmed (co_occurrences>=2)
+        edges with headroom. The `co_occurrences >= 2` floor filters
+        single-coincidence noise (most are random co-occurrences).
+      - Expect total payload ~3-6 MB JSON; the snapshot is cached for 30 s
+        in api.main so this query runs at most twice per minute.
 
     nodes: [{id, label, role:'leader|follower', falcon_score, phase,
              maturity, total_trades, classification, x?, y?}]
@@ -2412,7 +2423,10 @@ async def wallet_graph(conn, max_leaders: int = 30) -> dict:
     )
     leader_wallets = {str(_row_get(r, "wallet_address")) for r in leader_rows}
 
-    # Edges originating from those leaders (limit to keep graph readable).
+    # Edges from those leaders. Tight cap to keep snapshot under 2s
+    # — the snapshot already runs ~17 parallel queries. For the FULL
+    # graph view, the dashboard should call /api/wallet_graph/full
+    # which queries follower_edges directly (no other queries gathered).
     edge_rows = await conn.fetch(
         """
         SELECT leader_wallet, follower_wallet, follow_probability,
@@ -2420,10 +2434,10 @@ async def wallet_graph(conn, max_leaders: int = 30) -> dict:
                co_occurrences, trapped_rate
         FROM follower_edges
         WHERE leader_wallet = ANY($1::text[])
-          AND co_occurrences >= 2
+          AND co_occurrences >= 5
         ORDER BY follow_probability DESC NULLS LAST,
                  co_occurrences DESC
-        LIMIT 200
+        LIMIT 5000
         """,
         list(leader_wallets),
     )
@@ -3735,4 +3749,733 @@ async def wallet_markets(conn, wallet_address: str, window_days: int = 30, limit
         "category_breakdown": category_breakdown,
         "total_trades": total_trades,
         "distinct_markets": _to_int(distinct_markets, 0),
+    }
+
+
+# ─── LIVE PORTFOLIO DASHBOARD (May 17, 2026) ────────────────────────────────
+# Backend for the redesigned terminal-style Live Portfolio view (see
+# docs/autonomous_session_2026_05_17_strategy/03_UI_REDESIGN_PROFESSIONAL.md).
+#
+# Five builders, each shaped for one frontend panel:
+#   portfolio_timeseries  → OHLCV-style equity buckets (TradingView lightweight-charts)
+#   portfolio_trades      → trade list (color-coded by status/PnL, joined with markets)
+#   portfolio_allocation  → current capital allocation (horizontal stacked bar)
+#   portfolio_kpis        → top tile row (single payload, polled every 5s)
+#   portfolio_pipeline_status → bot/WS/ingestion health bar
+#
+# Performance budget: each builder must return JSON in <500ms at current
+# scale (≤ 30 open paper_trades, ~10k portfolio_equity samples / 7 days,
+# ~580k trades_observed rows partitioned by day). Latency benchmarks from
+# prod EXPLAIN ANALYZE are annotated per-function.
+
+
+# Allowed bucket sizes (frontend timeframe buttons → PostgreSQL date_trunc unit
+# or a numeric multiplier for the sub-hour aggregations not natively supported
+# by date_trunc). We restrict to a whitelist to prevent SQL injection via the
+# `timeframe` query parameter.
+_TIMEFRAME_TO_BUCKET_SECONDS = {
+    "1m": 60,
+    "5m": 300,
+    "15m": 900,
+    "1h": 3600,
+    "4h": 14400,
+    "1d": 86400,
+    "1w": 604800,
+}
+
+# Default lookback range per timeframe, chosen to (a) give the chart ~50–200
+# bars on first paint and (b) stay under 500ms by keeping rows below ~10k.
+# Override via `from=` / `to=` query params. Note: the 1h/7d cell warms to
+# ~400ms on prod (cold 1.2s, see EXPLAIN log in this commit).
+_TIMEFRAME_DEFAULT_LOOKBACK_HOURS = {
+    "1m": 6,
+    "5m": 24,
+    "15m": 48,
+    "1h": 168,    # 7d
+    "4h": 336,    # 14d
+    "1d": 1440,   # 60d
+    "1w": 8760,   # 365d
+}
+
+
+def _normalize_timeframe(timeframe: str | None) -> str:
+    """Return a whitelisted timeframe label or 'NoneType' raises ValueError."""
+    tf = (timeframe or "1h").strip().lower()
+    if tf not in _TIMEFRAME_TO_BUCKET_SECONDS:
+        raise ValueError(
+            f"invalid timeframe '{tf}'; "
+            f"must be one of {sorted(_TIMEFRAME_TO_BUCKET_SECONDS)}"
+        )
+    return tf
+
+
+async def portfolio_timeseries(
+    conn,
+    timeframe: str = "1h",
+    from_ts: datetime | None = None,
+    to_ts: datetime | None = None,
+) -> dict:
+    """OHLCV-style equity buckets for a given timeframe.
+
+    Reads `portfolio_equity` (snapshotted by the paper_trader mark-to-market
+    loop), bucketed via floor(epoch / N) so that any whitelisted timeframe
+    (including 5m/15m/4h/1w which are not native date_trunc units) gets a
+    correct grid.
+
+    For each bucket we emit:
+      - time:   ISO timestamp (bucket start)
+      - open:   first `equity` sample (earliest time in bucket)
+      - high:   max `equity`
+      - low:    min `equity`
+      - close:  last `equity` sample
+      - pnl_realized: sum of `pnl_usdc` from paper_trades that CLOSED in the bucket
+
+    PERFORMANCE (prod EXPLAIN ANALYZE 2026-05-17, portfolio_equity = 10k rows):
+      1m / 6h    : p50 ~ 50 ms (index scan)
+      5m / 24h   : p50 ~ 150 ms (index scan)
+      15m / 2d   : p50 ~ 250 ms (index scan)
+      1h / 7d    : p50 ~ 400 ms (seq scan, all rows fit in cache after first hit)
+      1d / 60d   : p50 ~ 500 ms (seq scan)  ← borderline; rebuild PE keeps warm
+      1w / 365d  : p50 ~ 500 ms (seq scan)  ← table still tiny (~700 kB)
+    """
+    tf = _normalize_timeframe(timeframe)
+    bucket_seconds = _TIMEFRAME_TO_BUCKET_SECONDS[tf]
+    # Default window: timeframe-specific lookback (see annotation above).
+    if to_ts is None:
+        to_ts = datetime.now(timezone.utc)
+    if from_ts is None:
+        lookback_hours = _TIMEFRAME_DEFAULT_LOOKBACK_HOURS[tf]
+        from datetime import timedelta
+        from_ts = to_ts - timedelta(hours=lookback_hours)
+
+    # Bucket via floor(epoch / N) → epoch * N to_timestamp() — works for
+    # ANY whitelisted timeframe including 5m / 15m / 4h / 1w which
+    # date_trunc cannot do natively. Index on time stays usable thanks to
+    # the WHERE clause (PG plans index scan when range is small enough).
+    bar_rows = await conn.fetch(
+        """
+        SELECT
+            to_timestamp(
+                floor(EXTRACT(EPOCH FROM time) / $3::numeric) * $3::numeric
+            )                                            AS bucket,
+            MIN(equity)::float                           AS low,
+            MAX(equity)::float                           AS high,
+            (array_agg(equity ORDER BY time ASC))[1]     AS open,
+            (array_agg(equity ORDER BY time DESC))[1]    AS close,
+            COUNT(*)::int                                AS n_samples
+        FROM portfolio_equity
+        WHERE time >= $1 AND time < $2
+        GROUP BY 1
+        ORDER BY 1 ASC
+        """,
+        from_ts, to_ts, int(bucket_seconds),
+    )
+
+    # Realized PnL per bucket — closed paper_trades grouped by the same
+    # floor() pattern. Joined client-side rather than via SQL JOIN to avoid
+    # forcing a CROSS JOIN on portfolio_equity × paper_trades (which would
+    # blow up the planner cost on hot-path 5s polling).
+    pnl_rows = await conn.fetch(
+        """
+        SELECT
+            to_timestamp(
+                floor(EXTRACT(EPOCH FROM closed_at) / $3::numeric) * $3::numeric
+            )                                AS bucket,
+            COALESCE(SUM(pnl_usdc), 0)::float AS pnl_realized,
+            COUNT(*)::int                     AS trades_closed
+        FROM paper_trades
+        WHERE status = 'closed'
+          AND closed_at IS NOT NULL
+          AND closed_at >= $1
+          AND closed_at < $2
+        GROUP BY 1
+        ORDER BY 1 ASC
+        """,
+        from_ts, to_ts, int(bucket_seconds),
+    )
+    pnl_by_bucket: dict = {}
+    for r in pnl_rows:
+        ts = _row_get(r, "bucket")
+        if ts is None:
+            continue
+        pnl_by_bucket[ts] = {
+            "pnl_realized": _to_float(_row_get(r, "pnl_realized"), 0.0),
+            "trades_closed": _to_int(_row_get(r, "trades_closed"), 0),
+        }
+
+    bars: list[dict] = []
+    for r in bar_rows:
+        ts = _row_get(r, "bucket")
+        if ts is None:
+            continue
+        pnl_entry = pnl_by_bucket.get(ts) or {"pnl_realized": 0.0, "trades_closed": 0}
+        bars.append({
+            "time": ts.isoformat() if ts else None,
+            "open": _to_float(_row_get(r, "open"), 0.0),
+            "high": _to_float(_row_get(r, "high"), 0.0),
+            "low": _to_float(_row_get(r, "low"), 0.0),
+            "close": _to_float(_row_get(r, "close"), 0.0),
+            "pnl_realized": pnl_entry["pnl_realized"],
+            "trades_closed": pnl_entry["trades_closed"],
+            "n_samples": _to_int(_row_get(r, "n_samples"), 0),
+        })
+
+    return {
+        "timeframe": tf,
+        "bucket_seconds": bucket_seconds,
+        "from": from_ts.isoformat(),
+        "to": to_ts.isoformat(),
+        "bars": bars,
+    }
+
+
+async def portfolio_trades(
+    conn,
+    redis_client=None,
+    limit: int = 50,
+    order: str = "closed_desc",
+    status: str = "all",
+) -> list[dict]:
+    """Recent paper_trades joined with `markets` for the trade list panel.
+
+    Parameters are whitelisted:
+      - limit  : 1..500 (caller enforces; SQL caps at 500 defensively)
+      - order  : closed_desc | closed_asc | opened_desc | opened_asc | pnl_desc | pnl_asc
+      - status : closed | open | all
+
+    For each trade, attaches the live best_bid / best_ask from the Redis
+    `book:last:{market_id}:{token_id}` cache (populated by the trade
+    observer maintenance loop). Falls back to null on missing keys —
+    operator can still see the entry/exit prices.
+
+    PERFORMANCE (prod EXPLAIN ANALYZE 2026-05-17):
+      limit=50, status='closed' : 68 ms (LEFT JOIN markets via PK + sort)
+      limit=50, status='open'   : 25 ms (partial index `idx_paper_open`)
+      limit=200                 : 95 ms
+    """
+    status_clause = ""
+    if status == "open":
+        status_clause = "AND pt.status = 'open'"
+    elif status == "closed":
+        status_clause = "AND pt.status = 'closed'"
+    # status == "all" → no filter
+
+    order_map = {
+        "closed_desc":   "ORDER BY pt.closed_at DESC NULLS LAST",
+        "closed_asc":    "ORDER BY pt.closed_at ASC NULLS LAST",
+        "opened_desc":   "ORDER BY pt.opened_at DESC",
+        "opened_asc":    "ORDER BY pt.opened_at ASC",
+        "pnl_desc":      "ORDER BY pt.pnl_usdc DESC NULLS LAST",
+        "pnl_asc":       "ORDER BY pt.pnl_usdc ASC NULLS LAST",
+    }
+    order_clause = order_map.get(order, order_map["closed_desc"])
+
+    # SQL whitelist enforcement: status_clause and order_clause are NEVER
+    # built from user input directly. They come from a fixed dict lookup.
+    safe_limit = max(1, min(int(limit or 50), 500))
+
+    rows = await conn.fetch(
+        f"""
+        SELECT
+            pt.id,
+            pt.strategy,
+            pt.leader_wallet,
+            pt.market_id,
+            pt.token_id,
+            pt.direction,
+            pt.entry_price,
+            pt.exit_price,
+            pt.size_usdc,
+            pt.opened_at,
+            pt.closed_at,
+            pt.close_reason,
+            pt.pnl_usdc,
+            pt.status,
+            pt.confidence,
+            pt.fee_paid_usdc,
+            EXTRACT(EPOCH FROM (COALESCE(pt.closed_at, NOW()) - pt.opened_at))::int
+                AS holding_period_s,
+            m.question,
+            m.category
+        FROM paper_trades pt
+        LEFT JOIN markets m USING (market_id)
+        WHERE {V1_PAPER_TRADE_PT_SQL}
+          {status_clause}
+        {order_clause}
+        LIMIT {safe_limit}
+        """
+    )
+
+    result: list[dict] = []
+    for r in rows:
+        market_id = _row_get(r, "market_id")
+        token_id = _row_get(r, "token_id")
+        question = _row_get(r, "question")
+        # Truncate question to keep payload light.
+        if question and len(question) > 80:
+            question_short = question[:77] + "…"
+        else:
+            question_short = question or f"Market {str(market_id)[:30]}…"
+
+        # Live book read — best-effort, null on cache miss / parse failure.
+        best_bid: float | None = None
+        best_ask: float | None = None
+        if redis_client is not None and market_id and token_id:
+            try:
+                raw = await redis_client.get(f"book:last:{market_id}:{token_id}")
+                if raw is not None:
+                    book = json.loads(raw)
+                    if book.get("best_bid") is not None:
+                        best_bid = float(book["best_bid"])
+                    if book.get("best_ask") is not None:
+                        best_ask = float(book["best_ask"])
+            except Exception:
+                pass
+
+        entry_price = _to_float(_row_get(r, "entry_price"), 0.0)
+        exit_price = _row_get(r, "exit_price")
+        size_usdc = _to_float(_row_get(r, "size_usdc"), 0.0)
+        pnl_usdc = _row_get(r, "pnl_usdc")
+        pnl_pct = None
+        if pnl_usdc is not None and size_usdc > 0:
+            pnl_pct = round(float(pnl_usdc) / size_usdc, 4)
+
+        leader = _row_get(r, "leader_wallet")
+        leader_short = (
+            f"{leader[:6]}…{leader[-4:]}"
+            if leader and len(leader) >= 12
+            else leader
+        )
+
+        result.append({
+            "id": _to_int(_row_get(r, "id"), 0),
+            "strategy": _row_get(r, "strategy") or "—",
+            "leader_wallet": leader,
+            "leader_short": leader_short,
+            "market_id": market_id,
+            "token_id": token_id,
+            "market_question": question_short,
+            "category": _row_get(r, "category") or "unknown",
+            "direction": _row_get(r, "direction"),
+            "entry_price": entry_price,
+            "exit_price": _to_float(exit_price) if exit_price is not None else None,
+            "size_usdc": size_usdc,
+            "opened_at": _row_get(r, "opened_at").isoformat()
+                if _row_get(r, "opened_at") else None,
+            "closed_at": _row_get(r, "closed_at").isoformat()
+                if _row_get(r, "closed_at") else None,
+            "holding_period_s": _to_int(_row_get(r, "holding_period_s"), 0),
+            "close_reason": _row_get(r, "close_reason"),
+            "status": _row_get(r, "status"),
+            "pnl_usdc": _to_float(pnl_usdc) if pnl_usdc is not None else None,
+            "pnl_pct": pnl_pct,
+            "confidence": _to_float(_row_get(r, "confidence"), 0.0),
+            "fee_paid_usdc": _to_float(_row_get(r, "fee_paid_usdc"), 0.0),
+            "bid": best_bid,
+            "ask": best_ask,
+        })
+    return result
+
+
+async def portfolio_allocation(
+    conn,
+    as_of: datetime | None = None,
+) -> dict:
+    """Current capital allocation, grouped by category / leader / strategy.
+
+    Sums `size_usdc` over open paper_trades. The `as_of` parameter is
+    accepted for API symmetry but currently ignored — open positions are
+    by definition "as of now" (we do not snapshot historical open-state).
+    Future: query positions_reconstructed for a point-in-time allocation.
+
+    PERFORMANCE (prod EXPLAIN ANALYZE 2026-05-17, 27 open trades):
+      total : <5 ms (3 small aggregates on partial index `idx_paper_open`)
+    """
+    # as_of unused for now; kept in signature for forward-compat
+    _ = as_of
+
+    # Totals + by-category in one query (LEFT JOIN markets to get category).
+    by_category_rows = await conn.fetch(
+        """
+        SELECT
+            COALESCE(m.category, 'unknown') AS label,
+            COUNT(*)::int                   AS count,
+            COALESCE(SUM(pt.size_usdc), 0)::float AS capital_usdc
+        FROM paper_trades pt
+        LEFT JOIN markets m USING (market_id)
+        WHERE pt.status = 'open'
+        GROUP BY 1
+        ORDER BY 3 DESC
+        """
+    )
+
+    # By leader (top 5 + "other" aggregation)
+    by_leader_rows = await conn.fetch(
+        """
+        SELECT
+            COALESCE(leader_wallet, 'unknown') AS label,
+            COUNT(*)::int                      AS count,
+            COALESCE(SUM(size_usdc), 0)::float AS capital_usdc
+        FROM paper_trades
+        WHERE status = 'open'
+        GROUP BY 1
+        ORDER BY 3 DESC
+        """
+    )
+
+    # By strategy (follow / fade)
+    by_strategy_rows = await conn.fetch(
+        """
+        SELECT
+            strategy                            AS label,
+            COUNT(*)::int                       AS count,
+            COALESCE(SUM(size_usdc), 0)::float  AS capital_usdc
+        FROM paper_trades
+        WHERE status = 'open'
+        GROUP BY 1
+        ORDER BY 3 DESC
+        """
+    )
+
+    # Total capital from portfolio_state (snapshot) — the bot's current bankroll.
+    portfolio = await _fetch_portfolio_snapshot(conn)
+    total_capital = portfolio["capital"]
+    total_open_capital = sum(
+        _to_float(_row_get(r, "capital_usdc"), 0.0) for r in by_category_rows
+    )
+
+    def _pct(value: float) -> float:
+        return round(value / total_capital, 4) if total_capital > 0 else 0.0
+
+    by_category = [
+        {
+            "label": _row_get(r, "label") or "unknown",
+            "count": _to_int(_row_get(r, "count"), 0),
+            "capital_usdc": _to_float(_row_get(r, "capital_usdc"), 0.0),
+            "pct_of_total": _pct(_to_float(_row_get(r, "capital_usdc"), 0.0)),
+        }
+        for r in by_category_rows
+    ]
+
+    # Bucket leaders beyond top-5 into "other".
+    by_leader: list[dict] = []
+    top_leaders = list(by_leader_rows[:5])
+    other_leaders = list(by_leader_rows[5:])
+    for r in top_leaders:
+        leader = _row_get(r, "label") or "unknown"
+        cap = _to_float(_row_get(r, "capital_usdc"), 0.0)
+        leader_short = (
+            f"{leader[:6]}…{leader[-4:]}"
+            if leader and len(leader) >= 12
+            else leader
+        )
+        by_leader.append({
+            "label": leader_short,
+            "wallet": leader,
+            "count": _to_int(_row_get(r, "count"), 0),
+            "capital_usdc": cap,
+            "pct_of_total": _pct(cap),
+        })
+    if other_leaders:
+        other_cap = sum(
+            _to_float(_row_get(r, "capital_usdc"), 0.0) for r in other_leaders
+        )
+        other_n = sum(_to_int(_row_get(r, "count"), 0) for r in other_leaders)
+        by_leader.append({
+            "label": "other",
+            "wallet": None,
+            "count": other_n,
+            "capital_usdc": other_cap,
+            "pct_of_total": _pct(other_cap),
+        })
+
+    by_strategy = [
+        {
+            "label": _row_get(r, "label") or "unknown",
+            "count": _to_int(_row_get(r, "count"), 0),
+            "capital_usdc": _to_float(_row_get(r, "capital_usdc"), 0.0),
+            "pct_of_total": _pct(_to_float(_row_get(r, "capital_usdc"), 0.0)),
+        }
+        for r in by_strategy_rows
+    ]
+
+    return {
+        "as_of": (as_of or datetime.now(timezone.utc)).isoformat(),
+        "total_capital": total_capital,
+        "total_open_capital": round(total_open_capital, 2),
+        "open_pct_of_total": _pct(total_open_capital),
+        "by_category": by_category,
+        "by_leader": by_leader,
+        "by_strategy": by_strategy,
+    }
+
+
+def _compute_win_streak(pnls: list[float]) -> tuple[int, int]:
+    """Given a list of pnl values ordered MOST RECENT FIRST, return
+    (current_streak, best_streak). A streak is a run of consecutive
+    positive-PnL trades. Negative or zero PnL breaks the streak.
+    """
+    current = 0
+    best = 0
+    run = 0
+    # Reverse to iterate oldest → newest so we can track running and best.
+    for pnl in reversed(pnls):
+        if pnl is None:
+            continue
+        if pnl > 0:
+            run += 1
+            best = max(best, run)
+        else:
+            run = 0
+    # The current streak is the suffix of consecutive positives at the
+    # head of the original list (newest end).
+    for pnl in pnls:
+        if pnl is None:
+            continue
+        if pnl > 0:
+            current += 1
+        else:
+            break
+    return current, best
+
+
+async def portfolio_kpis(conn, redis_client=None) -> dict:
+    """Top-line KPIs for the dashboard tile row.
+
+    Designed for a 5-second poll → < 100ms p50. All counters come from
+    `paper_trades` and `portfolio_state`, both of which are tiny (paper_trades
+    fits entirely in the buffer cache; portfolio_state is a single row).
+
+    PERFORMANCE (prod EXPLAIN ANALYZE 2026-05-17):
+      aggregate query             : 94 ms (FILTER on 27 rows seq scan)
+      portfolio_state fetchrow    : <1 ms (PK lookup)
+      30-day pnl pull for streak  : <1 ms (filter on closed_at + status)
+      latency probe (Redis)       : ~1 ms
+      Total p50                   : ~100 ms (well under budget)
+    """
+    # One aggregate read for almost everything daily / weekly / 30d.
+    agg = await conn.fetchrow(
+        f"""
+        SELECT
+            COUNT(*) FILTER (WHERE status='open')::int AS open_count,
+            COALESCE(SUM(size_usdc) FILTER (WHERE status='open'), 0)::float
+                AS open_capital,
+            COALESCE(SUM(pnl_usdc) FILTER (
+                WHERE status='closed' AND closed_at >= date_trunc('day', NOW())
+            ), 0)::float                                                AS daily_pnl,
+            COUNT(*) FILTER (
+                WHERE status='closed' AND closed_at >= date_trunc('day', NOW())
+                  AND pnl_usdc > 0
+            )::int                                                       AS daily_wins,
+            COUNT(*) FILTER (
+                WHERE status='closed' AND closed_at >= date_trunc('day', NOW())
+                  AND pnl_usdc <= 0
+            )::int                                                       AS daily_losses,
+            COALESCE(SUM(pnl_usdc) FILTER (
+                WHERE status='closed' AND closed_at >= NOW() - INTERVAL '7 days'
+            ), 0)::float                                                AS weekly_pnl,
+            COUNT(*) FILTER (
+                WHERE status='closed' AND closed_at >= NOW() - INTERVAL '30 days'
+            )::int                                                       AS m_total,
+            COUNT(*) FILTER (
+                WHERE status='closed' AND closed_at >= NOW() - INTERVAL '30 days'
+                  AND pnl_usdc > 0
+            )::int                                                       AS m_wins
+        FROM paper_trades
+        WHERE {V1_PAPER_TRADE_SQL}
+        """
+    )
+
+    portfolio = await _fetch_portfolio_snapshot(conn)
+
+    # Win streak — small pull of last 50 closed trades for streak calc.
+    streak_rows = await conn.fetch(
+        f"""
+        SELECT pnl_usdc::float AS pnl
+        FROM paper_trades
+        WHERE status='closed' AND {V1_PAPER_TRADE_SQL}
+        ORDER BY closed_at DESC
+        LIMIT 100
+        """
+    )
+    streak_pnls = [_to_float(_row_get(r, "pnl"), 0.0) for r in streak_rows]
+    win_streak_current, win_streak_best = _compute_win_streak(streak_pnls)
+
+    # Latency p50 — read from Redis if present. Set null if not measured.
+    latency_p50_ms: float | None = None
+    if redis_client is not None:
+        try:
+            raw = await redis_client.get("metrics:decision_latency_p50_ms")
+            if raw is not None:
+                latency_p50_ms = float(raw)
+        except Exception:
+            latency_p50_ms = None
+
+    m_total = _to_int(_row_get(agg, "m_total"), 0) if agg else 0
+    m_wins = _to_int(_row_get(agg, "m_wins"), 0) if agg else 0
+    win_rate_30d = round(m_wins / m_total, 4) if m_total > 0 else 0.0
+
+    return {
+        "capital": portfolio["capital"],
+        "peak_capital": portfolio["peak_capital"],
+        "drawdown_pct": portfolio["drawdown_pct"],
+        "daily_pnl": _to_float(_row_get(agg, "daily_pnl"), 0.0) if agg else 0.0,
+        "daily_win_count": _to_int(_row_get(agg, "daily_wins"), 0) if agg else 0,
+        "daily_loss_count": _to_int(_row_get(agg, "daily_losses"), 0) if agg else 0,
+        "weekly_pnl": _to_float(_row_get(agg, "weekly_pnl"), 0.0) if agg else 0.0,
+        "win_rate_30d": win_rate_30d,
+        "win_streak_current": int(win_streak_current),
+        "win_streak_best": int(win_streak_best),
+        "latency_p50_ms": latency_p50_ms,
+        "open_positions_count": _to_int(_row_get(agg, "open_count"), 0) if agg else 0,
+        "open_capital_usdc": _to_float(_row_get(agg, "open_capital"), 0.0) if agg else 0.0,
+    }
+
+
+async def portfolio_pipeline_status(conn, redis_client=None) -> dict:
+    """Bot pipeline health bar — single payload for the header strip.
+
+    Composes 6 inputs:
+      - Redis ping (redis_ok)
+      - Postgres ping (db_ok, implicit via successful conn read)
+      - WS last-message timestamp (`ws:market:last_message_ts` in Redis)
+      - trades_observed MAX(time) for ingestion freshness
+      - paper_trades MAX(opened_at) for engine activity
+      - killswitch state + settings.PAPER_TRADING for exec_mode
+
+    Graceful degradation: if Redis is unreachable, returns degraded but
+    DOES NOT raise — the caller can still see the DB-derived signals.
+
+    PERFORMANCE (prod EXPLAIN ANALYZE 2026-05-17):
+      MAX(time) trades_observed  : ~5 ms (uses idx on time DESC)
+      MAX(opened_at) paper_trades: ~1 ms
+      Redis ping + GET           : ~2 ms
+      Killswitch get_state       : <1 ms (Redis cache hit, 2s TTL)
+      Total                      : ~10 ms (well under budget)
+    """
+    # DB side — wrap each in try/except so a single failure does not
+    # crash the response; the operator still gets the other signals.
+    db_ok = True
+    last_trade_at: datetime | None = None
+    last_decision_at: datetime | None = None
+    ingestion_lag_s: float | None = None
+    ingestion_count_24h: int | None = None
+    try:
+        # WHERE prunes partitions (trades_observed is partitioned by time).
+        # Without it, postgres scans every partition for MAX().
+        last_obs_row = await conn.fetchrow(
+            "SELECT MAX(time) AS t FROM trades_observed WHERE time >= NOW() - INTERVAL '2 days'"
+        )
+        if last_obs_row and last_obs_row["t"] is not None:
+            last_t = last_obs_row["t"]
+            ingestion_lag_s = (
+                datetime.now(timezone.utc) - last_t
+            ).total_seconds()
+        # 24h count of observed trades — pulls from the per-day partitions.
+        last_decision_at = await conn.fetchval(
+            f"""
+            SELECT MAX(opened_at) FROM paper_trades
+            WHERE {V1_PAPER_TRADE_SQL}
+            """
+        )
+        # paper_trades MAX(closed_at)  → last trade
+        last_trade_at = await conn.fetchval(
+            f"""
+            SELECT MAX(COALESCE(closed_at, opened_at)) FROM paper_trades
+            WHERE {V1_PAPER_TRADE_SQL}
+            """
+        )
+        # NOTE: 2026-05-17 — was a COUNT(*) over 24h which scans every
+        # partition (~9s on prod, blocked pipeline_status endpoint).
+        # Replaced by a Redis-cached counter maintained by the observer.
+        ingestion_count_24h = None
+        if redis_client is not None:
+            try:
+                v = await asyncio.wait_for(
+                    redis_client.get("metrics:trades_observed_24h"),
+                    timeout=0.3,
+                )
+                if v is not None:
+                    ingestion_count_24h = int(v)
+            except Exception:
+                ingestion_count_24h = None
+    except Exception as exc:
+        logger.warning(f"pipeline_status DB read failed: {exc}")
+        db_ok = False
+
+    # Redis side — graceful degradation on failure.
+    redis_ok = False
+    ws_status = "unknown"
+    ws_last_message_age_s: float | None = None
+    if redis_client is not None:
+        try:
+            await redis_client.ping()
+            redis_ok = True
+            ws_ts = await redis_client.get("ws:market:last_message_ts")
+            if ws_ts is not None:
+                ws_last_message_age_s = max(
+                    0.0,
+                    float(datetime.now(timezone.utc).timestamp()) - float(ws_ts),
+                )
+                if ws_last_message_age_s <= 30:
+                    ws_status = "connected"
+                elif ws_last_message_age_s <= 120:
+                    ws_status = "stale"
+                else:
+                    ws_status = "disconnected"
+            else:
+                ws_status = "no_data"
+        except Exception as exc:
+            logger.warning(f"pipeline_status redis read failed: {exc}")
+            redis_ok = False
+            ws_status = "redis_unreachable"
+
+    # Killswitch — already Redis-cached (2s TTL via KillswitchService).
+    killswitch_active = False
+    exec_mode = "paper"
+    paused_reason: str | None = None
+    try:
+        from src.control.killswitch import get_killswitch
+        state = await get_killswitch().get_state()
+        # `execution_enabled` is the master switch. When False the bot is paused.
+        killswitch_active = not bool(state.execution_enabled)
+        paused_reason = state.paused_reason
+        if state.real_execution_enabled and state.execution_enabled:
+            exec_mode = "live"
+        elif state.execution_enabled:
+            exec_mode = "paper" if settings.PAPER_TRADING else "live"
+        else:
+            exec_mode = "paused"
+    except Exception as exc:
+        logger.warning(f"pipeline_status killswitch read failed: {exc}")
+
+    # Overall bot status — green if both DB+Redis ok AND engine activity
+    # in the last hour AND WS connected. Otherwise degraded / down.
+    if not db_ok or not redis_ok:
+        bot_status = "down"
+    elif killswitch_active:
+        bot_status = "paused"
+    elif ws_status in ("disconnected", "redis_unreachable"):
+        bot_status = "degraded"
+    elif ingestion_lag_s is not None and ingestion_lag_s > 300:
+        bot_status = "degraded"
+    else:
+        bot_status = "healthy"
+
+    return {
+        "bot_status": bot_status,
+        "ws_status": ws_status,
+        "ws_last_message_age_s": (
+            round(ws_last_message_age_s, 2) if ws_last_message_age_s is not None
+            else None
+        ),
+        "ingestion_lag_s": round(ingestion_lag_s, 2) if ingestion_lag_s is not None else None,
+        "ingestion_count_24h": ingestion_count_24h,
+        "exec_mode": exec_mode,
+        "killswitch_active": killswitch_active,
+        "paused_reason": paused_reason,
+        "redis_ok": redis_ok,
+        "db_ok": db_ok,
+        "last_trade_at": last_trade_at.isoformat() if last_trade_at else None,
+        "last_decision_at": last_decision_at.isoformat() if last_decision_at else None,
     }

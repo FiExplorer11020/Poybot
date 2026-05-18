@@ -1,0 +1,428 @@
+/* =============================================================================
+   theme.css — Mirrorfish Backtest Engine terminal-style design system
+   Single source of truth for tokens, typography, base components, utilities.
+   No preprocessor. Pure CSS custom properties.
+   =========================================================================== */
+
+@import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600&family=Inter:wght@400;500;600&display=swap');
+
+/* -----------------------------------------------------------------------------
+   1. Design tokens (CSS variables)
+   --------------------------------------------------------------------------- */
+:root {
+  /* Backgrounds — near-black canvas → panel → card */
+  --bg-0: #050608;
+  --bg-1: #0c0e12;
+  --bg-2: #131720;
+
+  /* Borders — subtle → emphasized */
+  --bd-1: #1a1f2b;
+  --bd-2: #2a3142;
+
+  /* Foregrounds — primary → muted → dim */
+  --fg-0: #e8eaf0;
+  --fg-1: #9aa1b3;
+  --fg-2: #5b6376;
+
+  /* Accents — used SPARINGLY for state semantics */
+  --accent-green:  #4ade80;
+  --accent-red:    #f87171;
+  --accent-amber:  #fbbf24;
+  --accent-blue:   #60a5fa;
+  --accent-violet: #a78bfa;
+  --accent-pink:   #ec4899;
+
+  /* Accent backgrounds (12% alpha equivalents for tinted surfaces) */
+  --accent-green-bg:  rgba(74, 222, 128, 0.12);
+  --accent-red-bg:    rgba(248, 113, 113, 0.12);
+  --accent-amber-bg:  rgba(251, 191, 36, 0.12);
+  --accent-blue-bg:   rgba(96, 165, 250, 0.12);
+  --accent-violet-bg: rgba(167, 139, 250, 0.12);
+  --accent-pink-bg:   rgba(236, 72, 153, 0.12);
+  --fg-2-bg:          rgba(91, 99, 118, 0.12);
+
+  /* Spacing scale — 4px base */
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-6: 24px;
+  --space-8: 32px;
+  --space-12: 48px;
+
+  /* Font families */
+  --font-mono: 'JetBrains Mono', 'Menlo', 'Consolas', monospace;
+  --font-body: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+
+  /* Type scale */
+  --fs-9:  9px;
+  --fs-10: 10px;
+  --fs-11: 11px;
+  --fs-12: 12px;
+  --fs-13: 13px;
+  --fs-14: 14px;
+  --fs-16: 16px;
+  --fs-20: 20px;
+  --fs-24: 24px;
+  --fs-32: 32px;
+
+  /* Radii — terminal feel: never bigger than 2px */
+  --radius-0: 0;
+  --radius-1: 1px;
+  --radius-2: 2px;
+
+  /* Misc */
+  --label-spacing: 0.09em;
+  --transition-fast: 120ms ease;
+}
+
+/* -----------------------------------------------------------------------------
+   2. Base typography
+   --------------------------------------------------------------------------- */
+.ui-root, .ui-root * {
+  box-sizing: border-box;
+}
+
+.ui-root {
+  font-family: var(--font-body);
+  font-size: var(--fs-12);
+  color: var(--fg-0);
+  background: var(--bg-0);
+  -webkit-font-smoothing: antialiased;
+  line-height: 1.4;
+}
+
+/* Numeric / tabular text — always monospace, tabular figures */
+.num,
+.kpi,
+.tabular {
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+  font-feature-settings: 'tnum' 1;
+}
+
+/* Labels — uppercase, tracked, dim */
+.label,
+.ui-label {
+  font-family: var(--font-mono);
+  font-size: var(--fs-10);
+  font-weight: 600;
+  color: var(--fg-2);
+  text-transform: uppercase;
+  letter-spacing: var(--label-spacing);
+}
+
+/* -----------------------------------------------------------------------------
+   3. Panel primitive (the workhorse of the layout)
+   --------------------------------------------------------------------------- */
+.panel {
+  background: var(--bg-1);
+  border: 1px solid var(--bd-1);
+  border-radius: var(--radius-2);
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+}
+
+.panel--accent-green  { border-top: 2px solid var(--accent-green); }
+.panel--accent-red    { border-top: 2px solid var(--accent-red); }
+.panel--accent-amber  { border-top: 2px solid var(--accent-amber); }
+.panel--accent-blue   { border-top: 2px solid var(--accent-blue); }
+.panel--accent-violet { border-top: 2px solid var(--accent-violet); }
+.panel--accent-pink   { border-top: 2px solid var(--accent-pink); }
+
+.panel__header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-3);
+  padding: var(--space-2) var(--space-3);
+  border-bottom: 1px solid var(--bd-1);
+  flex-shrink: 0;
+}
+
+.panel__title-group {
+  display: flex;
+  align-items: baseline;
+  gap: var(--space-2);
+  min-width: 0;
+}
+
+.panel__title {
+  font-family: var(--font-mono);
+  font-size: var(--fs-11);
+  font-weight: 600;
+  color: var(--fg-0);
+  text-transform: uppercase;
+  letter-spacing: var(--label-spacing);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.panel__subtitle {
+  font-family: var(--font-mono);
+  font-size: var(--fs-10);
+  color: var(--fg-2);
+  white-space: nowrap;
+}
+
+.panel__body {
+  padding: var(--space-3);
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow: auto;
+}
+
+.panel__body--dense {
+  padding: var(--space-2);
+}
+
+/* -----------------------------------------------------------------------------
+   4. Stat primitive — label + value
+   --------------------------------------------------------------------------- */
+.stat {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  min-width: 0;
+}
+
+.stat--row {
+  flex-direction: row;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: var(--space-2);
+}
+
+.stat__label {
+  font-family: var(--font-mono);
+  font-size: var(--fs-10);
+  font-weight: 600;
+  color: var(--fg-2);
+  text-transform: uppercase;
+  letter-spacing: var(--label-spacing);
+  white-space: nowrap;
+}
+
+.stat__value {
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+  font-size: var(--fs-14);
+  font-weight: 500;
+  color: var(--fg-0);
+  white-space: nowrap;
+  text-align: right;
+}
+
+.stat__value--sm  { font-size: var(--fs-12); }
+.stat__value--md  { font-size: var(--fs-14); }
+.stat__value--lg  { font-size: var(--fs-20); font-weight: 600; }
+.stat__value--xl  { font-size: var(--fs-24); font-weight: 600; }
+
+.stat__value--pos { color: var(--accent-green); }
+.stat__value--neg { color: var(--accent-red); }
+.stat__value--neutral { color: var(--fg-0); }
+
+.stat__suffix {
+  font-size: 0.8em;
+  color: var(--fg-2);
+  margin-left: 2px;
+  font-weight: 400;
+}
+
+/* -----------------------------------------------------------------------------
+   5. Pill primitives (static label + animated status)
+   --------------------------------------------------------------------------- */
+.pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 2px 6px;
+  font-family: var(--font-mono);
+  font-size: var(--fs-10);
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  border: 1px solid transparent;
+  border-radius: var(--radius-2);
+  white-space: nowrap;
+  line-height: 1.4;
+}
+
+.pill-success { color: var(--accent-green);  background: var(--accent-green-bg);  border-color: rgba(74, 222, 128, 0.30); }
+.pill-warning { color: var(--accent-amber);  background: var(--accent-amber-bg);  border-color: rgba(251, 191, 36, 0.30); }
+.pill-danger  { color: var(--accent-red);    background: var(--accent-red-bg);    border-color: rgba(248, 113, 113, 0.30); }
+.pill-info    { color: var(--accent-blue);   background: var(--accent-blue-bg);   border-color: rgba(96, 165, 250, 0.30); }
+.pill-violet  { color: var(--accent-violet); background: var(--accent-violet-bg); border-color: rgba(167, 139, 250, 0.30); }
+.pill-muted   { color: var(--fg-1);          background: var(--fg-2-bg);          border-color: rgba(91, 99, 118, 0.30); }
+
+/* Pulsing dot for live status */
+.pill__dot {
+  display: inline-block;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: currentColor;
+  flex-shrink: 0;
+}
+
+.pill__dot--pulse {
+  animation: ui-pulse 1.6s ease-in-out infinite;
+  box-shadow: 0 0 6px currentColor;
+}
+
+@keyframes ui-pulse {
+  0%, 100% { opacity: 1; transform: scale(1); }
+  50%      { opacity: 0.45; transform: scale(0.85); }
+}
+
+/* -----------------------------------------------------------------------------
+   6. KPI tile (large headline stat)
+   --------------------------------------------------------------------------- */
+.kpi-tile {
+  background: var(--bg-1);
+  border: 1px solid var(--bd-1);
+  border-radius: var(--radius-2);
+  padding: var(--space-3) var(--space-4);
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  min-width: 0;
+  position: relative;
+  overflow: hidden;
+}
+
+.kpi-tile--accent-green  { border-left: 2px solid var(--accent-green); }
+.kpi-tile--accent-red    { border-left: 2px solid var(--accent-red); }
+.kpi-tile--accent-amber  { border-left: 2px solid var(--accent-amber); }
+.kpi-tile--accent-blue   { border-left: 2px solid var(--accent-blue); }
+.kpi-tile--accent-violet { border-left: 2px solid var(--accent-violet); }
+
+.kpi-tile__label {
+  font-family: var(--font-mono);
+  font-size: var(--fs-10);
+  font-weight: 600;
+  color: var(--fg-2);
+  text-transform: uppercase;
+  letter-spacing: var(--label-spacing);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.kpi-tile__value {
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+  font-size: var(--fs-24);
+  font-weight: 600;
+  color: var(--fg-0);
+  letter-spacing: -0.02em;
+  line-height: 1.1;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.kpi-tile__value--pos { color: var(--accent-green); }
+.kpi-tile__value--neg { color: var(--accent-red); }
+
+.kpi-tile__secondary {
+  font-family: var(--font-mono);
+  font-size: var(--fs-10);
+  color: var(--fg-1);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.kpi-tile__trend {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  font-family: var(--font-mono);
+  font-size: var(--fs-10);
+  font-weight: 500;
+}
+
+.kpi-tile__sparkline {
+  margin-top: var(--space-1);
+  height: 24px;
+}
+
+/* -----------------------------------------------------------------------------
+   7. Timeframe selector (segmented control)
+   --------------------------------------------------------------------------- */
+.tf-selector {
+  display: inline-flex;
+  align-items: stretch;
+  background: var(--bg-1);
+  border: 1px solid var(--bd-1);
+  border-radius: var(--radius-2);
+  overflow: hidden;
+}
+
+.tf-selector__btn {
+  appearance: none;
+  border: 0;
+  background: transparent;
+  color: var(--fg-1);
+  font-family: var(--font-mono);
+  font-size: var(--fs-10);
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  padding: 4px 10px;
+  cursor: pointer;
+  border-right: 1px solid var(--bd-1);
+  transition: color var(--transition-fast), background var(--transition-fast);
+  min-width: 32px;
+}
+
+.tf-selector__btn:last-child {
+  border-right: 0;
+}
+
+.tf-selector__btn:hover {
+  color: var(--fg-0);
+  background: var(--bg-2);
+}
+
+.tf-selector__btn--active {
+  background: var(--bg-2);
+  color: var(--accent-blue);
+  box-shadow: inset 0 -2px 0 var(--accent-blue);
+}
+
+.tf-selector__btn--active:hover {
+  color: var(--accent-blue);
+}
+
+/* -----------------------------------------------------------------------------
+   8. Utility classes (used across the app)
+   --------------------------------------------------------------------------- */
+.text-pos { color: var(--accent-green); }
+.text-neg { color: var(--accent-red); }
+.text-warn { color: var(--accent-amber); }
+.text-info { color: var(--accent-blue); }
+.text-muted { color: var(--fg-1); }
+.text-dim { color: var(--fg-2); }
+
+.text-right { text-align: right; }
+.text-left { text-align: left; }
+
+.flex { display: flex; }
+.flex-col { flex-direction: column; }
+.items-center { align-items: center; }
+.justify-between { justify-content: space-between; }
+.gap-1 { gap: var(--space-1); }
+.gap-2 { gap: var(--space-2); }
+.gap-3 { gap: var(--space-3); }
+.gap-4 { gap: var(--space-4); }
+
+/* Scrollbar — narrow terminal-style */
+.ui-root ::-webkit-scrollbar { width: 4px; height: 4px; }
+.ui-root ::-webkit-scrollbar-track { background: var(--bg-0); }
+.ui-root ::-webkit-scrollbar-thumb { background: var(--bd-2); }
+.ui-root ::-webkit-scrollbar-thumb:hover { background: var(--fg-2); }

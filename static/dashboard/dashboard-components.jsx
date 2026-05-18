@@ -232,9 +232,61 @@ const stratType  = s  => s === 'directional' ? 'blue' : s === 'structural' ? 'am
 const phaseLabel = { 0: 'WARM', 1: 'BETA', 2: 'LOGREG', 3: 'LGBM' };
 const phaseType  = { 0: 'default', 1: 'blue', 2: 'amber', 3: 'green' };
 
+// ── categoryRisk + CategoryRiskBadge (PLAN-UIA-001) ────────────────────────
+// Mission-aligned market risk classification. Crypto markets carry the
+// 1.56% peak fee + phantom-trade risk per memory project_paper_trading_truth.md.
+// Centralised here so the UI never duplicates the boundary logic.
+const categoryRisk = (category, feeRatePct) => {
+  if (!category) {
+    if (feeRatePct != null && feeRatePct > 0.005) {
+      return { level: 'med', color: C.amber, badge: `⚠ FEE ${(feeRatePct * 100).toFixed(2)}%` };
+    }
+    return { level: 'low', color: C.dim2, badge: null };
+  }
+  const c = String(category).toLowerCase();
+  if (
+    c.includes('crypto') || c.includes('bitcoin') || c === 'btc' ||
+    c.includes('ether')  || c === 'eth'           || c.includes('solana')
+  ) {
+    return { level: 'high', color: C.red, badge: '⚠ CRYPTO' };
+  }
+  if (feeRatePct != null && feeRatePct > 0.005) {
+    return { level: 'med', color: C.amber, badge: `⚠ FEE ${(feeRatePct * 100).toFixed(2)}%` };
+  }
+  return { level: 'low', color: C.dim2, badge: null };
+};
+
+// Inline badge component for the 4 sites (Recent Trades, Decision Engine,
+// LivePortfolio open, LivePortfolio history). Renders nothing when level=low.
+const CategoryRiskBadge = ({ category, feeRatePct }) => {
+  const r = categoryRisk(category, feeRatePct);
+  if (!r.badge) return null;
+  return (
+    <span
+      title={`${r.level.toUpperCase()} risk — ${r.badge}`}
+      style={{
+        display: 'inline-block',
+        padding: '1px 5px',
+        fontSize: 9,
+        fontWeight: 700,
+        letterSpacing: '0.04em',
+        background: r.color === C.red ? 'rgba(201,53,69,0.15)' : 'rgba(232,160,32,0.15)',
+        color: r.color,
+        border: `1px solid ${r.color}`,
+        borderRadius: 2,
+        whiteSpace: 'nowrap',
+        marginLeft: 6,
+        lineHeight: 1.4,
+      }}>
+      {r.badge}
+    </span>
+  );
+};
+
 Object.assign(window, {
   C, S, useLiveStore, usePersistedState, ConnBanner,
   Badge, MiniBar, ScoreBar, Dot, KpiStrip, TH, TD, SectionLabel, Sparkline, ProgressBar,
   short, fmtAge, fmtPnl, fmtPct, fmtMs, fmtNum,
   pnlColor, sideColor, actionType, stratType, phaseLabel, phaseType,
+  categoryRisk, CategoryRiskBadge,
 });

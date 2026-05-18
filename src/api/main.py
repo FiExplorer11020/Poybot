@@ -66,6 +66,32 @@ TEMPLATE_PATH = Path(__file__).parent.parent.parent / "templates" / "dashboard.h
 # features now exposed via the V1 LAB tab; see static/dashboard/dashboard-tabs.jsx
 # LabGates component + /api/lab/gates endpoint).
 STATIC_DIR = Path(__file__).parent.parent.parent / "static"
+
+# ---------------------------------------------------------------------------
+# Pre-computed snapshot — Redis-backed (Phase: Precomputed Snapshot, 2026-05-17)
+# ---------------------------------------------------------------------------
+# The maintenance container (scripts/maintenance_loop.py +
+# src/api/snapshot_builder.py) composes the live-summary JSON sequentially
+# every ~30s and writes it to Redis. The API endpoint just serves the
+# cached value, eliminating pool DB contention from user requests.
+#
+# These constants are duplicated in src/api/snapshot_builder.py so the
+# maintenance container can import them without depending on this module.
+# When snapshot_builder.py ships, this file should import from there
+# rather than redefining the literals.
+SNAPSHOT_REDIS_KEY = "snapshot:live_summary"
+SNAPSHOT_BUILT_AT_KEY = "snapshot:live_summary:built_at"
+# Skeleton served when Redis has no snapshot yet (cold start / maintenance
+# container down). Matches the shape consumed by static/dashboard/api-client.js
+# closely enough for the dashboard to render shells without exploding.
+_SKELETON = {
+    "clock": {"updated_at": None, "warming_up": True},
+    "meta": {},
+    "bot": {"status": "warming_up"},
+    "stats": {},
+    "positions": {"open": [], "closed": [], "stats": {}},
+    "wallet_graph": {"nodes": [], "edges": [], "stats": {}},
+}
 STATS_PUSH_INTERVAL_S = 1.0  # how often to push live stats over WebSocket
 HEALTH_CACHE_TTL_S = 5.0
 LIVE_SNAPSHOT_TTL_S = 5.0
@@ -519,13 +545,16 @@ async def _fetch_overview_snapshot() -> dict:
 # because the snapshot rebuilder lives in the same process.
 _HELPER_CACHE: dict = {}  # key -> {"data": ..., "fetched_at_mono": float}
 _HELPER_CACHE_TTLS = {
-    "data_quality": 60.0,    # market enrichment gaps drift on hours, not seconds
-    "ml_summary":   30.0,    # profile maturity / phase distribution
-    "ml_diagnostics": 30.0,  # /api/ml/diagnostics aggregate over 730 JSONB rows
-    "activation":   30.0,    # leader activation queue
-    "system":       15.0,    # leader counts + edges
-    "alpha_extras": 15.0,
-    "wallet_graph": 30.0,
+    # 2026-05-18: bumped TTLs for slow helpers. Rebuild can take 20-40s
+    # under parallel pool pressure; if TTL < rebuild time, the cache
+    # expires before it's written — perpetual cold-start loop.
+    "data_quality": 180.0,   # query is 20-30s; TTL ≥ 3x rebuild
+    "ml_summary":   120.0,
+    "ml_diagnostics": 120.0,
+    "activation":   180.0,
+    "system":       120.0,   # 20s query, bump to 120 to stay cached
+    "alpha_extras": 180.0,   # 60s+ query, longest TTL
+    "wallet_graph": 120.0,   # 15s query, comfortable margin
     "rejections":   15.0,
     "equity_curve_v2": 30.0,
     "market_scanner": 30.0,
@@ -544,6 +573,12 @@ _HELPER_CACHE_TTLS = {
     "ops_chain_sync": 10.0,
     "ops_rpc_health": 15.0,
     "ops_mempool_wallet_index": 15.0,
+    # PLAN-UIA-001 (2026-05-18) — mission-alignment additions. Recon
+    # summary changes at most every 5 min (cron pre-warm); pillars are
+    # boolean health checks, no point polling faster than the dashboard
+    # refresh.
+    "recon_summary_30d": 30.0,
+    "pillars_status": 30.0,
     # Dashboard hot-path (229s rebuild fix, V1 audit Phase 3, May 17 session).
     # These helpers used to bypass the cache entirely; every parallel
     # gather() in _get_terminal_snapshot re-queried Postgres. Short TTLs
@@ -787,6 +822,19 @@ async def _get_terminal_snapshot(force: bool = False) -> dict:
     # Readers always return whatever cache exists — fresh or stale.
     if not force and cached is not None:
         return copy.deepcopy(cached)
+    # If cache is None and we're not the rebuilder, do NOT block on lock —
+    # return an empty skeleton so the dashboard renders shells while the
+    # background rebuilder warms the cache.
+    if not force and cached is None:
+        return {
+            "clock": {"updated_at": datetime.now(timezone.utc).isoformat(),
+                      "warming_up": True},
+            "meta": {},
+            "bot": {"status": "starting"},
+            "stats": {},
+            "positions": {"open": [], "closed": [], "stats": {}},
+            "wallet_graph": {"nodes": [], "edges": [], "stats": {}},
+        }
 
     # No cache + not forced: cold start, must build synchronously.
     # `force=True` (background worker): also reach the rebuild path.
@@ -804,24 +852,39 @@ async def _get_terminal_snapshot(force: bool = False) -> dict:
             return copy.deepcopy(cached)
 
         build_started = time.perf_counter()
+        # 2026-05-17: generous per-fetcher timeout (30s). Cold-start needs
+        # the slow queries to actually COMPLETE so the cache fills; user
+        # endpoint returns skeleton (non-blocking) while rebuilder warms.
+        # Heavy fetchers get 45s. Once cache is warm, _cached_helper returns
+        # in <1ms regardless.
+        async def _tof(coro, name, timeout=30.0):
+            try:
+                return await asyncio.wait_for(coro, timeout=timeout)
+            except asyncio.TimeoutError:
+                logger.warning(f"snapshot fetcher '{name}' TIMEOUT >{timeout}s")
+                return TimeoutError(name)
+            except Exception as e:
+                logger.warning(f"snapshot fetcher '{name}' ERROR: {e}")
+                return e
+        # Heavy fetchers get 8s; the rest get 5s.
         results = await asyncio.gather(
-            _fetch_overview_snapshot(),
-            _fetch_ml_snapshot(),
-            _fetch_system_snapshot(),
-            _fetch_positions_live_snapshot(),
-            _fetch_positions_snapshot(),
-            _fetch_decisions_snapshot(),
-            _fetch_decisions_stats_snapshot(),
-            _fetch_risk_snapshot(),
-            _fetch_activation_snapshot(),
-            _fetch_data_quality_snapshot(),
-            _health_checks(),
-            _fetch_market_scanner_rows(),
-            _fetch_recent_observed_trades(),
-            _fetch_alpha_extras(),
-            _fetch_wallet_graph(),
-            _fetch_rejections_breakdown(),
-            _fetch_equity_curve_v2(),
+            _tof(_fetch_overview_snapshot(), "overview"),
+            _tof(_fetch_ml_snapshot(), "ml"),
+            _tof(_fetch_system_snapshot(), "system"),
+            _tof(_fetch_positions_live_snapshot(), "positions_live"),
+            _tof(_fetch_positions_snapshot(), "positions"),
+            _tof(_fetch_decisions_snapshot(), "decisions"),
+            _tof(_fetch_decisions_stats_snapshot(), "decision_stats"),
+            _tof(_fetch_risk_snapshot(), "risk"),
+            _tof(_fetch_activation_snapshot(), "activation", timeout=45.0),
+            _tof(_fetch_data_quality_snapshot(), "data_quality", timeout=45.0),
+            _tof(_health_checks(), "health"),
+            _tof(_fetch_market_scanner_rows(), "market_rows", timeout=45.0),
+            _tof(_fetch_recent_observed_trades(), "observed_trades"),
+            _tof(_fetch_alpha_extras(), "alpha_extras", timeout=45.0),
+            _tof(_fetch_wallet_graph(), "wallet_graph", timeout=45.0),
+            _tof(_fetch_rejections_breakdown(), "rejections"),
+            _tof(_fetch_equity_curve_v2(), "equity_curve"),
             return_exceptions=True,
         )
         (
@@ -957,6 +1020,40 @@ async def _get_terminal_snapshot(force: bool = False) -> dict:
         except Exception as exc:
             logger.warning(f"runtime_config load failed: {exc}")
             runtime_overrides = None
+        # PLAN-UIA-001: surface execution_mode in `runtime` (passed to bot block).
+        if runtime_overrides:
+            mode = runtime_overrides.get("trading_mode") or runtime_overrides.get("TRADING_MODE")
+            if mode:
+                runtime["execution_mode"] = mode
+
+        # PLAN-UIA-001: fetch reconciliation summary + pillars status in
+        # parallel with the existing snapshot work. Both are cached at
+        # the helper layer; the work here is just an async dispatch.
+        async def _build_recon():
+            async with _pool.acquire() as conn:
+                return await _recon_q.reconciliation_summary(conn, window_days=30)
+
+        async def _build_pillars():
+            async with _pool.acquire() as conn:
+                return await _pillars_q.pillars_status(conn, redis_client=_redis)
+
+        try:
+            recon_for_snapshot, pillars_for_snapshot = await asyncio.gather(
+                _cached_helper("recon_summary_30d", _build_recon),
+                _cached_helper("pillars_status", _build_pillars),
+                return_exceptions=True,
+            )
+            if isinstance(recon_for_snapshot, Exception):
+                logger.debug(f"snapshot recon fetch failed: {recon_for_snapshot}")
+                recon_for_snapshot = None
+            if isinstance(pillars_for_snapshot, Exception):
+                logger.debug(f"snapshot pillars fetch failed: {pillars_for_snapshot}")
+                pillars_for_snapshot = None
+        except Exception as exc:
+            logger.debug(f"snapshot recon+pillars gather failed: {exc}")
+            recon_for_snapshot = None
+            pillars_for_snapshot = None
+
         logs = load_recent_log_entries(LOG_PATHS, limit=120)
         snapshot = build_terminal_snapshot(
             overview=overview_data,
@@ -979,6 +1076,8 @@ async def _get_terminal_snapshot(force: bool = False) -> dict:
             runtime=runtime,
             logs=logs,
             runtime_overrides=runtime_overrides,
+            reconciliation=recon_for_snapshot,
+            health_pillars=pillars_for_snapshot,
         )
         build_ms = round((time.perf_counter() - build_started) * 1000, 2)
         snapshot.setdefault("bot", {})["cycle_latency_ms"] = build_ms
@@ -989,14 +1088,36 @@ async def _get_terminal_snapshot(force: bool = False) -> dict:
 
 
 async def _stats_push_loop() -> None:
-    """Push fresh overview stats to all connected WS clients every STATS_PUSH_INTERVAL_S."""
+    """Push fresh snapshot to all connected WS clients every STATS_PUSH_INTERVAL_S.
+
+    Now Redis-backed: reads the same payload the V1 endpoint serves, so
+    WS subscribers and HTTP pollers see byte-identical snapshots. No DB
+    pool contention — just a single GET against Redis.
+
+    If the snapshot key is absent (cold start) or Redis raises, we skip
+    the tick rather than broadcasting noise. The next cycle retries.
+    """
     while True:
         await asyncio.sleep(STATS_PUSH_INTERVAL_S)
         if not _bridge.has_connections:
             continue
         try:
-            data = await _get_terminal_snapshot()
-            await _bridge.broadcast({"type": "tick", "payload": data})
+            raw = await _redis.get(SNAPSHOT_REDIS_KEY)
+            if raw is None:
+                continue
+            if isinstance(raw, bytes):
+                raw = raw.decode("utf-8")
+            try:
+                data = json.loads(raw)
+            except (ValueError, TypeError) as exc:
+                logger.warning(f"Stats push loop: bad snapshot JSON: {exc}")
+                continue
+            # The Redis-stored payload is the inner snapshot dict; we wrap
+            # it in {"data": ...} only at the HTTP layer. For the WS tick,
+            # we keep the legacy shape (broadcast payload is the snapshot
+            # itself, not wrapped in {"data": ...}).
+            payload = data.get("data", data) if isinstance(data, dict) else data
+            await _bridge.broadcast({"type": "tick", "payload": payload})
         except asyncio.CancelledError:
             break
         except Exception as exc:
@@ -1017,65 +1138,31 @@ _snapshot_rebuilder_stats: dict = {
 
 
 async def _snapshot_rebuilder_loop() -> None:
-    """Background loop that keeps `_terminal_snapshot_cache` warm.
+    """No-op stub — snapshot composition now lives in the maintenance container.
 
-    DESIGN RATIONALE
-    ----------------
-    Before this loop existed, `_get_terminal_snapshot()` was invoked
-    lazily on every incoming request whose cache had expired. With a
-    TTL of 1s (5s post-Phase-1) and a rebuild cost of ~15-30s, this
-    meant:
-      * Every V1 client polling /api/v1/live-summary triggered a
-        rebuild if the cache had expired between polls.
-      * Concurrent rebuilds were serialised by `_terminal_snapshot_lock`
-        so the second client waited for the first to finish (15-30s).
-      * Cold start (first request after restart) was always ~30s.
-    By moving rebuild to a single background task running every
-    SNAPSHOT_REBUILDER_INTERVAL_S, we get:
-      * 1 rebuild per period — predictable DB load.
-      * Cold start ≈ 0ms (request reads cache).
-      * No request thread ever waits on rebuild (cache always fresh
-        or, in the worst case, slightly stale within the TTL window).
-      * Backpressure isolated to one task; clients never feel it.
+    NOTE (2026-05-17, precomputed-snapshot refactor):
+    The in-process rebuilder is intentionally disabled. The snapshot is
+    now composed by `scripts/maintenance_loop.py` via
+    `src/api/snapshot_builder.py`, written to Redis under
+    `SNAPSHOT_REDIS_KEY`, and served by `/api/v1/live-summary` with a
+    single Redis GET. This eliminates the 17-way `asyncio.gather()` that
+    used to saturate the DB pool from user requests.
 
-    FAILURE HANDLING
-    ----------------
-    If a rebuild fails (exception inside `_get_terminal_snapshot`), we
-    record it in stats and continue the loop. The cache keeps the
-    last-known-good value so the endpoint serves stale data rather
-    than 500s. After SNAPSHOT_STALENESS_WARN_S of staleness,
-    `/api/snapshot/health` flips to warning and the next request that
-    hits `/api/v1/live-summary` may trigger a synchronous fallback
-    rebuild (still capped by the lock).
+    The function body is preserved so:
+      * External imports (`from src.api.main import _snapshot_rebuilder_loop`)
+        keep working without an ImportError.
+      * The task spawned by `lifespan` (kept for now to avoid a config
+        ripple) loops harmlessly instead of crashing.
+      * A future fallback mode could re-enable the in-process path by
+        flipping a feature flag without restoring the implementation.
+
+    If you ever need the old behaviour, restore from git history
+    (commit prior to 2026-05-17 precomputed-snapshot refactor).
     """
-    logger.info(
-        f"Snapshot rebuilder loop starting "
-        f"(interval={SNAPSHOT_REBUILDER_INTERVAL_S}s, "
-        f"staleness_warn={SNAPSHOT_STALENESS_WARN_S}s)"
-    )
     while True:
         try:
-            t_start = time.perf_counter()
-            await _get_terminal_snapshot(force=True)
-            duration_ms = round((time.perf_counter() - t_start) * 1000, 2)
-            _snapshot_rebuilder_stats["last_completed_at"] = time.monotonic()
-            _snapshot_rebuilder_stats["last_duration_ms"] = duration_ms
-            _snapshot_rebuilder_stats["consecutive_failures"] = 0
-            _snapshot_rebuilder_stats["total_rebuilds"] += 1
-            _snapshot_rebuilder_stats["last_error"] = None
-        except asyncio.CancelledError:
-            logger.info("Snapshot rebuilder loop cancelled")
-            break
-        except Exception as exc:  # pragma: no cover — defensive top-level
-            _snapshot_rebuilder_stats["consecutive_failures"] += 1
-            _snapshot_rebuilder_stats["total_failures"] += 1
-            _snapshot_rebuilder_stats["last_error"] = repr(exc)
-            logger.warning(
-                f"Snapshot rebuilder failed (consecutive={_snapshot_rebuilder_stats['consecutive_failures']}): {exc}"
-            )
-        # Sleep regardless — even on failure, don't tight-loop the DB.
-        try:
-            await asyncio.sleep(SNAPSHOT_REBUILDER_INTERVAL_S)
+            await asyncio.sleep(60)
+            logger.debug("rebuilder loop is no-op (replaced by maintenance)")
         except asyncio.CancelledError:
             break
 
@@ -1621,28 +1708,59 @@ async def api_data_quality():
 
 @app.get("/api/v1/live-summary")
 async def api_live_summary_v1(request: Request, response: Response):
-    """Full snapshot endpoint with conditional-GET (ETag / If-None-Match).
+    """Redis-backed snapshot endpoint.
 
-    The dashboard polls this every 5 s. Hashing the serialized snapshot and
-    returning 304 Not Modified when nothing changed cuts the wire payload
-    (~50–200 KB) and JSON parse time on the client to near-zero on idle ticks.
-    The snapshot itself is already cached in-process for ≤ 1 s
-    (_get_terminal_snapshot), so this is a pure additive optimisation.
+    The snapshot is composed by the maintenance container (see
+    scripts/maintenance_loop.py + src/api/snapshot_builder.py) and
+    stored as JSON in Redis. This endpoint just serves the cached
+    value with <10ms latency, eliminating pool DB contention from
+    user requests.
+
+    Behaviour:
+      * Redis present + populated → 200 with payload + ETag.
+      * Redis present, key missing (cold start, maintenance down for >120s)
+        → 503 with skeleton + warming_up flag so the dashboard renders
+        shells instead of blank.
+      * Redis unavailable (raises) → 503 with skeleton + error flag.
+      * `If-None-Match` matches our ETag → 304 (zero-body response).
+      * Built-at age > 60s → adds `X-Snapshot-Stale-Age` header so the
+        dashboard can display a "data refresh paused" indicator.
     """
-    snap = await _get_terminal_snapshot()
-    payload = json.dumps({"data": snap}, default=str, separators=(",", ":"))
-    etag = '"' + hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16] + '"'
+    try:
+        raw_bytes = await _redis.get(SNAPSHOT_REDIS_KEY)
+        built_at_raw = await _redis.get(SNAPSHOT_BUILT_AT_KEY)
+    except Exception as exc:
+        logger.warning(f"snapshot redis read failed: {exc}")
+        response.status_code = 503
+        return {"data": _SKELETON, "warming_up": True, "error": "redis_unavailable"}
 
-    inm = request.headers.get("if-none-match")
-    if inm and inm == etag:
-        response.status_code = 304
-        response.headers["ETag"] = etag
-        # 304 must have an empty body — FastAPI's Response handles that.
+    if raw_bytes is None:
+        response.status_code = 503
+        return {"data": _SKELETON, "warming_up": True}
+
+    # Compute age + stale warning
+    try:
+        built_at = float(built_at_raw) if built_at_raw else 0.0
+    except Exception:
+        built_at = 0.0
+    age_s = max(0.0, time.time() - built_at) if built_at else None
+
+    # ETag = hash of raw bytes (already serialized by the builder, so
+    # repeated calls yield identical hashes — no JSON re-encoding round-trip).
+    if isinstance(raw_bytes, bytes):
+        raw = raw_bytes.decode("utf-8")
+    else:
+        raw = raw_bytes
+    etag = '"' + hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16] + '"'
+
+    headers = {"ETag": etag, "Cache-Control": "private, no-cache, must-revalidate"}
+    if age_s is not None and age_s > 60.0:
+        headers["X-Snapshot-Stale-Age"] = str(round(age_s, 1))
+
+    if request.headers.get("if-none-match") == etag:
         return Response(status_code=304, headers={"ETag": etag})
 
-    response.headers["ETag"] = etag
-    response.headers["Cache-Control"] = "private, no-cache, must-revalidate"
-    return Response(content=payload, media_type="application/json", headers={"ETag": etag})
+    return Response(content=raw, media_type="application/json", headers=headers)
 
 
 @app.get("/api/snapshot/health")
@@ -1911,6 +2029,76 @@ async def api_inspector_snapshot(limit: int = Query(80, ge=10, le=500)):
 
 
 # ---------------------------------------------------------------------------
+# PLAN-UIA-001 — Paper-trade reconciliation endpoints (mission alignment).
+#
+# /api/inspector/reconciliation        → summary for the recon panel
+# /api/inspector/reconciliation/trades → per-trade drift drill-down
+# /api/inspector/reconciliation/run    → operator-triggered fresh run
+#
+# Backed by paper_close_divergences (migration 051) + paper_trades.
+# See `src/api/reconciliation_queries.py` for the verdict thresholds.
+# ---------------------------------------------------------------------------
+from src.api import reconciliation_queries as _recon_q
+from src.api import pillars_queries as _pillars_q
+
+
+@app.get("/api/inspector/reconciliation")
+async def api_inspector_reconciliation(window_days: int = Query(30, ge=1, le=365)):
+    """Paper-trade reconciliation summary for the Inspector recon panel."""
+    if window_days == 30:
+        async def _build():
+            async with _pool.acquire() as conn:
+                return await _recon_q.reconciliation_summary(conn, window_days=30)
+        return await _cached_helper("recon_summary_30d", _build)
+    async with _pool.acquire() as conn:
+        return await _recon_q.reconciliation_summary(conn, window_days=window_days)
+
+
+@app.get("/api/inspector/reconciliation/trades")
+async def api_inspector_reconciliation_trades(
+    classification: str | None = Query(
+        None,
+        pattern="^(ok|drift|phantom|premature|all)$",
+    ),
+    limit: int = Query(50, ge=1, le=500),
+):
+    """Per-trade drift breakdown for the drill-down modal."""
+    eff_class = None if classification in (None, "all") else classification
+    async with _pool.acquire() as conn:
+        rows = await _recon_q.reconciliation_drift_trades(
+            conn, classification=eff_class, limit=limit
+        )
+    return {"trades": rows, "classification": classification or "all", "limit": limit}
+
+
+class _ReconRunRequest(BaseModel):
+    window_days: int = Field(default=30, ge=1, le=365)
+
+
+@app.post("/api/inspector/reconciliation/run")
+async def api_inspector_reconciliation_run(req: _ReconRunRequest | None = None):
+    """Operator-triggered reconciliation. Non-blocking — sets a Redis
+    key the engine's scheduler polls. The dashboard's "↻ Run now"
+    button calls this; UI then re-fetches the summary 30-90s later."""
+    window = (req or _ReconRunRequest()).window_days
+    async with _pool.acquire() as conn:
+        return await _recon_q.reconciliation_trigger_run(conn, _redis, window_days=window)
+
+
+@app.get("/api/health/pillars")
+async def api_health_pillars():
+    """5-pillar health gauge for the Bot Health tab.
+
+    Aggregate of oracle / reconciliation / backfill / spread_gates /
+    audit_log. Cached 30s — pillars don't change faster than that.
+    """
+    async def _build():
+        async with _pool.acquire() as conn:
+            return await _pillars_q.pillars_status(conn, redis_client=_redis)
+    return await _cached_helper("pillars_status", _build)
+
+
+# ---------------------------------------------------------------------------
 # Runtime control: killswitch + execution mode
 # ---------------------------------------------------------------------------
 
@@ -2103,6 +2291,67 @@ async def api_control_real_execution(payload: _KillswitchFlip):
         actor=payload.actor or "api",
     )
     return state.to_dict()
+
+
+# ---------------------------------------------------------------------------
+# PLAN-UIA-001 — EMERGENCY HALT.
+#
+# Distinct from /api/control/killswitch which ONLY gates new trades.
+# Halt = killswitch off + force-close all open paper positions.
+# Force-close is fanned out via Redis pubsub `control:halt` so the
+# engine container (which owns the PaperTrader instance) actually does
+# the closing — the API process only owns the DB pool.
+# ---------------------------------------------------------------------------
+class _HaltRequest(BaseModel):
+    reason: str | None = Field(default="emergency_halt", max_length=512)
+    actor: str | None = Field(default=None, max_length=64)
+
+
+@app.post("/api/control/halt")
+async def api_control_halt(req: _HaltRequest | None = None):
+    """EMERGENCY HALT — flip killswitch off AND force-close all open paper trades.
+
+    The killswitch flip is synchronous (DB write + Redis cache).
+    The force-close is published on Redis channel `control:halt` and
+    consumed by the running PaperTrader instance (engine container).
+    """
+    req = req or _HaltRequest()
+    reason = req.reason or "emergency_halt"
+    actor = req.actor or "operator"
+
+    # 1. Flip master killswitch off.
+    state = await get_killswitch().set_execution_enabled(
+        False,
+        reason=f"halt:{reason}",
+        actor=actor,
+    )
+
+    # 2. Publish force-close request. Best-effort — never raise out.
+    published = False
+    if _redis is not None:
+        try:
+            await _redis.publish(
+                "control:halt",
+                json.dumps(
+                    {
+                        "reason": reason,
+                        "actor": actor,
+                        "requested_at": datetime.now(timezone.utc).isoformat(),
+                    }
+                ),
+            )
+            published = True
+        except Exception as exc:  # pragma: no cover — best-effort
+            logger.warning(f"halt: redis publish failed: {exc}")
+
+    return {
+        "killswitched": True,
+        "halt_published": published,
+        "reason": reason,
+        "actor": actor,
+        "requested_at": datetime.now(timezone.utc).isoformat(),
+        "killswitch_state": state.to_dict(),
+    }
 
 
 @app.get("/api/lab/gates")
@@ -3910,6 +4159,163 @@ async def api_research_notebook_run(notebook_id: str):
     but no execution actually happens.
     """
     return {"ok": True, "notebook_id": notebook_id, "queued": False}
+
+
+# ---------------------------------------------------------------------------
+# LIVE PORTFOLIO DASHBOARD (May 17, 2026)
+# Five endpoints powering the redesigned terminal-style Live Portfolio page.
+# Spec: docs/autonomous_session_2026_05_17_strategy/03_UI_REDESIGN_PROFESSIONAL.md
+#
+# Performance budget: each endpoint must return JSON in <500ms at current
+# scale. KPI / pipeline_status are designed for a 5s poll (<100ms).
+# ---------------------------------------------------------------------------
+
+
+def _parse_iso_datetime(raw: str | None) -> datetime | None:
+    """Parse an ISO-8601 string into a tz-aware datetime, or None.
+
+    Accepts the trailing 'Z' shorthand. Returns None on parse failure so
+    the caller can fall back to a default range (rather than 422-ing the
+    whole request).
+    """
+    if not raw:
+        return None
+    try:
+        dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt
+
+
+class PortfolioBar(BaseModel):
+    time: str
+    open: float
+    high: float
+    low: float
+    close: float
+    pnl_realized: float
+    trades_closed: int = 0
+    n_samples: int = 0
+
+
+class PortfolioTimeseriesResponse(BaseModel):
+    timeframe: str
+    bucket_seconds: int
+    bars: list[PortfolioBar] = Field(default_factory=list)
+    from_: str = Field(alias="from")
+    to: str
+
+    class Config:
+        populate_by_name = True
+
+
+@app.get("/api/portfolio/timeseries")
+async def api_portfolio_timeseries(
+    timeframe: str = Query(default="1h"),
+    from_: str | None = Query(default=None, alias="from"),
+    to: str | None = Query(default=None),
+):
+    """OHLCV-style equity buckets for the dashboard chart.
+
+    Query params:
+      - timeframe : 1m, 5m, 15m, 1h, 4h, 1d, 1w (whitelist)
+      - from      : ISO-8601 timestamp (inclusive lower bound)
+      - to        : ISO-8601 timestamp (exclusive upper bound)
+
+    Default lookback is timeframe-dependent (e.g. 1m → 6h, 1h → 7d, 1w → 365d).
+    """
+    try:
+        async with _pool.acquire() as conn:
+            return await queries.portfolio_timeseries(
+                conn,
+                timeframe=timeframe,
+                from_ts=_parse_iso_datetime(from_),
+                to_ts=_parse_iso_datetime(to),
+            )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+@app.get("/api/portfolio/trades")
+async def api_portfolio_trades(
+    limit: int = Query(default=50, ge=1, le=500),
+    order: str = Query(default="closed_desc"),
+    status: str = Query(default="all"),
+):
+    """Recent paper_trades joined with markets, optionally with live bid/ask.
+
+    Query params:
+      - limit  : 1..500
+      - order  : closed_desc | closed_asc | opened_desc | opened_asc |
+                 pnl_desc | pnl_asc
+      - status : closed | open | all
+    """
+    allowed_orders = {
+        "closed_desc", "closed_asc",
+        "opened_desc", "opened_asc",
+        "pnl_desc", "pnl_asc",
+    }
+    if order not in allowed_orders:
+        raise HTTPException(
+            status_code=400,
+            detail=f"invalid order '{order}'; must be one of {sorted(allowed_orders)}",
+        )
+    allowed_status = {"closed", "open", "all"}
+    if status not in allowed_status:
+        raise HTTPException(
+            status_code=400,
+            detail=f"invalid status '{status}'; must be one of {sorted(allowed_status)}",
+        )
+    async with _pool.acquire() as conn:
+        return await queries.portfolio_trades(
+            conn,
+            redis_client=_redis,
+            limit=limit,
+            order=order,
+            status=status,
+        )
+
+
+@app.get("/api/portfolio/allocation")
+async def api_portfolio_allocation(
+    as_of: str | None = Query(default=None),
+):
+    """Current capital allocation by category / leader (top 5 + other) / strategy.
+
+    Query params:
+      - as_of : ISO-8601 timestamp or 'now' (default). Reserved for future
+                point-in-time allocation; currently always returns the live
+                view of open paper_trades.
+    """
+    as_of_dt = None if (as_of in (None, "now")) else _parse_iso_datetime(as_of)
+    async with _pool.acquire() as conn:
+        return await queries.portfolio_allocation(conn, as_of=as_of_dt)
+
+
+@app.get("/api/portfolio/kpis")
+async def api_portfolio_kpis():
+    """Top-line dashboard KPIs (capital / drawdown / daily PnL / win-rate / streak).
+
+    Designed for a 5s poll cadence — p50 target <100ms. Single payload so the
+    frontend can update all tiles from one request.
+    """
+    async with _pool.acquire() as conn:
+        return await queries.portfolio_kpis(conn, redis_client=_redis)
+
+
+@app.get("/api/portfolio/pipeline_status")
+async def api_portfolio_pipeline_status():
+    """Bot pipeline health bar for the dashboard header.
+
+    Composes: bot_status, ws_status, ingestion_lag_s, ingestion_count_24h,
+    exec_mode, killswitch_active, redis_ok, db_ok, last_decision_at,
+    last_trade_at. Gracefully degrades on Redis unreachable (returns
+    redis_ok=False rather than 500-ing).
+    """
+    async with _pool.acquire() as conn:
+        return await queries.portfolio_pipeline_status(conn, redis_client=_redis)
 
 
 @app.websocket("/ws/live")

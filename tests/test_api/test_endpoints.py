@@ -311,24 +311,24 @@ class TestDashboardHtml:
 
 
 class TestLiveSummaryV1:
-    def test_returns_unified_terminal_snapshot(self, app_client):
+    """Endpoint is now Redis-backed (precomputed-snapshot refactor, 2026-05-17).
+
+    The default test fixtures supply a mock_redis whose `.get()` returns
+    None, so the endpoint correctly returns 503 + skeleton. Tests for
+    populated-key + ETag + stale behaviour live in
+    `tests/test_api/test_live_summary_redis_backed.py`.
+    """
+
+    def test_returns_503_skeleton_when_snapshot_missing(self, app_client):
         resp = app_client.get("/api/v1/live-summary")
-        assert resp.status_code == 200
+        assert resp.status_code == 503
         payload = resp.json()
-        assert "data" in payload
+        assert payload.get("warming_up") is True
+        # Skeleton must contain at least the dashboard-expected top-level keys
+        # so the V1 client can render shells without crashing.
         data = payload["data"]
-        for key in (
-            "stats",
-            "analytics",
-            "bot",
-            "positions",
-            "decision_engine",
-            "risk_config",
-            "ingestion",
-            "recent_trades",
-            "logs",
-        ):
-            assert key in data, f"Missing terminal key: {key}"
+        for key in ("clock", "bot", "stats", "positions", "wallet_graph"):
+            assert key in data, f"Missing skeleton key: {key}"
 
 
 # ---------------------------------------------------------------------------
