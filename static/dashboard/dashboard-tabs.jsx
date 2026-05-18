@@ -50,6 +50,12 @@ const AlphaTerminal = () => {
   // accurate, and updated optimistically by the WS dispatcher).
   const leader24h    = paperPnL.observed_trades_24h ?? leaderSpark.reduce((a, b) => a + b, 0);
   const paperExec24h = paperPnL.exec_trades_24h ?? 0;
+  // Learning Trajectory "Trades observed" card delta: reduce of the
+  // tradesSpark timeline buckets. NOT the same as leader24h (which is
+  // the firehose top-level counter); the spark slot uses b.trades which
+  // may differ in granularity. Restored here — A11 dropped this line
+  // and the dangling ReferenceError below crashed the whole React tree.
+  const trades24h    = tradesSpark.reduce((a, b) => a + b, 0);
   const positions24h = positionsSpark.reduce((a, b) => a + b, 0);
 
   // PLAN-UIA-001 — Win Rate first (mission KPI 28→70%), Net PnL second
