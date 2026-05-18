@@ -476,6 +476,7 @@ def format_digest_daily(payload: dict) -> str:
     drifts = int(payload.get("drift_events", 0) or 0)
     transitions = int(payload.get("phase_transitions", 0) or 0)
     new_leaders = int(payload.get("new_leaders", 0) or 0)
+    new_followers = int(payload.get("new_followers_confirmed", 0) or 0)
 
     lines = [f"📅 DAILY DIGEST — {date}"]
     lines.append(
@@ -514,6 +515,10 @@ def format_digest_daily(payload: dict) -> str:
         extras.append(f"phase_up={transitions}")
     if new_leaders > 0:
         extras.append(f"new_leaders={new_leaders}")
+    if new_followers > 0:
+        # S3.12: surface the per-day total since we no longer fire an
+        # instant alert per confirmed follower edge.
+        extras.append(f"new_followers={new_followers}")
     if extras:
         lines.append("events: " + "  ".join(extras))
 

@@ -171,12 +171,43 @@ CHANNEL_TIER: dict[str, int] = {
     CHANNEL_RUNTIME_CONFIG_CHANGED: TIER_INFO,
 }
 
+# S3.12 — per-event counters for the daily digest. The notifier
+# transparently bumps a 1h + 24h Redis counter whenever it sees a
+# message on one of these channels, so the digest builder reads them
+# without each producer needing to also INCR.
+COUNTED_CHANNELS: dict[str, str] = {}
+# (populated after VERBOSITY_MAX_TIER below so we can reference the
+# channel constants without forward-declaration noise; see __init__-time
+# population at end of this section.)
+
+# Channels for which we ONLY bump the counter and do NOT send an
+# instant Telegram message. The operator sees the count in the daily
+# digest instead. Useful for high-frequency "model maturity" events
+# (e.g. graph:follower:confirmed during cold-start fanout) that would
+# otherwise flood the chat.
+SILENT_COUNT_CHANNELS: set[str] = set()
+
+
 VERBOSITY_MAX_TIER: dict[str, int] = {
     "quiet": TIER_CRITICAL,
     "normal": TIER_ALERT,
     "verbose": TIER_INFO,
     "debug": 99,  # send everything, ignore tier filtering
 }
+
+
+# Populate the S3.12 counter map now that the channel constants are in
+# scope. The values are the per-counter "name" used in the Redis key
+# prefix `telegram:counter:<name>:<window>`. They MUST match what
+# src/telegram_bot/digest.py reads.
+COUNTED_CHANNELS.update({
+    CHANNEL_RISK_BREAKER: "breaker_hits",
+    CHANNEL_DRIFT_DETECTED: "drift_events",
+    CHANNEL_PHASE_UPGRADED: "phase_transitions",
+    CHANNEL_LEADER_ADDED: "new_leaders",
+    CHANNEL_FOLLOWER_CONFIRMED: "follower_confirmed",
+})
+SILENT_COUNT_CHANNELS.update({CHANNEL_FOLLOWER_CONFIRMED})
 
 
 # Per-source cooldown for ingest-gap alerts (seconds). Override with
@@ -335,6 +366,19 @@ class TelegramNotifier:
 
     async def _handle(self, channel: str, payload: dict) -> None:
         tier = CHANNEL_TIER.get(channel, TIER_INFO)
+
+        # S3.12: bump 1h+24h counters BEFORE any filtering so the daily
+        # digest reflects every event even if the operator lowered the
+        # verbosity or dedup would have suppressed the message.
+        await self._bump_counter(channel)
+
+        # SILENT counters: count and stop. The operator only sees these
+        # in the daily digest, not as instant alerts. Added specifically
+        # to keep graph:follower:confirmed off the chat during cold-start
+        # fanout (dozens of edges crossing thresholds simultaneously).
+        if channel in SILENT_COUNT_CHANNELS:
+            return
+
         if tier > self._max_tier:
             return
 
@@ -461,6 +505,28 @@ class TelegramNotifier:
                 )
                 self._bump_backoff()
         return sent_any
+
+    async def _bump_counter(self, channel: str) -> None:
+        """Best-effort INCR for both the 1h and 24h windows.
+
+        TTL is set with NX so the first INCR creates the window and
+        subsequent INCRs do not extend it — a tumbling window close to
+        the digest's notion of "events in the last N hours". Without NX
+        we'd reset the TTL on every event and a 25h-old event would
+        still show in the 24h counter.
+        """
+        name = COUNTED_CHANNELS.get(channel)
+        if name is None or self._redis is None:
+            return
+        for window, ttl in (("1h", 3600), ("24h", 86400)):
+            key = f"telegram:counter:{name}:{window}"
+            try:
+                await self._redis.incr(key)
+                # nx=True → only set TTL if the key has none. Requires
+                # Redis 7.0+ (prod is 7.2-alpine per CLAUDE.md § 8).
+                await self._redis.expire(key, ttl, nx=True)
+            except Exception as e:
+                logger.debug(f"counter bump {channel} failed: {e}")
 
     def _allow_send(self) -> bool:
         """Sliding-window rate limit. Returns True if we may send now."""

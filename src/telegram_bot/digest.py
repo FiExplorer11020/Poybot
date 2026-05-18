@@ -30,6 +30,10 @@ COUNTER_BREAKER_HITS = "telegram:counter:breaker_hits:{window}"
 COUNTER_DRIFT_EVENTS = "telegram:counter:drift_events:{window}"
 COUNTER_PHASE_TRANSITIONS = "telegram:counter:phase_transitions:{window}"
 COUNTER_NEW_LEADERS = "telegram:counter:new_leaders:{window}"
+# S3.12: silent-counted in the notifier (no instant Telegram message)
+# and surfaced in the daily digest as "new followers" — operator
+# explicitly asked to stop the per-event flood during cold-start.
+COUNTER_FOLLOWER_CONFIRMED = "telegram:counter:follower_confirmed:{window}"
 
 
 async def _read_counter(redis_client, key: str) -> int:
@@ -142,6 +146,9 @@ async def build_daily_digest(*, redis_client, paper_trader=None) -> dict:
         ),
         "new_leaders": await _read_counter(
             redis_client, COUNTER_NEW_LEADERS.format(window="24h")
+        ),
+        "new_followers_confirmed": await _read_counter(
+            redis_client, COUNTER_FOLLOWER_CONFIRMED.format(window="24h")
         ),
     }
 

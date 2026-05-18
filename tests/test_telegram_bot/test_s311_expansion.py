@@ -161,6 +161,73 @@ async def test_set_verbosity_swaps_tier_filter(redis_client):
         n.set_verbosity("unknown")
 
 
+async def test_follower_confirmed_is_silent_but_counted(redis_client):
+    """S3.12: follower_confirmed bumps the 24h counter but sends no Telegram."""
+    send = AsyncMock()
+    n = notifier.TelegramNotifier(
+        redis_client=redis_client,
+        send_fn=send,
+        verbosity="debug",  # would normally let everything through
+        dedup_window_s=0,
+    )
+    await n.start()
+    try:
+        await asyncio.sleep(0.05)
+        payload = json.dumps(
+            {
+                "leader_wallet": "0xleader",
+                "follower_wallet": "0xfoll",
+                "follow_probability": 0.82,
+                "same_direction_rate": 0.85,
+                "co_occurrences": 7,
+            }
+        )
+        await redis_client.publish(notifier.CHANNEL_FOLLOWER_CONFIRMED, payload)
+        await redis_client.publish(notifier.CHANNEL_FOLLOWER_CONFIRMED, payload)
+        await redis_client.publish(notifier.CHANNEL_FOLLOWER_CONFIRMED, payload)
+        await asyncio.sleep(0.3)
+        # Crucially: zero sends.
+        assert send.await_count == 0, "follower_confirmed must not produce an instant alert"
+        # But the counter incremented to 3 in both windows.
+        raw_24h = await redis_client.get("telegram:counter:follower_confirmed:24h")
+        raw_1h = await redis_client.get("telegram:counter:follower_confirmed:1h")
+        if isinstance(raw_24h, bytes):
+            raw_24h = raw_24h.decode()
+        if isinstance(raw_1h, bytes):
+            raw_1h = raw_1h.decode()
+        assert int(raw_24h) == 3
+        assert int(raw_1h) == 3
+    finally:
+        await n.stop()
+
+
+async def test_counted_non_silent_channel_still_sends(redis_client):
+    """Channels in COUNTED_CHANNELS but NOT in SILENT_COUNT both send and count."""
+    send = AsyncMock()
+    n = notifier.TelegramNotifier(
+        redis_client=redis_client,
+        send_fn=send,
+        verbosity="verbose",
+        dedup_window_s=0,
+    )
+    await n.start()
+    try:
+        await asyncio.sleep(0.05)
+        # drift_detected is counted AND sent (verbosity verbose covers ALERT tier).
+        payload = json.dumps(
+            {"wallet": "0xabc", "phase_before": 3, "phase_after": 2, "cusum_value": 3.5}
+        )
+        await redis_client.publish(notifier.CHANNEL_DRIFT_DETECTED, payload)
+        ok = await _wait_for(lambda: send.await_count >= 1, timeout=1.0)
+        assert ok
+        raw = await redis_client.get("telegram:counter:drift_events:24h")
+        if isinstance(raw, bytes):
+            raw = raw.decode()
+        assert int(raw) == 1
+    finally:
+        await n.stop()
+
+
 async def test_critical_bypasses_throttle_and_dedup(redis_client):
     """An over-throttle CRITICAL still sends (engine_crash twice in a row)."""
     send = AsyncMock()
