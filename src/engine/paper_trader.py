@@ -1463,27 +1463,49 @@ class PaperTrader:
         # other consumer) can show the user the full price journey, not
         # just the final PnL number — the May 17 audit confirmed sparse
         # close messages were a key source of operator confusion.
-        event = {
-            "trade_id": trade_id,
-            "market_id": trade.market_id,
-            "pnl_usdc": round(pnl_usdc, 2),  # float, not str
-            "pnl_pct": round(pnl_pct * 100, 2),
-            "direction": trade.direction,
-            "size_usdc": trade.size_usdc,
-            "entry_price": trade.entry_price,
-            "exit_price": exit_price,
-            "close_reason": close_reason,
-            "strategy": trade.strategy,
-            "strategy_track": trade.strategy_track,
-            "economic_model_version": trade.economic_model_version,
-            "gross_pnl_usdc": round(gross_pnl_usdc, 2),
-            "size_shares": size_shares,
-            "leader_wallet": trade.leader_wallet,
-            "loss_reasons": learning_feedback.get("reason_codes", []),
-            "context_penalty": learning_feedback.get("penalty", 0.0),
-        }
+        #
+        # Typed via src/events/schemas.py::PositionClosed. The model keeps
+        # all legacy keys (trade_id, leader_wallet …) so the Telegram
+        # notifier and the dashboard stay compatible, AND adds the
+        # canonical core trio (position_id, wallet_address,
+        # holding_period_seconds) required by the new typed contract.
+        from src.events.schemas import PositionClosed
+
+        holding_seconds = 0
+        if trade.opened_at is not None:
+            try:
+                holding_seconds = int((now - trade.opened_at).total_seconds())
+            except Exception:
+                holding_seconds = 0
         try:
-            await self._redis.publish(REDIS_PAPER_CLOSED_CHANNEL, json.dumps(event))
+            event_model = PositionClosed(
+                time=now,
+                position_id=str(trade_id),
+                wallet_address=trade.leader_wallet or "paper_bot",
+                market_id=trade.market_id,
+                pnl_usdc=round(pnl_usdc, 2),
+                close_method=close_reason,
+                holding_period_seconds=holding_seconds,
+                # Legacy keys kept verbatim — downstream consumers read them.
+                trade_id=trade_id,
+                leader_wallet=trade.leader_wallet,
+                pnl_pct=round(pnl_pct * 100, 2),
+                direction=trade.direction,
+                size_usdc=trade.size_usdc,
+                entry_price=trade.entry_price,
+                exit_price=exit_price,
+                close_reason=close_reason,
+                strategy=trade.strategy,
+                strategy_track=trade.strategy_track,
+                economic_model_version=trade.economic_model_version,
+                gross_pnl_usdc=round(gross_pnl_usdc, 2),
+                size_shares=size_shares,
+                loss_reasons=learning_feedback.get("reason_codes", []),
+                context_penalty=learning_feedback.get("penalty", 0.0),
+            )
+            await self._redis.publish(
+                REDIS_PAPER_CLOSED_CHANNEL, event_model.model_dump_json()
+            )
         except Exception as exc:
             logger.warning(
                 f"PaperTrader: paper_closed event publish failed for #{trade_id}: {exc}"

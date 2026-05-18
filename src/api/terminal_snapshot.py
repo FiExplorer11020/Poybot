@@ -438,6 +438,16 @@ def _build_ingestion(
         "stale_market_count": stale_markets,
         "updates_last_minute": updates_last_minute,
         "avg_freshness_ms": round(avg_freshness, 2) if avg_freshness is not None else None,
+        # PLAN-UIA-001 / Batch 2 (A7 fix): expose the real WS lag in
+        # SECONDS at the top-level ingestion block so the dashboard
+        # topbar reads "ws lag <1s" instead of the avg book-snapshot
+        # freshness across 60 markets (dominated by 1-8 stale markets
+        # with >100s age). Producer: `ws:market:last_message_ts` in
+        # trade_observer; consumer: `_health_snapshot` populates
+        # `health.last_message_age_s`. We surface it here too so the
+        # JSX fallback chain `ws_last_message_age_s ?? avg_freshness_ms`
+        # in dashboard-app.jsx picks the right field automatically.
+        "ws_last_message_age_s": round(ws_age_s, 2),
         "sources": sources,
         "markets": market_rows[:80],
     }
@@ -446,6 +456,8 @@ def _build_ingestion(
 def _build_bot_payload(
     health: dict[str, Any],
     runtime: dict[str, Any],
+    reconciliation: dict[str, Any] | None = None,
+    system: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     # PLAN-UIA-001: surface execution_mode (paper | live | dual) so the
     # dashboard ModeChip can render the 3-state badge instead of the
@@ -460,12 +472,86 @@ def _build_bot_payload(
         if mode_raw not in ("paper", "live", "dual"):
             mode_raw = "paper"
 
+    last_msg_age_s = _to_float(health.get("last_message_age_s"), 0.0) or 0.0
+    websocket_connected = bool(health.get("websocket_connected", False))
+
+    # Batch 2 fix: expose the canonical bot/ws status pair on the bot
+    # block so the dashboard sidebar can stop falling through to
+    # UNKNOWN. Mirrors `portfolio_pipeline_status` thresholds (30s
+    # connected / 120s stale / >120s disconnected) so the two
+    # endpoints converge on the same value.
+    if not websocket_connected:
+        ws_status = "DOWN"
+    elif last_msg_age_s <= 30:
+        ws_status = "LIVE"
+    elif last_msg_age_s <= 120:
+        ws_status = "DEGRADED"
+    else:
+        ws_status = "DOWN"
+
+    status_label = _bot_status(health)  # "running" | "stopped"
+    bot_status = "RUNNING" if status_label == "running" else "STOPPED"
+
+    # Batch 2 fix #1: branch the recon summary onto the bot block so
+    # /api/v1/live-summary's `bot.reconciliation` is no longer None
+    # for the dashboard cards that read it as the verdict source.
+    # We mirror only the small (verdict + delta_abs + last_run_ts)
+    # subset — the full payload still lives at `snapshot.reconciliation`.
+    recon_block: dict[str, Any] = {
+        "verdict": "unknown",
+        "delta_abs": 0.0,
+        "last_run_ts": None,
+        "trades_evaluated": 0,
+    }
+    if isinstance(reconciliation, dict):
+        recon_block["verdict"] = reconciliation.get("verdict") or "unknown"
+        recon_block["delta_abs"] = _to_float(reconciliation.get("pnl_delta_abs"), 0.0) or 0.0
+        recon_block["last_run_ts"] = reconciliation.get("run_at_iso")
+        recon_block["trades_evaluated"] = _to_int(reconciliation.get("trades_evaluated"), 0)
+
+    # A12 — bootstrap maturity. Surfaced directly on `bot` so the
+    # dashboard banner can read snapshot.bot.maturity without crossing
+    # into other blocks. `system` carries the canonical maturity dict
+    # built by `queries.system_status`; if absent (older payloads),
+    # fall back to a zeroed bootstrap state.
+    maturity_block: dict[str, Any] = {
+        "profiles_pct": 0.0,
+        "sample_eff_pct": 0.0,
+        "cat_coverage_pct": 0.0,
+        "decision_health_pct": 0.0,
+        "overall_pct": 0.0,
+        "tier": "bootstrap",
+    }
+    if isinstance(system, dict):
+        raw_maturity = system.get("maturity")
+        if isinstance(raw_maturity, dict):
+            # Copy canonical fields explicitly so a producer can't sneak
+            # unexpected keys onto the bot block.
+            for k in (
+                "profiles_pct",
+                "sample_eff_pct",
+                "cat_coverage_pct",
+                "decision_health_pct",
+                "overall_pct",
+                "tier",
+                "counts",
+                "targets",
+                "error",
+            ):
+                if k in raw_maturity:
+                    maturity_block[k] = raw_maturity[k]
+
     return {
         "status": _bot_status(health),
+        # Canonical uppercase aliases (Batch 2): consumed by the new
+        # sidebar chips. Keep the legacy lowercase `status` key alive
+        # for the existing components until the JSX migration ships.
+        "bot_status": bot_status,
+        "ws_status": ws_status,
         "execution_enabled": False,
         "execution_mode": mode_raw,
         "uptime_seconds": _to_int(runtime.get("uptime_seconds"), 0),
-        "latency_ms": round((_to_float(health.get("last_message_age_s"), 0.0) or 0.0) * 1000, 2),
+        "latency_ms": round(last_msg_age_s * 1000, 2),
         "cycle_latency_ms": _to_float(runtime.get("cycle_latency_ms"), 0.0) or 0.0,
         "started_at": runtime.get("started_at"),
         "accumulated_run_seconds": _to_int(runtime.get("uptime_seconds"), 0),
@@ -473,6 +559,9 @@ def _build_bot_payload(
         "paper_only": mode_raw == "paper",
         "control_available": bool(runtime.get("control_available", False)),
         "config_mutable": bool(runtime.get("config_mutable", False)),
+        "reconciliation": recon_block,
+        # A12 — bootstrap maturity (see _compute_maturity docstring).
+        "maturity": maturity_block,
     }
 
 
@@ -551,6 +640,32 @@ def build_terminal_snapshot(
     equity = _to_float(overview.get("equity"), paper_capital) or paper_capital
     pnl_pct = ((equity - settings.PAPER_CAPITAL_USDC) / settings.PAPER_CAPITAL_USDC) if settings.PAPER_CAPITAL_USDC > 0 else 0.0
 
+    # Batch 2 fix #3: surface two DISTINCT 24h trade counters so the
+    # dashboard can stop conflating them. "exec_trades_24h" is the
+    # operator-visible count of paper trades the engine actually opened
+    # (taken from `overview.trades_24h` when present, otherwise derived
+    # from positions). "observed_trades_24h" is the raw ingestion firehose
+    # — every dedup-passing trade across the watchlist — sourced from
+    # the new `metrics:trades_observed_24h` Redis counter via
+    # `health.observed_trades_24h` (populated by snapshot_builder when
+    # available; the API path falls back to None and the front-end
+    # renders "—").
+    exec_trades_24h = _to_int(
+        overview.get("trades_24h")
+        or overview.get("paper_trades_24h")
+        or overview.get("exec_trades_24h"),
+        0,
+    )
+    observed_trades_24h_val = (
+        health.get("observed_trades_24h")
+        or health.get("trades_observed_24h")
+    )
+    observed_trades_24h = (
+        _to_int(observed_trades_24h_val, 0)
+        if observed_trades_24h_val is not None
+        else None
+    )
+
     return {
         "clock": {
             "updated_at": _safe_iso(datetime.now(timezone.utc)),
@@ -560,7 +675,9 @@ def build_terminal_snapshot(
             "leaders_active": _to_int((system.get("leaders") or {}).get("active"), 0),
             "readiness_blockers": list((readiness.get("global") or {}).get("blockers", [])),
         },
-        "bot": _build_bot_payload(health, runtime),
+        "bot": _build_bot_payload(
+            health, runtime, reconciliation=reconciliation, system=system
+        ),
         "stats": {
             "total_pnl": round(_to_float(overview.get("total_pnl"), 0.0) or 0.0, 2),
             "win_rate": _to_float(overview.get("win_rate"), 0.0) or 0.0,
@@ -570,6 +687,11 @@ def build_terminal_snapshot(
             "pnl_percent": round(pnl_pct, 4),
             "detected_arbs_today": _to_int((decision_stats.get("totals") or {}).get("total"), 0),
             "capital_in_trade": positions_payload["capital_in_trade"],
+            # Batch 2 fix #3 — distinct counters at the top-level too so
+            # the dashboard cards don't have to dive into ingestion/health
+            # to render them.
+            "exec_trades_24h": exec_trades_24h,
+            "observed_trades_24h": observed_trades_24h,
         },
         "analytics": analytics,
         "positions": positions_payload,
@@ -581,6 +703,11 @@ def build_terminal_snapshot(
         "wallet_graph": wallet_graph or {"nodes": [], "edges": [], "stats": {}},
         "rejections": rejections or {"total": 0, "breakdown": []},
         "equity_curve": equity_curve or {"series": [], "by_leader": [], "by_strategy": []},
+        # Batch 2 fix #3 — distinct trade counters also exposed at the
+        # top level (mirrored in `stats`) so the JSX cards can read
+        # either path without breaking on missing-key.
+        "exec_trades_24h": exec_trades_24h,
+        "observed_trades_24h": observed_trades_24h,
         # Expose the full data_quality report so BOT HEALTH can drill-down
         # into the exact gates that flipped the dashboard to DEGRADED
         # (instead of just showing the issue count).

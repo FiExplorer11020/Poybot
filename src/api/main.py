@@ -545,15 +545,20 @@ async def _fetch_overview_snapshot() -> dict:
 # because the snapshot rebuilder lives in the same process.
 _HELPER_CACHE: dict = {}  # key -> {"data": ..., "fetched_at_mono": float}
 _HELPER_CACHE_TTLS = {
-    # 2026-05-18: bumped TTLs for slow helpers. Rebuild can take 20-40s
-    # under parallel pool pressure; if TTL < rebuild time, the cache
-    # expires before it's written — perpetual cold-start loop.
-    "data_quality": 180.0,   # query is 20-30s; TTL ≥ 3x rebuild
-    "ml_summary":   120.0,
+    # 2026-05-18 (A6 perf pass): bumped TTLs for slow helpers. Rebuild
+    # can take 20-40s under parallel pool pressure; if TTL < rebuild
+    # time, the cache "expires before it's written" → perpetual
+    # cold-start loop. Rule of thumb: TTL >= max(rebuild × 5, 600s) for
+    # helpers whose rebuild has been observed > 60s. _cached_helper now
+    # records rebuild durations and emits a structured warning when a
+    # rebuild took more than half of its TTL — surfaces the next round
+    # of TTL tuning candidates without a separate profiling pass.
+    "data_quality": 600.0,   # 20-30s rebuild on prod (15.7s baseline) → 20x margin
+    "ml_summary":   600.0,   # 8s rebuild → keep parity with data_quality
     "ml_diagnostics": 120.0,
     "activation":   180.0,
     "system":       120.0,   # 20s query, bump to 120 to stay cached
-    "alpha_extras": 180.0,   # 60s+ query, longest TTL
+    "alpha_extras": 600.0,   # 60s+ rebuild → 10x margin (was 180)
     "wallet_graph": 120.0,   # 15s query, comfortable margin
     "rejections":   15.0,
     "equity_curve_v2": 30.0,
@@ -610,6 +615,17 @@ async def _safe_query(query_fn, default=None):
         return default
 
 
+# Telemetry: track per-key rebuild durations so we can flag cold-start
+# loops (rebuild took more than half of its TTL → cache expires before
+# it's even written for the next caller). Updated by _cached_helper on
+# every miss; read-only metric, no eviction.
+_HELPER_REBUILD_STATS: dict[str, dict] = {}
+# Cooldown so the cold-start warning doesn't spam: log at most once per
+# key per cooldown window. Keyed by helper name → monotonic timestamp.
+_HELPER_COLDSTART_WARN_AT: dict[str, float] = {}
+_HELPER_COLDSTART_WARN_COOLDOWN_S = 300.0
+
+
 async def _cached_helper(key: str, builder):
     """Wrap an async builder fn with an in-process TTL cache.
 
@@ -622,14 +638,61 @@ async def _cached_helper(key: str, builder):
     rebuilt will both hit the builder. That's fine for our use case
     (the rebuilder loop is single-threaded). For multi-threaded
     callers add an asyncio.Lock per key if needed.
+
+    Telemetry (added 2026-05-18, A6 perf pass): on every cache miss we
+    record the rebuild duration in `_HELPER_REBUILD_STATS[key]` and, if
+    the rebuild took more than half of the configured TTL, emit a
+    structured WARNING ("cache_ttl_too_short ..."). That's the cold-start
+    loop fingerprint: TTL < rebuild_s × 2 means the cache effectively
+    expires before the next caller can hit it, so every poll re-runs
+    the slow query. The warning is throttled per key
+    (_HELPER_COLDSTART_WARN_COOLDOWN_S) to keep the log readable.
     """
     ttl = _HELPER_CACHE_TTLS.get(key, 30.0)
     now = time.monotonic()
     cached = _HELPER_CACHE.get(key)
     if cached and (now - cached["fetched_at_mono"]) < ttl:
         return cached["data"]
+
+    rebuild_start = time.monotonic()
     data = await builder()
-    _HELPER_CACHE[key] = {"data": data, "fetched_at_mono": now}
+    rebuild_end = time.monotonic()
+    rebuild_s = rebuild_end - rebuild_start
+
+    # Update rolling per-key telemetry (max + EWMA).
+    stats = _HELPER_REBUILD_STATS.setdefault(
+        key, {"last_s": 0.0, "max_s": 0.0, "ewma_s": 0.0, "n": 0}
+    )
+    stats["last_s"] = rebuild_s
+    stats["max_s"] = max(stats["max_s"], rebuild_s)
+    # EWMA with λ=0.5 — fast convergence on rebuild-time changes.
+    stats["ewma_s"] = (
+        rebuild_s if stats["n"] == 0 else 0.5 * stats["ewma_s"] + 0.5 * rebuild_s
+    )
+    stats["n"] += 1
+
+    _HELPER_CACHE[key] = {"data": data, "fetched_at_mono": rebuild_end}
+
+    # Cold-start loop guard: warn when the rebuild took more than half
+    # of the TTL. We use `rebuild_s * 2 > ttl` rather than
+    # `rebuild_s > ttl / 2` to make the threshold relationship explicit
+    # in code review.
+    if rebuild_s * 2 > ttl:
+        last_warn = _HELPER_COLDSTART_WARN_AT.get(key, 0.0)
+        if (now - last_warn) > _HELPER_COLDSTART_WARN_COOLDOWN_S:
+            _HELPER_COLDSTART_WARN_AT[key] = now
+            logger.warning(
+                "cache_ttl_too_short namespace={key} rebuild_s={rebuild_s:.2f} "
+                "ttl_s={ttl:.1f} max_s={max_s:.2f} ewma_s={ewma_s:.2f} "
+                "suggested_ttl_s={suggest:.0f}",
+                key=key,
+                rebuild_s=rebuild_s,
+                ttl=ttl,
+                max_s=stats["max_s"],
+                ewma_s=stats["ewma_s"],
+                suggest=max(stats["max_s"] * 5.0, 600.0),
+            )
+
     return data
 
 
@@ -643,7 +706,9 @@ async def _fetch_ml_snapshot() -> dict:
 async def _fetch_system_snapshot() -> dict:
     async def _build():
         async with _pool.acquire() as conn:
-            return await queries.system_status(conn)
+            # Batch 2 fix #2: pass redis_client so system_status can
+            # populate the canonical bot_status/ws_status block.
+            return await queries.system_status(conn, redis_client=_redis)
     return await _cached_helper("system", _build)
 
 
@@ -1225,8 +1290,16 @@ async def api_overview():
         row = await conn.fetchrow(
             """
             SELECT
+                -- Batch 2 fix #4: filter for the canonical action set
+                -- (both legacy lower-case and uppercase) so the counter
+                -- matches what reconciliation reports. Excluding NULL
+                -- actions defends against an old schema row leaking
+                -- through and inflating the count.
                 (SELECT COUNT(*)::int FROM decision_log
-                 WHERE time >= NOW() - INTERVAL '24 hours')                                              AS decisions_24h,
+                 WHERE time >= NOW() - INTERVAL '24 hours'
+                   AND action IS NOT NULL
+                   AND LOWER(action) IN
+                       ('follow','fade','skip','open','close','reduce','volume_anticipation'))            AS decisions_24h,
                 (SELECT COUNT(*)::int FROM paper_trades WHERE status = 'open')                            AS positions_open,
                 (SELECT COUNT(*)::int FROM microstructure_features
                  WHERE bucket_ts >= NOW() - INTERVAL '5 minutes')                                         AS microstructure_recent,
@@ -1515,10 +1588,16 @@ async def api_ml():
             phase_distribution = {"p1": 0, "p2": 0, "p3": 0}
 
         # Decisions in last 24h (V2 KPI: DECISIONS 24H).
+        # Batch 2 fix #4 — filter for the canonical action set so the
+        # KPI matches the reconciliation source of truth instead of
+        # drifting to 0 when the engine emits only legacy values.
         try:
             decisions_24h = await conn.fetchval(
                 "SELECT COUNT(*)::int FROM decision_log "
-                "WHERE time >= NOW() - INTERVAL '24 hours'"
+                "WHERE time >= NOW() - INTERVAL '24 hours' "
+                "  AND action IS NOT NULL "
+                "  AND LOWER(action) IN "
+                "      ('follow','fade','skip','open','close','reduce','volume_anticipation')"
             )
         except Exception:
             decisions_24h = 0
@@ -1665,7 +1744,9 @@ async def _neural_readiness_build() -> dict:
 @app.get("/api/system")
 async def api_system():
     async with _pool.acquire() as conn:
-        data = await queries.system_status(conn)
+        # Batch 2 fix #2: redis_client passed so the canonical bot_status
+        # / ws_status block is computed alongside leaders/graph.
+        data = await queries.system_status(conn, redis_client=_redis)
     data["health"] = await _health_checks()
     return data
 
@@ -2406,17 +2487,46 @@ async def api_lab_gates():
     r10_total = await _safe_count("SELECT COUNT(*) AS n FROM causal_estimates")
     r7_total  = await _safe_count("SELECT COUNT(*) AS n FROM mempool_observations")
 
+    # A12 — last_output timestamp per daemon. Lets the UI render
+    # "warming up — last output 2 days ago" instead of just "—" when
+    # the gate is ON but the daemon is quiet. Best-effort: NULL fields
+    # in the DB simply propagate as None (frontend ?? '—').
+    async def _safe_iso(sql: str) -> str | None:
+        try:
+            async with _pool.acquire() as conn:
+                row = await conn.fetchrow(sql)
+                ts = row[0] if row else None
+                return ts.isoformat() if ts is not None else None
+        except Exception as exc:
+            logger.debug(f"lab_gates ts failed for {sql[:60]}: {exc}")
+            return None
+
+    r8_last  = await _safe_iso("SELECT MAX(classified_at) FROM leader_strategy_history")
+    r9_last  = await _safe_iso("SELECT MAX(fit_at) FROM multivariate_hawkes_fits")
+    r10_last = await _safe_iso("SELECT MAX(estimated_at) FROM causal_estimates")
+    r7_last  = await _safe_iso("SELECT MAX(intent_received_at) FROM mempool_observations")
+
     # A daemon counts as "running" if it has produced ANYTHING in its
     # table. 24h emptiness on a never-empty table = quiet but alive.
     daemons = sum(1 for v in (r8_total, r9_total, r10_total, r7_total) if v is not None and v > 0)
 
+    # A12 — gate state as booleans (raw config values are floats from
+    # runtime_config). Surfaced inside each rN block so the UI doesn't
+    # have to cross-reference gates{} with rN_*.
+    r8_enabled  = bool(cfg.get("strategy_conditional_confidence_enabled", False))
+    r9_enabled  = bool(cfg.get("volume_anticipation_enabled", False))
+    r10_enabled = bool(cfg.get("causal_gating_enabled", False))
+    r7_enabled  = bool(cfg.get("prefill_live_enabled", False))
+
     return {
         "gates": {
-            "strategy_conditional_confidence_enabled": bool(cfg.get("strategy_conditional_confidence_enabled", False)),
-            "volume_anticipation_enabled":             bool(cfg.get("volume_anticipation_enabled", False)),
-            "causal_gating_enabled":                   bool(cfg.get("causal_gating_enabled", False)),
-            "prefill_live_enabled":                    bool(cfg.get("prefill_live_enabled", False)),
+            "strategy_conditional_confidence_enabled": r8_enabled,
+            "volume_anticipation_enabled":             r9_enabled,
+            "causal_gating_enabled":                   r10_enabled,
+            "prefill_live_enabled":                    r7_enabled,
         },
+        # Legacy flat fields (kept for backward-compat with the existing
+        # LabGates KPI strip + daemonHealth helper).
         "r8_classifications_24h": r8,
         "r9_forecasts_24h":       r9,
         "r10_estimates_24h":      r10,
@@ -2426,6 +2536,21 @@ async def api_lab_gates():
         "r10_estimates_total":      r10_total,
         "r7_intents_total":         r7_total,
         "daemons_running":          daemons,
+        # A12 — structured per-daemon block. Frontend reads `daemons.r7`,
+        # etc. so it can render a single helper instead of switching on
+        # tableKey. Each block is self-describing: enabled, 24h count,
+        # lifetime total, last output timestamp. A None field means the
+        # query failed (renders as "—" with no further interpretation).
+        "daemons": {
+            "r7":  {"enabled": r7_enabled,  "count_24h": r7,  "lifetime": r7_total,
+                    "last_output_ts": r7_last,  "metric": "intents"},
+            "r8":  {"enabled": r8_enabled,  "count_24h": r8,  "lifetime": r8_total,
+                    "last_output_ts": r8_last,  "metric": "classifications"},
+            "r9":  {"enabled": r9_enabled,  "count_24h": r9,  "lifetime": r9_total,
+                    "last_output_ts": r9_last,  "metric": "forecasts"},
+            "r10": {"enabled": r10_enabled, "count_24h": r10, "lifetime": r10_total,
+                    "last_output_ts": r10_last, "metric": "estimates"},
+        },
     }
 
 

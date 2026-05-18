@@ -134,6 +134,10 @@ async def _health_snapshot(pool, redis_client) -> dict[str, Any]:
     rejected_signals_1h: dict[str, int] = {}
     paper_rejections_1h: dict[str, int] = {}
     ws_msgs_last_minute = 0
+    # Batch 2 fix #3 — pulled from the new `metrics:trades_observed_24h`
+    # Redis counter maintained by trade_observer._update_trades_observed_metric.
+    # None ↔ "unknown" downstream; the dashboard renders a "—" placeholder.
+    observed_trades_24h: int | None = None
 
     try:
         async with pool.acquire() as conn:
@@ -158,6 +162,14 @@ async def _health_snapshot(pool, redis_client) -> dict[str, Any]:
             ws_msgs_last_minute = int(ws_msgs) if ws_msgs is not None else 0
         except Exception:
             ws_msgs_last_minute = 0
+        try:
+            # Batch 2 fix #3 — populated by trade_observer; treat any
+            # non-integer as "unknown" rather than crashing the build.
+            obs_24h = await redis_client.get("metrics:trades_observed_24h")
+            if obs_24h is not None:
+                observed_trades_24h = int(obs_24h)
+        except Exception:
+            observed_trades_24h = None
         book_age = await redis_client.get("metrics:book_age_p95_s")
         fee_coverage = await redis_client.get("metrics:fee_snapshot_coverage_pct")
         token_coverage = await redis_client.get("metrics:token_map_coverage_pct")
@@ -203,6 +215,10 @@ async def _health_snapshot(pool, redis_client) -> dict[str, Any]:
             "paper_rejections_1h": paper_rejections_1h,
         },
         "last_trade_age_s": last_trade_age_s,
+        # Batch 2 fix #3 — null ↔ "unknown" in the dashboard. Read by
+        # `build_terminal_snapshot` to populate `stats.observed_trades_24h`
+        # and `snapshot.observed_trades_24h`.
+        "observed_trades_24h": observed_trades_24h,
     }
 
 
@@ -259,7 +275,7 @@ async def _build_locked(pool, redis_client) -> dict[str, Any]:
 
     async def system():
         async with pool.acquire() as conn:
-            return await queries.system_status(conn)
+            return await queries.system_status(conn, redis_client=redis_client)
 
     async def positions_live():
         async with pool.acquire() as conn:
@@ -396,6 +412,30 @@ async def _build_locked(pool, redis_client) -> dict[str, Any]:
         logger.debug(f"log loading skipped in builder: {exc}")
         logs = []
 
+    # Batch 2 fix #1 — fetch reconciliation + pillars summaries so the
+    # maintenance-container snapshot exposes the same `bot.reconciliation`
+    # and `snapshot.reconciliation` / `snapshot.health_pillars` fields the
+    # API-path snapshot does. Best-effort: a failure in either falls back
+    # to None and the dashboard renders "unknown".
+    recon_for_snapshot: dict[str, Any] | None = None
+    pillars_for_snapshot: dict[str, Any] | None = None
+    try:
+        from src.api import reconciliation_queries as _recon_q
+        async with pool.acquire() as conn:
+            recon_for_snapshot = await _recon_q.reconciliation_summary(
+                conn, window_days=30
+            )
+    except Exception as exc:
+        logger.debug(f"snapshot recon fetch failed: {exc}")
+    try:
+        from src.api import pillars_queries as _pillars_q
+        async with pool.acquire() as conn:
+            pillars_for_snapshot = await _pillars_q.pillars_status(
+                conn, redis_client=redis_client
+            )
+    except Exception as exc:
+        logger.debug(f"snapshot pillars fetch failed: {exc}")
+
     snapshot = compose_terminal_snapshot(
         overview=section_data["overview"],
         ml=section_data["ml"],
@@ -417,6 +457,8 @@ async def _build_locked(pool, redis_client) -> dict[str, Any]:
         runtime=runtime,
         logs=logs,
         runtime_overrides=runtime_overrides,
+        reconciliation=recon_for_snapshot,
+        health_pillars=pillars_for_snapshot,
     )
     build_ms = round((time.perf_counter() - started) * 1000, 2)
     snapshot.setdefault("bot", {})["cycle_latency_ms"] = build_ms

@@ -376,6 +376,7 @@
     useEffect(() => {
       const inst = cosmoRef.current;
       if (!inst || !filtered.nodes.length) return;
+      let fallback;
       try {
         // The API has shifted across minor versions; try both signatures.
         if (typeof inst.setData === 'function') {
@@ -384,10 +385,33 @@
           inst.setNodes(filtered.nodes);
           inst.setLinks?.(filtered.edges);
         }
+        // Auto-fit after setData. We use a double rAF so the WebGL renderer
+        // has time to (a) lay out its initial frame and (b) compute node
+        // bounds — a single rAF fires before bounds are stable on a 4889-edge
+        // dataset, which is why fitView() previously left the graph clipped
+        // outside the viewport. A 500ms setTimeout fallback covers the heavy-
+        // load case where two rAFs aren't enough.
+        const fit = () => { try { cosmoRef.current?.fitView?.(); } catch (_) {} };
+        requestAnimationFrame(() => requestAnimationFrame(fit));
+        fallback = setTimeout(fit, 500);
       } catch (e) {
         console.warn('[WalletGraph v2] setData failed:', e.message);
       }
+      return () => { if (fallback) clearTimeout(fallback); };
     }, [filtered, cosmoReady]);
+
+    // Re-fit when the container is resized (window resize, side panel
+    // toggle, tab switch reflow). ResizeObserver fires once layout settles.
+    useEffect(() => {
+      if (!cosmoReady || !canvasRef.current) return;
+      const target = canvasRef.current.parentElement || canvasRef.current;
+      if (typeof ResizeObserver === 'undefined') return;
+      const observer = new ResizeObserver(() => {
+        try { cosmoRef.current?.fitView?.(); } catch (_) {}
+      });
+      observer.observe(target);
+      return () => observer.disconnect();
+    }, [cosmoReady]);
 
     // Lazy profile fetch when selection changes.
     useEffect(() => {

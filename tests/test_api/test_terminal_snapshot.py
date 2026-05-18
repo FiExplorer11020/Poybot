@@ -227,3 +227,40 @@ def test_parse_loguru_line_extracts_structured_log_entry():
     assert entry["level"] == "INFO"
     assert entry["category"] == "observer.websocket_client"
     assert entry["message"] == "WebSocket connected"
+
+
+# A12 — maturity propagation tests.
+def test_bot_payload_includes_maturity_when_system_block_provides_it(sample_terminal_inputs):
+    """The maturity dict from system_status() must end up on snapshot.bot.maturity."""
+    from src.api.terminal_snapshot import build_terminal_snapshot
+
+    sample_terminal_inputs["system"]["maturity"] = {
+        "profiles_pct": 0.42,
+        "sample_eff_pct": 0.31,
+        "cat_coverage_pct": 0.5,
+        "decision_health_pct": 1.0,
+        "overall_pct": 0.5575,
+        "tier": "ramping_up",
+        "counts": {"positions_resolved": 2100, "leaders_with_sample": 62, "categories_covered": 3},
+        "targets": {"positions_resolved": 5000, "leaders_with_sample": 200, "categories_covered": 6},
+    }
+    snapshot = build_terminal_snapshot(**sample_terminal_inputs)
+    maturity = snapshot["bot"]["maturity"]
+    assert maturity["tier"] == "ramping_up"
+    assert maturity["overall_pct"] == 0.5575
+    assert maturity["counts"]["positions_resolved"] == 2100
+    assert maturity["targets"]["categories_covered"] == 6
+
+
+def test_bot_payload_maturity_defaults_to_bootstrap_when_absent(sample_terminal_inputs):
+    """No maturity in system → bot.maturity falls back to a zeroed bootstrap state."""
+    from src.api.terminal_snapshot import build_terminal_snapshot
+
+    # Ensure system block has no maturity field (it shouldn't in the
+    # default fixture, but be explicit).
+    sample_terminal_inputs["system"].pop("maturity", None)
+    snapshot = build_terminal_snapshot(**sample_terminal_inputs)
+    maturity = snapshot["bot"]["maturity"]
+    assert maturity["tier"] == "bootstrap"
+    assert maturity["overall_pct"] == 0.0
+    assert maturity["profiles_pct"] == 0.0

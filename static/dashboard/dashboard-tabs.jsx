@@ -2,7 +2,8 @@
 
 const { useState: useStateT, useEffect: useEffectT, useMemo: useMemoT } = React;
 const {
-  C, S, useLiveStore, usePersistedState, ConnBanner,
+  C, S, useLiveStore, useLiveStoreSlice, useConnectionState,
+  usePersistedState, ConnBanner,
   Badge, MiniBar, ScoreBar, Dot, KpiStrip, TH, TD, SectionLabel, Sparkline, ProgressBar,
   short, fmtAge, fmtPnl, fmtPct, fmtMs, fmtNum,
   pnlColor, sideColor, actionType,
@@ -10,9 +11,24 @@ const {
 } = window;
 
 // ─── ALPHA TERMINAL ───────────────────────────────────────────────────────────
+// A9 migration: the 8-card KPI header consumes the `paperPnL` + `systemStatus`
+// slices so a trade landing on the WS only re-renders the KPI strip + the
+// recent-trades stream — not the entire tab body.
+//
+// IMPORTANT (mission spec, project_paper_trading_truth.md): the "Trades 24h"
+// card shows paper bot executions (`exec_trades_24h`), NOT the firehose
+// count. The firehose count goes in "Leader Trades 24h". Mixing the two is
+// what produced the +$39 784 phantom number in the audit.
 const AlphaTerminal = () => {
-  const { snapshot, connectionState } = useLiveStore();
-  const stats   = snapshot?.stats                    || {};
+  const { snapshot } = useLiveStore();
+  const connectionState = useConnectionState();
+  const paperPnL = useLiveStoreSlice('paperPnL') || {};
+  const systemStatus = useLiveStoreSlice('systemStatus') || {};
+
+  if (typeof window !== 'undefined' && window.__LIVESTORE_DEBUG__) {
+    console.log('[re-render] AlphaTerminal', { hasPaperPnL: !!paperPnL, hasSystemStatus: !!systemStatus });
+  }
+
   const ana     = snapshot?.analytics?.summary       || {};
   const de      = snapshot?.decision_engine?.summary || {};
   const trades  = snapshot?.recent_trades            || [];
@@ -21,65 +37,74 @@ const AlphaTerminal = () => {
   const followReady = extras.follow_ready || [];
   const totals  = extras.totals || {};
 
-  // Sparkline data (from 24h timeline buckets)
+  // Sparkline data (from 24h timeline buckets). The buckets carry firehose
+  // counts (observed) — use them for the LEADER sparkline. The paper-bot
+  // exec count is a single number, no spark available.
   const tradesSpark    = timeline.map(b => b.trades || 0);
   const leaderSpark    = timeline.map(b => b.leader_trades || 0);
   const positionsSpark = timeline.map(b => b.positions_resolved || 0);
   const edgesSpark     = timeline.map(b => b.edges_active || 0);
 
-  // 24h cumulative (latest bucket sums)
-  const trades24h    = tradesSpark.reduce((a, b) => a + b, 0);
-  const leader24h    = leaderSpark.reduce((a, b) => a + b, 0);
+  // 24h cumulative — keep the timeline fold for legacy panels below, but
+  // prefer the explicit top-level counters when they're present (more
+  // accurate, and updated optimistically by the WS dispatcher).
+  const leader24h    = paperPnL.observed_trades_24h ?? leaderSpark.reduce((a, b) => a + b, 0);
+  const paperExec24h = paperPnL.exec_trades_24h ?? 0;
   const positions24h = positionsSpark.reduce((a, b) => a + b, 0);
 
   // PLAN-UIA-001 — Win Rate first (mission KPI 28→70%), Net PnL second
   // with reconciliation-aware coloring so the operator never reads a
   // trustable-looking PnL during a drift.
-  const recon = snapshot?.reconciliation || { verdict: 'unknown' };
-  const wrColor = stats.win_rate >= 0.7 ? C.green : stats.win_rate >= 0.5 ? C.amber : stats.win_rate != null ? C.red : C.dim2;
-  const pnlBase = pnlColor(stats.total_pnl);
-  const pnlEffective = recon.verdict === 'critical' ? C.red : pnlBase;
+  const reconVerdict = systemStatus?.reconciliation?.verdict || snapshot?.reconciliation?.verdict || 'unknown';
+  const winRate = paperPnL.win_rate;
+  const totalPnL = paperPnL.total;
+  const wrColor = winRate >= 0.7 ? C.green : winRate >= 0.5 ? C.amber : winRate != null ? C.red : C.dim2;
+  const pnlBase = pnlColor(totalPnL);
+  const pnlEffective = reconVerdict === 'critical' ? C.red : pnlBase;
   const kpis = [
     {
       label: 'Win Rate',
-      value: stats.win_rate != null ? `${(stats.win_rate * 100).toFixed(1)}%` : '—',
+      value: winRate != null ? `${(winRate * 100).toFixed(1)}%` : '—',
       color: wrColor,
       sub: '/ 70% target',
     },
     {
       label: 'Net PnL',
-      value: fmtPnl(stats.total_pnl),
+      value: fmtPnl(totalPnL),
       color: pnlEffective,
-      sub: recon.verdict === 'critical' ? '⚠ recon drift' : recon.verdict === 'warn' ? '~ recon warn' : '',
-      spark: <Sparkline data={timeline.map(_ => stats.total_pnl || 0)} color={pnlEffective} />,
+      sub: reconVerdict === 'critical' ? '⚠ recon drift' : reconVerdict === 'warn' ? '~ recon warn' : '',
+      spark: <Sparkline data={timeline.map(_ => totalPnL || 0)} color={pnlEffective} />,
     },
     {
       label: 'Portfolio',
-      value: stats.portfolio_total != null ? `$${stats.portfolio_total.toFixed(0)}` : '—',
+      value: paperPnL.portfolio_total != null ? `$${paperPnL.portfolio_total.toFixed(0)}` : '—',
       color: C.white,
-      sub: stats.pnl_percent != null ? `${stats.pnl_percent >= 0 ? '+' : ''}${(stats.pnl_percent * 100).toFixed(2)}%` : '',
+      sub: paperPnL.pnl_percent != null ? `${paperPnL.pnl_percent >= 0 ? '+' : ''}${(paperPnL.pnl_percent * 100).toFixed(2)}%` : '',
     },
     {
       label: 'Open Positions',
-      value: stats.open_positions ?? '—',
+      value: paperPnL.open_positions ?? '—',
       color: C.text,
-      sub: stats.capital_in_trade != null ? `$${stats.capital_in_trade.toFixed(0)} in trade` : '',
+      sub: paperPnL.capital_in_trade != null ? `$${paperPnL.capital_in_trade.toFixed(0)} in trade` : '',
     },
     {
+      // PLAN-UIA-001 fix (A9): this card now shows paper-bot executions, NOT
+      // the firehose-observed count. The firehose count is in the next card.
       label: 'Trades 24h',
-      value: trades24h ? trades24h.toLocaleString() : '0',
+      value: paperExec24h ? paperExec24h.toLocaleString() : '0',
       color: C.blue,
-      spark: <Sparkline data={tradesSpark} color={C.blue} />,
+      sub: 'paper bot',
     },
     {
       label: 'Leader Trades 24h',
       value: leader24h ? leader24h.toLocaleString() : '0',
       color: C.amber,
       spark: <Sparkline data={leaderSpark} color={C.amber} />,
+      sub: 'firehose',
     },
     {
       label: 'Active Markets',
-      value: stats.active_markets ?? '—',
+      value: paperPnL.active_markets ?? '—',
       color: C.green,
     },
     {
@@ -324,13 +349,36 @@ const _MarketScanner_DELETED = () => null;
 
 
 // ─── LIVE PORTFOLIO ───────────────────────────────────────────────────────────
+// A11 migration: critical truth surfaces (RECON verdict, paper PnL win rate)
+// now flow from the dedicated slices. The legacy snapshot fallback stays
+// the source for positions/equity_curve/recent_trades — those panels read
+// from the HTTP-sourced shape that hasn't been carved out into a slice yet.
 const LivePortfolio = () => {
-  const { snapshot, connectionState } = useLiveStore();
+  const { snapshot } = useLiveStore();
+  const connectionState = useConnectionState();
+  const paperPnL = useLiveStoreSlice('paperPnL') || {};
+  const reconciliation = useLiveStoreSlice('reconciliation');
+  const systemStatus = useLiveStoreSlice('systemStatus') || {};
+
+  if (typeof window !== 'undefined' && window.__LIVESTORE_DEBUG__) {
+    console.log('[re-render] LivePortfolio', {
+      hasPaperPnL: !!paperPnL, hasRecon: !!reconciliation, hasSystemStatus: !!systemStatus,
+    });
+  }
+
   const [view, setView] = usePersistedState('lp.view', 'open');
   const positions = snapshot?.positions || {};
   const openItems = positions.items     || [];
   const trades    = snapshot?.recent_trades || [];
-  const stats     = snapshot?.stats     || {};
+  // stats: use the live slice for win_rate/total_pnl (mission KPIs), fall
+  // back to the legacy snapshot for derived fields (portfolio_total etc).
+  const statsLegacy = snapshot?.stats || {};
+  const stats = {
+    ...statsLegacy,
+    win_rate: paperPnL.win_rate ?? statsLegacy.win_rate ?? null,
+    total_pnl: paperPnL.total ?? statsLegacy.total_pnl ?? null,
+    portfolio_total: paperPnL.portfolio_total ?? statsLegacy.portfolio_total ?? null,
+  };
   const openPnl   = openItems.reduce((a, p) => a + (p.unrealized_pnl_abs || 0), 0);
   const eq = snapshot?.equity_curve || { series: [], by_leader: [], by_strategy: [] };
   const equitySeries = (eq.series || []).map(s => s.equity);
@@ -339,9 +387,16 @@ const LivePortfolio = () => {
   return (
     <div style={{ display: 'flex', flexDirection: 'column', height: '100%', width: '100%', overflow: 'hidden' }}>
       <ConnBanner state={connectionState} />
-      {/* PLAN-UIA-001: Win Rate first (mission KPI), Reconciliation stamp visible. */}
+      {/* PLAN-UIA-001: Win Rate first (mission KPI), Reconciliation stamp visible.
+          A11: pulls the recon verdict from the dedicated slice so a fresh
+          reconciliation WS event flips the badge instantly without waiting
+          for the next HTTP snapshot. systemStatus.reconciliation is the
+          fallback (sidebar-style mirror) and snapshot is the cold-start. */}
       {(() => {
-        const recon = snapshot?.reconciliation || { verdict: 'unknown' };
+        const recon = reconciliation
+          || systemStatus.reconciliation
+          || snapshot?.reconciliation
+          || { verdict: 'unknown' };
         const verdictGlyph = recon.verdict === 'ok' ? '✓' : recon.verdict === 'critical' ? '✗' : recon.verdict === 'warn' ? '~' : '?';
         const verdictColor = { ok: C.green, warn: C.amber, critical: C.red, unknown: C.dim2 }[recon.verdict] || C.dim2;
         return (
@@ -477,14 +532,53 @@ const LivePortfolio = () => {
 };
 
 // ─── DECISION ENGINE ──────────────────────────────────────────────────────────
+// A11 migration: KPI counters now flow from the `decisions` slice (live
+// counters incremented by the typed-delta dispatcher in api-client.js) so
+// the ACTIONABLE / OPEN / CLOSE / REDUCE / SKIP cards update instantly when
+// a decision lands on the WS. The ranked list still comes from the HTTP
+// snapshot (it's a server-side aggregation we don't reproduce client-side).
+//
+// IMPORTANT (user observation): the cards displayed "0" everywhere because
+// the cycle summary (`de.summary`) only repopulates each engine cycle. The
+// live `decisions.counters` slice fills the gap so the operator sees
+// activity between cycles.
 const DecisionEngine = () => {
-  const { snapshot, connectionState } = useLiveStore();
+  const { snapshot } = useLiveStore();
+  const connectionState = useConnectionState();
+  const decisionsSlice = useLiveStoreSlice('decisions') || { recent: [], counters: {} };
+
+  if (typeof window !== 'undefined' && window.__LIVESTORE_DEBUG__) {
+    console.log('[re-render] DecisionEngine', {
+      counters: decisionsSlice.counters,
+      recentLen: (decisionsSlice.recent || []).length,
+    });
+  }
+
   const [filter, setFilter]     = usePersistedState('de.filter', 'ALL');
   const [groupBy, setGroupBy]   = usePersistedState('de.groupBy', 'leader'); // 'leader' | 'flat'
   const [expanded, setExpanded] = useStateT(new Set());  // ephemeral — reset on remount
   const de      = snapshot?.decision_engine || {};
   const summary = de.summary || {};
   const ranked  = de.ranked  || [];
+
+  // Merge the live counters from the WS typed-delta path with the cycle
+  // summary from the HTTP snapshot. The slice carries plain action keys
+  // (`open`, `close`, `follow`, `fade`, `skip`, ...) while the snapshot
+  // exposes pre-named *_count fields. Prefer the slice when it has a
+  // non-zero number for the matching action, since it tracks live activity
+  // independent of the engine cycle.
+  const liveCounters = decisionsSlice.counters || {};
+  const liveValue = (key) => {
+    const v = liveCounters[key];
+    return typeof v === 'number' && v > 0 ? v : null;
+  };
+  const actionableLive = liveValue('open') ?? null; // 'actionable' is engine-side; reuse open as proxy
+  const openLive = liveValue('open');
+  const closeLive = liveValue('close');
+  const reduceLive = liveValue('reduce');
+  const skipLive = liveValue('skip');
+  const followLive = liveValue('follow');
+  const fadeLive = liveValue('fade');
 
   const filtered = useMemoT(() => {
     if (filter === 'ALL')  return ranked;
@@ -518,11 +612,14 @@ const DecisionEngine = () => {
     <div style={{ display: 'flex', flexDirection: 'column', height: '100%', width: '100%', overflow: 'hidden' }}>
       <ConnBanner state={connectionState} />
       <KpiStrip items={[
-        { label: 'Actionable',       value: summary.actionable_count ?? '—', color: C.green },
-        { label: 'Open Signals',     value: summary.open_count       ?? '—', color: C.blue  },
-        { label: 'Close Signals',    value: summary.close_count      ?? '—', color: C.red   },
-        { label: 'Reduce',           value: summary.reduce_count     ?? '—', color: C.amber },
-        { label: 'Rejected',         value: summary.reject_count     ?? '—', color: C.dim2  },
+        // A11: counters prefer the LIVE slice (incremented per WS decision
+        // event). When the slice has no data yet (cold start), fall back to
+        // the engine-cycle summary so the strip isn't blank on first load.
+        { label: 'Actionable',       value: actionableLive ?? summary.actionable_count ?? '—', color: C.green },
+        { label: 'Open Signals',     value: openLive       ?? summary.open_count       ?? '—', color: C.blue  },
+        { label: 'Close Signals',    value: closeLive      ?? summary.close_count      ?? '—', color: C.red   },
+        { label: 'Reduce',           value: reduceLive     ?? summary.reduce_count     ?? '—', color: C.amber },
+        { label: 'Rejected',         value: skipLive       ?? summary.reject_count     ?? '—', color: C.dim2  },
         { label: 'Unique Leaders',   value: byLeader.length, color: C.purple },
         { label: 'Slots Remaining',  value: summary.slots_remaining  ?? '—', color: C.text  },
         { label: 'Exposure Left',    value: summary.exposure_remaining != null ? `${(summary.exposure_remaining * 100).toFixed(1)}%` : '—', color: C.text },
@@ -706,11 +803,31 @@ const DecisionsFlat = ({ filtered, expanded, toggle, snapshot }) => (
 );
 
 // ─── RISK & CONFIG ────────────────────────────────────────────────────────────
+// A11 migration: the killswitch UI (ENABLE/DISABLE TRADING) reads
+// `systemStatus.killswitch` so flipping the switch via WS (or another
+// operator) lights up instantly. The config form itself stays HTTP-bound
+// (POST /api/risk/update returns the new state; no slice needed). Net PnL
+// stat comes from paperPnL slice so the bottom KPI strip stays live.
 const RiskConfig = () => {
-  const { snapshot, connectionState } = useLiveStore();
+  const { snapshot } = useLiveStore();
+  const connectionState = useConnectionState();
+  const systemStatus = useLiveStoreSlice('systemStatus') || {};
+  const paperPnL = useLiveStoreSlice('paperPnL') || {};
+
+  if (typeof window !== 'undefined' && window.__LIVESTORE_DEBUG__) {
+    console.log('[re-render] RiskConfig', {
+      killswitch: systemStatus.killswitch,
+      bot_status: systemStatus.bot_status,
+    });
+  }
+
   const bot   = snapshot?.bot         || {};
   const rcfg  = snapshot?.risk_config || {};
-  const stats = snapshot?.stats       || {};
+  const statsLegacy = snapshot?.stats || {};
+  const stats = {
+    ...statsLegacy,
+    total_pnl: paperPnL.total ?? statsLegacy.total_pnl ?? null,
+  };
 
   const [edits, setEdits]           = useStateT({});
   const [saving, setSaving]         = useStateT(false);
@@ -772,17 +889,26 @@ const RiskConfig = () => {
     setCmdBusy(false);
   };
 
-  const isRunning = bot.status === 'running';
+  // A11: prefer the live systemStatus slice so the killswitch toggle flips
+  // the button label without waiting for the next HTTP snapshot. Legacy
+  // bot.status / bot.execution_enabled stay as fallback.
+  const ssBotUpper = systemStatus.bot_status || '—';
+  const liveBotStatus = ssBotUpper.toString().toLowerCase();
+  const isRunning = liveBotStatus
+    ? liveBotStatus === 'running'
+    : bot.status === 'running';
+  const execEnabledLive = systemStatus.execution_enabled ?? bot.execution_enabled ?? false;
+  const uptimeLive = systemStatus.uptime_seconds ?? bot.uptime_seconds;
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', height: '100%', width: '100%', overflow: 'hidden' }}>
       <ConnBanner state={connectionState} />
       <KpiStrip items={[
-        { label: 'Bot Status',    value: (bot.status || '—').toUpperCase(), color: isRunning ? C.green : C.red },
-        { label: 'Uptime',        value: fmtAge(bot.uptime_seconds),        color: C.text },
+        { label: 'Bot Status',    value: (ssBotUpper !== '—' ? ssBotUpper : (bot.status || '—').toUpperCase()), color: isRunning ? C.green : C.red },
+        { label: 'Uptime',        value: fmtAge(uptimeLive),                color: C.text },
         { label: 'Latency',       value: fmtMs(bot.latency_ms),             color: C.blue },
         { label: 'Cycle Latency', value: fmtMs(bot.cycle_latency_ms),       color: C.blue },
-        { label: 'Execution',     value: bot.execution_enabled ? 'ENABLED' : 'DRY RUN', color: bot.execution_enabled ? C.green : C.amber },
+        { label: 'Execution',     value: execEnabledLive ? 'ENABLED' : 'DRY RUN', color: execEnabledLive ? C.green : C.amber },
         { label: 'Net PnL',       value: fmtPnl(stats.total_pnl),          color: pnlColor(stats.total_pnl) },
       ]} />
 
@@ -942,8 +1068,13 @@ const RiskConfig = () => {
 };
 
 // ─── PLAN-UIA-001 — 5-pillars gauge for BotHealth ────────────────────────────
+// A9: HTTP fetch is preserved as the authoritative source (the endpoint
+// computes pillar status server-side), but we also accept a `pillars`
+// snapshot embedded in systemStatus.pillars as a cold-start hint so the
+// gauge isn't blank for the first 0–30s after page load.
 const PillarsGauge = () => {
-  const [data, setData] = useStateT(null);
+  const systemStatus = useLiveStoreSlice('systemStatus') || {};
+  const [data, setData] = useStateT(() => systemStatus.pillars || null);
   useEffectT(() => {
     let cancelled = false;
     const load = async () => {
@@ -1003,9 +1134,22 @@ const PillarsGauge = () => {
 };
 
 // ─── BOT HEALTH ───────────────────────────────────────────────────────────────
+// A9 migration: the headline KPIs + 5-pillars gauge subscribe to the
+// `systemStatus` slice so a typed system-status WS event repaints them
+// instantly without the full HTTP poll round-trip. Everything else (logs,
+// per-source ingestion stats, data-quality issues) still flows through the
+// legacy snapshot — those are detailed views that don't need sub-second
+// freshness and don't have typed WS deltas.
 const BotHealth = () => {
-  const { snapshot, connectionState } = useLiveStore();
+  const { snapshot } = useLiveStore();
+  const connectionState = useConnectionState();
+  const systemStatus = useLiveStoreSlice('systemStatus') || {};
   const [logFilter, setLogFilter] = usePersistedState('bh.logFilter', 'ALL');
+
+  if (typeof window !== 'undefined' && window.__LIVESTORE_DEBUG__) {
+    console.log('[re-render] BotHealth', { hasSystemStatus: !!systemStatus });
+  }
+
   const ingestion = snapshot?.ingestion || {};
   const bot       = snapshot?.bot       || {};
   const logs      = snapshot?.logs      || [];
@@ -1083,12 +1227,16 @@ const BotHealth = () => {
     <div style={{ display: 'flex', flexDirection: 'column', height: '100%', width: '100%', overflow: 'hidden' }}>
       <ConnBanner state={connectionState} />
       <KpiStrip items={[
-        { label: 'Total Markets',  value: ingestion.total_markets       ?? '—', color: C.text },
-        { label: 'Live Markets',   value: ingestion.live_markets        ?? '—', color: C.green },
+        // Total / Live markets and bot uptime come from the systemStatus
+        // slice when available — typed system_status deltas update them
+        // instantly. The slice falls back transparently to the HTTP
+        // snapshot when the WS hasn't sent anything yet.
+        { label: 'Total Markets',  value: (systemStatus.total_markets ?? ingestion.total_markets) ?? '—', color: C.text },
+        { label: 'Live Markets',   value: (systemStatus.live_markets ?? ingestion.live_markets)   ?? '—', color: C.green },
         { label: 'Stale Markets',  value: ingestion.stale_market_count  ?? '—', color: (ingestion.stale_market_count || 0) > 0 ? C.amber : C.dim2 },
         { label: 'Updates / min',  value: ingestion.updates_last_minute ?? '—', color: C.blue },
         { label: 'Avg Freshness',  value: fmtMs(ingestion.avg_freshness_ms),    color: C.text },
-        { label: 'Bot Uptime',     value: fmtAge(bot.uptime_seconds),           color: C.text },
+        { label: 'Bot Uptime',     value: fmtAge(systemStatus.uptime_seconds ?? bot.uptime_seconds), color: C.text },
         { label: 'Cycle Latency',  value: fmtMs(bot.cycle_latency_ms),          color: C.blue },
       ]} />
 
@@ -1245,8 +1393,26 @@ const BotHealth = () => {
 };
 
 // ─── ML PROGRESSION ───────────────────────────────────────────────────────────
+// A11 migration: most of this tab reads server-aggregated analytics that
+// don't have dedicated slices (alpha_extras totals/timeline/adaptive
+// thresholds, ML diagnostics fetched via /api/ml/diagnostics). Those stay
+// on the legacy snapshot path. The mission KPIs that ARE in slices
+// (paperPnL.win_rate, systemStatus, decisions.counters) get pulled in so
+// the strip stays in sync with the typed-delta stream.
 const MLProgression = () => {
-  const { snapshot, connectionState } = useLiveStore();
+  const { snapshot } = useLiveStore();
+  const connectionState = useConnectionState();
+  const paperPnL = useLiveStoreSlice('paperPnL') || {};
+  const systemStatus = useLiveStoreSlice('systemStatus') || {};
+  const decisionsSlice = useLiveStoreSlice('decisions') || { counters: {} };
+
+  if (typeof window !== 'undefined' && window.__LIVESTORE_DEBUG__) {
+    console.log('[re-render] MLProgression', {
+      winRate: paperPnL.win_rate,
+      decisionCounters: decisionsSlice.counters,
+    });
+  }
+
   const extras   = snapshot?.alpha_extras || {};
   const totals   = extras.totals || {};
   const followReady = extras.follow_ready || [];
@@ -1691,8 +1857,27 @@ const SparkRow = ({ label, color, data, total }) => (
 );
 
 // ─── WALLET GRAPH (now hosts the Wallet Scanner table view too) ─────────────
+// A11 migration: the graph data (nodes/edges) is a server-side aggregation
+// kept in the HTTP snapshot — no slice covers it. We subscribe to the
+// connection state separately so the WS-disconnect banner reacts without
+// pulling in the full snapshot subscription overhead. systemStatus is
+// pulled in so the read-only status indicator matches sidebar/topbar.
+//
+// The wallet drill-down fetches (/api/wallet/<id>/markets + /profile) are
+// kept HTTP — the new tab keep-alive in dashboard-app.jsx means those
+// fetches survive a tab switch without restarting on return.
 const WalletGraph = () => {
-  const { snapshot, connectionState } = useLiveStore();
+  const { snapshot } = useLiveStore();
+  const connectionState = useConnectionState();
+  const systemStatus = useLiveStoreSlice('systemStatus') || {};
+
+  if (typeof window !== 'undefined' && window.__LIVESTORE_DEBUG__) {
+    console.log('[re-render] WalletGraph', {
+      ws_status: systemStatus.ws_status,
+      node_count: (snapshot?.wallet_graph?.nodes || []).length,
+    });
+  }
+
   const wg     = snapshot?.wallet_graph || { nodes: [], edges: [], stats: {} };
   const stats  = wg.stats || {};
   const [selected, setSelected] = useStateT(null);
@@ -2689,8 +2874,26 @@ const ReconciliationDriftModal = ({ onClose }) => {
 // Pipeline observability tab — surfaces what the server is actually
 // receiving and what it's deciding, so operators can debug attribution
 // + latency + decision-pipeline issues without SSH.
+// A11 migration: the raw-trades + decisions stream now reads from the WS
+// slices (`trades.recent`, `decisions.recent`) as the live source. The HTTP
+// `/api/inspector/snapshot` fetch is kept for the panel-only data (sourceMix,
+// counters, pipeline) which is server-computed.
+//
+// Result: a single typed-delta trade re-renders only the trades column of
+// this tab; the source-mix sidebar refreshes on its own timer (3s) without
+// blocking the stream.
 const Inspector = () => {
-  const { connectionState } = useLiveStore();
+  const connectionState = useConnectionState();
+  const tradesSlice = useLiveStoreSlice('trades') || { recent: [] };
+  const decisionsSlice = useLiveStoreSlice('decisions') || { recent: [] };
+
+  if (typeof window !== 'undefined' && window.__LIVESTORE_DEBUG__) {
+    console.log('[re-render] Inspector', {
+      tradesCount: (tradesSlice.recent || []).length,
+      decisionsCount: (decisionsSlice.recent || []).length,
+    });
+  }
+
   const [snap, setSnap] = useStateT(null);
   const [filter, setFilter] = usePersistedState('insp.filter', 'all');     // all | leader | non-leader
   const [sourceFilter, setSourceFilter] = usePersistedState('insp.source', 'all');
@@ -2714,8 +2917,20 @@ const Inspector = () => {
     return () => clearInterval(id);
   }, [autoRefresh]);
 
-  const trades    = snap?.raw_trades   || [];
-  const decisions = snap?.decisions    || [];
+  // Live stream — WS slice trumps the HTTP snapshot. The HTTP path delivers
+  // the older buffer (up to 120) for cold-start; once the WS has populated
+  // the slice (200 buffer), use that as the source of truth.
+  const liveTrades = tradesSlice.recent || [];
+  const httpTrades = snap?.raw_trades || [];
+  // Use whichever buffer is bigger AND prefer live when both populated. The
+  // WS slice carries the normalized shape (see normalizeTradeDelta in
+  // api-client.js) — its fields match the legacy raw_trades shape closely.
+  const trades = liveTrades.length > 0 ? liveTrades : httpTrades;
+
+  const liveDecisions = decisionsSlice.recent || [];
+  const httpDecisions = snap?.decisions || [];
+  const decisions = liveDecisions.length > 0 ? liveDecisions : httpDecisions;
+
   const sourceMix = snap?.source_mix   || [];
   const counters  = snap?.counters     || {};
   const pipeline  = snap?.pipeline     || {};
@@ -2789,9 +3004,15 @@ const Inspector = () => {
                 </tr>
               </thead>
               <tbody>
-                {filteredTrades.map((t) => (
+                {filteredTrades.map((t) => {
+                  // A11: support both shapes. WS slice (normalizeTradeDelta) maps
+                  // time→timestamp + market_question→market_title; HTTP inspector
+                  // snapshot keeps the legacy field names. Read both.
+                  const tsRaw = t.time || t.timestamp || null;
+                  const mkt = t.market_question || t.market_title || (t.market_id ? t.market_id.slice(0, 30) : '');
+                  return (
                   <tr key={t.id}>
-                    <TD style={{ color: C.dim2 }}>{t.time ? new Date(t.time).toLocaleTimeString('en-GB') : '—'}</TD>
+                    <TD style={{ color: C.dim2 }}>{tsRaw ? new Date(tsRaw).toLocaleTimeString('en-GB') : '—'}</TD>
                     <TD style={{ color: t.is_leader ? C.amber : C.dim2 }}>
                       <span
                         onClick={t.wallet_address ? (e) => { e.stopPropagation(); window.PoybotNav?.selectWallet(t.wallet_address); } : undefined}
@@ -2801,12 +3022,13 @@ const Inspector = () => {
                     </TD>
                     <TD>{t.is_leader ? <Badge type="amber" size="xs">L</Badge> : <span style={{ color: C.dim }}>·</span>}</TD>
                     <TD style={{ color: sideColor(t.side), fontWeight: 700 }}>{t.side}</TD>
-                    <TD style={{ color: C.text }}>{t.price?.toFixed(3)}</TD>
-                    <TD style={{ color: C.text }}>{t.size_usdc?.toFixed(0)}</TD>
+                    <TD style={{ color: C.text }}>{t.price != null ? Number(t.price).toFixed(3) : '—'}</TD>
+                    <TD style={{ color: C.text }}>{t.size_usdc != null ? Number(t.size_usdc).toFixed(0) : '—'}</TD>
                     <TD><Badge type={t.source === 'websocket' ? 'blue' : t.source === 'api_market' ? 'green' : 'default'} size="xs">{t.source || '—'}</Badge></TD>
-                    <TD style={{ maxWidth: 250 }}><div style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', color: C.text }}>{t.market_question || t.market_id?.slice(0, 30)}</div></TD>
+                    <TD style={{ maxWidth: 250 }}><div style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', color: C.text }}>{mkt}</div></TD>
                   </tr>
-                ))}
+                  );
+                })}
               </tbody>
             </table>
           )}
@@ -2856,21 +3078,26 @@ const Inspector = () => {
               <div style={{ color: C.dim2, fontSize: 11 }}>No decisions yet.</div>
             ) : (
               <div style={{ display: 'grid', gap: 4, fontSize: 10 }}>
-                {decisions.slice(0, 20).map((d, i) => (
-                  <div key={i} style={{ background: C.panel, padding: '4px 6px', borderLeft: `2px solid ${d.action === 'follow' ? C.green : d.action === 'fade' ? C.amber : C.dim}` }}>
+                {decisions.slice(0, 20).map((d, i) => {
+                  // A11: WS slice keys may be {time|timestamp}; both supported.
+                  const ts = d.time || d.timestamp || null;
+                  const conf = typeof d.confidence === 'number' ? d.confidence : null;
+                  return (
+                  <div key={d.id || i} style={{ background: C.panel, padding: '4px 6px', borderLeft: `2px solid ${d.action === 'follow' ? C.green : d.action === 'fade' ? C.amber : C.dim}` }}>
                     <div style={{ display: 'flex', gap: 6, alignItems: 'center', marginBottom: 2 }}>
-                      <span style={{ color: C.dim2 }}>{d.time ? new Date(d.time).toLocaleTimeString('en-GB') : '—'}</span>
+                      <span style={{ color: C.dim2 }}>{ts ? new Date(ts).toLocaleTimeString('en-GB') : '—'}</span>
                       <Badge type={d.action === 'follow' ? 'green' : d.action === 'fade' ? 'amber' : 'default'} size="xs">{d.action}</Badge>
                       <span
                         onClick={d.leader_wallet ? () => window.PoybotNav?.selectWallet(d.leader_wallet) : undefined}
                         title={d.leader_wallet ? `Open ${short(d.leader_wallet)} in Wallet Graph` : undefined}
                         style={{ color: C.purple, fontFamily: 'monospace', cursor: d.leader_wallet ? 'pointer' : 'default', textDecoration: d.leader_wallet ? 'underline dotted rgba(120,85,192,0.3)' : 'none', textUnderlineOffset: 3 }}
                       >{short(d.leader_wallet)}</span>
-                      {d.confidence != null && <span style={{ color: C.amber, marginLeft: 'auto' }}>c={d.confidence.toFixed(2)}</span>}
+                      {conf != null && <span style={{ color: C.amber, marginLeft: 'auto' }}>c={conf.toFixed(2)}</span>}
                     </div>
                     {d.reason && <div style={{ color: C.dim2, fontSize: 9, lineHeight: 1.4 }}>{d.reason}</div>}
                   </div>
-                ))}
+                  );
+                })}
               </div>
             )}
           </div>
@@ -2986,17 +3213,77 @@ const LabGates = () => {
     },
   ];
 
-  // Daemon health helper: turn (24h count, lifetime count) into a label
-  // + color so the operator can tell "never ran" vs "quiet today" vs
-  // "actively producing".
+  // A12 — Daemon health helper. Prefers the new structured `daemons.rN`
+  // block from /api/lab/gates; falls back to the legacy flat fields so a
+  // stale backend doesn't blank the cards. Returns label + color + detail
+  // tooltip so the operator can tell "never ran" vs "warming up" vs
+  // "quiet" vs "actively producing".
   const daemonHealth = (gate) => {
     const tbl = gate.tableKey;
-    const last24h  = gateStats?.[`${tbl}_${{r7:'intents',r8:'classifications',r9:'forecasts',r10:'estimates'}[tbl]}_24h`];
-    const lifetime = gateStats?.[`${tbl}_${{r7:'intents',r8:'classifications',r9:'forecasts',r10:'estimates'}[tbl]}_total`];
-    if (lifetime == null) return { label: 'unknown', color: C.dim2, detail: 'daemon-state query failed' };
-    if (lifetime === 0)   return { label: 'NO DATA EVER', color: C.red, detail: 'daemon has never produced output — flipping the gate is a no-op until this changes' };
-    if (last24h === 0)    return { label: 'quiet 24h', color: C.amber, detail: `${lifetime.toLocaleString()} lifetime rows but 0 in last 24h` };
-    return { label: `${(last24h ?? '?').toLocaleString()}/24h`, color: C.green, detail: `${lifetime.toLocaleString()} lifetime rows` };
+    const block = gateStats?.daemons?.[tbl];
+    // Prefer structured block; fall back to legacy fields.
+    const last24h  = block ? block.count_24h
+      : gateStats?.[`${tbl}_${{r7:'intents',r8:'classifications',r9:'forecasts',r10:'estimates'}[tbl]}_24h`];
+    const lifetime = block ? block.lifetime
+      : gateStats?.[`${tbl}_${{r7:'intents',r8:'classifications',r9:'forecasts',r10:'estimates'}[tbl]}_total`];
+    const lastTs   = block?.last_output_ts || null;
+    const enabled  = block ? !!block.enabled : !!cfg?.[gate.key];
+
+    // 1. Query failed → no signal at all.
+    if (lifetime == null) {
+      return { label: 'unknown', color: C.dim2, detail: 'daemon-state query failed' };
+    }
+
+    // 2. Lifetime 0 → daemon has literally never written. Distinguish
+    //    between "gate ON, daemon should run, but no output" (red — bug)
+    //    and "gate OFF, daemon idle by design" (dim, expected).
+    if (lifetime === 0) {
+      if (enabled) {
+        return { label: 'no daemon output yet', color: C.red,
+          detail: 'gate is ON but the daemon has never produced output — wiring gap or daemon not scheduled' };
+      }
+      return { label: 'idle (gate OFF)', color: C.dim2,
+        detail: 'daemon has never written — expected because the gate is OFF' };
+    }
+
+    // 3. 24h quiet → daemon alive but no recent activity. Tier by gate.
+    if (last24h === 0) {
+      const ageStr = lastTs ? ` · last output ${new Date(lastTs).toISOString().slice(0,10)}` : '';
+      return { label: 'warming up', color: C.amber,
+        detail: `${lifetime.toLocaleString()} lifetime rows but 0 in last 24h${ageStr}` };
+    }
+
+    // 4. Active producer.
+    return {
+      label: `${(last24h ?? '?').toLocaleString()}/24h`,
+      color: C.green,
+      detail: `${lifetime.toLocaleString()} lifetime rows · ${enabled ? 'gate ON' : 'gate OFF (shadow)'}`,
+    };
+  };
+
+  // A12 — KPI strip renderer. Renders "warming up" / "—" with semantics
+  // instead of just a raw count so the operator never has to guess
+  // whether 0 = bootstrap or 0 = bug.
+  const kpiValue = (rN) => {
+    const block = gateStats?.daemons?.[rN];
+    if (!block) {
+      // Fall back to legacy flat fields.
+      const flatKey = { r7: 'r7_intents_24h', r8: 'r8_classifications_24h',
+                        r9: 'r9_forecasts_24h', r10: 'r10_estimates_24h' }[rN];
+      const v = gateStats?.[flatKey];
+      return v == null ? '—' : v.toLocaleString();
+    }
+    if (block.lifetime == null) return '—';
+    if (block.lifetime === 0)   return block.enabled ? '⚠ no output' : 'idle';
+    if (block.count_24h === 0)  return 'warming up';
+    return (block.count_24h ?? 0).toLocaleString();
+  };
+  const kpiColor = (rN) => {
+    const block = gateStats?.daemons?.[rN];
+    if (!block || block.lifetime == null) return C.dim2;
+    if (block.lifetime === 0) return block.enabled ? C.red : C.dim2;
+    if (block.count_24h === 0) return C.amber;
+    return C.blue;
   };
 
   const toggleGate = async (key, currentlyOn, riskLevel) => {
@@ -3029,10 +3316,12 @@ const LabGates = () => {
         { label: 'Gates ON',      value: `${onCount}/4`,            color: onCount > 0 ? C.green : C.dim },
         { label: 'Gates OFF',     value: `${4 - onCount}/4`,        color: C.amber },
         { label: 'Shadow daemons',value: gateStats?.daemons_running ?? '—', color: C.purple },
-        { label: 'R8 classified', value: gateStats?.r8_classifications_24h ?? '—', color: C.blue },
-        { label: 'R9 forecasts',  value: gateStats?.r9_forecasts_24h ?? '—',      color: C.blue },
-        { label: 'R10 estimates', value: gateStats?.r10_estimates_24h ?? '—',     color: C.blue },
-        { label: 'R7 intents',    value: gateStats?.r7_intents_24h ?? '—',        color: C.blue },
+        // A12 — show semantic state ("warming up" / "no output" / count)
+        // instead of raw 0/null so the operator can tell bootstrap from bug.
+        { label: 'R8 classified', value: kpiValue('r8'),  color: kpiColor('r8')  },
+        { label: 'R9 forecasts',  value: kpiValue('r9'),  color: kpiColor('r9')  },
+        { label: 'R10 estimates', value: kpiValue('r10'), color: kpiColor('r10') },
+        { label: 'R7 intents',    value: kpiValue('r7'),  color: kpiColor('r7')  },
       ]} />
 
       <div style={{ flex: 1, overflow: 'auto', padding: 14 }}>

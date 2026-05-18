@@ -1,0 +1,175 @@
+{
+  "captured_at": "2026-05-18T22:12:44Z",
+  "base_url": "http://89.167.23.215:8080",
+  "compared_to_baseline": "2026-05-18_pre_fix.json",
+  "endpoints": {
+    "/api/v1/live-summary": {
+      "status": 200,
+      "elapsed_ms": 323.52,
+      "error": null,
+      "top_keys": [
+        "adaptive_thresholds",
+        "alpha_extras",
+        "analytics",
+        "bot",
+        "clock",
+        "data_quality_full",
+        "decision_engine",
+        "equity_curve",
+        "health_pillars",
+        "ingestion",
+        "logs",
+        "meta",
+        "positions",
+        "recent_trades",
+        "reconciliation",
+        "rejections",
+        "risk_config",
+        "stats",
+        "wallet_graph"
+      ]
+    },
+    "/api/portfolio/pipeline_status": {
+      "status": 200,
+      "elapsed_ms": 457.01,
+      "error": null,
+      "top_keys": [
+        "bot_status",
+        "db_ok",
+        "exec_mode",
+        "ingestion_count_24h",
+        "ingestion_lag_s",
+        "killswitch_active",
+        "last_decision_at",
+        "last_trade_at",
+        "paused_reason",
+        "redis_ok",
+        "ws_last_message_age_s",
+        "ws_status"
+      ]
+    },
+    "/api/health/pillars": {
+      "status": 200,
+      "elapsed_ms": 3656.63,
+      "error": null,
+      "top_keys": [
+        "computed_at_iso",
+        "overall_ok",
+        "pillars"
+      ]
+    },
+    "/api/inspector/snapshot": {
+      "status": 200,
+      "elapsed_ms": 4012.83,
+      "error": null,
+      "top_keys": [
+        "counters",
+        "decisions",
+        "generated_at",
+        "pipeline",
+        "raw_trades",
+        "source_mix"
+      ]
+    },
+    "/api/inspector/reconciliation": {
+      "status": 200,
+      "elapsed_ms": 1807.08,
+      "error": null,
+      "top_keys": [
+        "age_s",
+        "last_5_runs",
+        "phantom_count",
+        "pnl_delta_abs",
+        "pnl_delta_pct",
+        "pnl_displayed_sum",
+        "pnl_oracle_sum",
+        "premature_count",
+        "run_at_iso",
+        "trades_drift_count",
+        "trades_evaluated",
+        "verdict",
+        "window_days"
+      ]
+    },
+    "/api/ml/diagnostics": {
+      "status": "error",
+      "elapsed_ms": 45139.99,
+      "error": "ReadTimeout: ",
+      "top_keys": null
+    },
+    "/api/system": {
+      "status": "error",
+      "elapsed_ms": 45139.9,
+      "error": "ReadTimeout: ",
+      "top_keys": null
+    },
+    "/api/lab/gates": {
+      "status": 200,
+      "elapsed_ms": 3037.87,
+      "error": null,
+      "top_keys": [
+        "daemons_running",
+        "gates",
+        "r10_estimates_24h",
+        "r10_estimates_total",
+        "r7_intents_24h",
+        "r7_intents_total",
+        "r8_classifications_24h",
+        "r8_classifications_total",
+        "r9_forecasts_24h",
+        "r9_forecasts_total"
+      ]
+    },
+    "/api/leaders": {
+      "status": "error",
+      "elapsed_ms": 45140.06,
+      "error": "ReadTimeout: ",
+      "top_keys": null
+    }
+  },
+  "facts_cross_view": {
+    "observed_trades_24h": {
+      "snapshot.observed_trades_24h": null,
+      "snapshot.stats.observed_trades_24h": null,
+      "snapshot.ingestion.observed_trades_24h": null,
+      "pipeline_status.observed_trades_24h": null,
+      "ml/diagnostics.sample_efficiency.trades_observed_total": null
+    },
+    "exec_trades_24h": {
+      "snapshot.exec_trades_24h": null,
+      "snapshot.stats.exec_trades_24h": null
+    },
+    "bot_status": {
+      "snapshot.bot.bot_status": null,
+      "pipeline_status.bot_status_canonical": null,
+      "pipeline_status.bot_status_legacy": "healthy"
+    },
+    "ws_status": {
+      "snapshot.bot.ws_status": null,
+      "pipeline_status.ws_status_canonical": null,
+      "pipeline_status.ws_status_legacy": "connected"
+    },
+    "ws_last_message_age_s": {
+      "snapshot.ingestion.ws_last_message_age_s": null,
+      "pipeline_status.ws_last_message_age_s": 14.18
+    },
+    "paper_pnl": {
+      "snapshot.stats.total_pnl": -2920.0,
+      "inspector/reconciliation.pnl_displayed_sum": -2920.0
+    },
+    "reconciliation_verdict": {
+      "snapshot.bot.reconciliation.verdict": null,
+      "snapshot.reconciliation.verdict": "unknown",
+      "inspector/reconciliation.verdict": "ok"
+    },
+    "decisions_24h": {
+      "ml/diagnostics.decisions_24h.total": null,
+      "inspector/reconciliation.decisions.total": null
+    }
+  },
+  "notes": {
+    "purpose": "Captured by tests/integration/test_cross_view_consistency.py (Agent A13 anti-regression safety net). Each test in that file asserts that \u22652 sources for the same fact agree under a small tolerance \u2014 this file records the observed values at run time.",
+    "fact_count": 8,
+    "tolerance": "rtol=0.5%, atol=1.0 (paper_pnl) / atol=5s (ws_lag)"
+  }
+}

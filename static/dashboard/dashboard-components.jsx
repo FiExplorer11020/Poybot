@@ -34,7 +34,22 @@ const S = {
   mono:  { fontFamily: "'JetBrains Mono', monospace" },
 };
 
-// ── Live store hook ────────────────────────────────────────────────────────────
+// ── Live store hooks ───────────────────────────────────────────────────────────
+// Two flavours of subscription:
+//
+//   useLiveStore()            — legacy, returns the full HTTP snapshot.
+//                               Components that haven't been migrated keep
+//                               using this and re-render on every tick.
+//
+//   useLiveStoreSlice(name)   — A9, returns ONE named slice (systemStatus,
+//                               paperPnL, trades, decisions, positions,
+//                               reconciliation). Re-renders only when that
+//                               specific slice changes — typed deltas
+//                               targeting another slice are ignored.
+//
+// useSyncExternalStore (React 18) is the right primitive here: it
+// guarantees a consistent read across concurrent renders without the
+// useState/useEffect race that the legacy hook had to work around.
 const useLiveStore = () => {
   const [state, setState] = useState(() => ({
     snapshot:        window.LiveStore?.snapshot        || null,
@@ -48,6 +63,43 @@ const useLiveStore = () => {
     );
   }, []);
   return state;
+};
+
+// Slice subscription — re-renders only when the named slice's reference
+// changes. Stable subscribe + getSnapshot identities are required by
+// useSyncExternalStore; we memoise them per slice name with useMemo so
+// that React doesn't tear down the subscription on every render.
+const useLiveStoreSlice = (name) => {
+  const sub = useMemo(() => (cb) => {
+    if (!window.LiveStore) return () => {};
+    return window.LiveStore.subscribeSlice(name, cb);
+  }, [name]);
+  const getSnap = useMemo(() => () => {
+    return window.LiveStore ? window.LiveStore.getSlice(name) : null;
+  }, [name]);
+  // useSyncExternalStore is available on React 18+ which is what the
+  // dashboard ships with (templates/dashboard.html loads react@18.3.1).
+  // Fallback path kept for the rare case where a future build downgrades.
+  if (typeof React.useSyncExternalStore === 'function') {
+    return React.useSyncExternalStore(sub, getSnap, getSnap);
+  }
+  // Fallback: useState + useEffect. Same semantics, one extra render.
+  const [value, setValue] = useState(getSnap);
+  useEffect(() => sub(() => setValue(getSnap())), [sub, getSnap]);
+  return value;
+};
+
+// Connection-state subscription — small enough to inline in any component
+// that wants the WS health indicator without subscribing to the full
+// legacy snapshot. Kept on the legacy bus because connectionState lives
+// outside the slice cache.
+const useConnectionState = () => {
+  const [s, setS] = useState(() => window.LiveStore?.connectionState || 'connecting');
+  useEffect(() => {
+    if (!window.LiveStore) return;
+    return window.LiveStore.subscribe(st => setS(st.connectionState));
+  }, []);
+  return s;
 };
 
 // ── Connection banner ──────────────────────────────────────────────────────────
@@ -284,7 +336,7 @@ const CategoryRiskBadge = ({ category, feeRatePct }) => {
 };
 
 Object.assign(window, {
-  C, S, useLiveStore, usePersistedState, ConnBanner,
+  C, S, useLiveStore, useLiveStoreSlice, useConnectionState, usePersistedState, ConnBanner,
   Badge, MiniBar, ScoreBar, Dot, KpiStrip, TH, TD, SectionLabel, Sparkline, ProgressBar,
   short, fmtAge, fmtPnl, fmtPct, fmtMs, fmtNum,
   pnlColor, sideColor, actionType, stratType, phaseLabel, phaseType,

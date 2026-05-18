@@ -923,6 +923,17 @@ class TradeObserver:
                 continue
             await self._publish_trade_event(rec, market_row, leader_row)
 
+        # Batch 2 / A7 fix: maintain `metrics:trades_observed:zset` —
+        # a sliding 24h zset of trade_ids keyed by ingestion timestamp.
+        # The /api/portfolio/pipeline_status endpoint reads
+        # `metrics:trades_observed_24h` (cached counter) which is
+        # populated below as `ZCARD` after the prune. Without this
+        # producer the counter is permanently null and the dashboard's
+        # observed-trades card stays stuck at "—". Per-wallet zsets
+        # let downstream features (wallet activity widget, telegram
+        # /trades) drill down without scanning the global one.
+        await self._update_trades_observed_metric(committed)
+
     @staticmethod
     def _metric_source_label(source: str) -> str:
         """Map the observer's internal `source` strings to the Prometheus
@@ -937,6 +948,84 @@ class TradeObserver:
         if source == "falcon":
             return "backfill"
         return "rest"
+
+    async def _update_trades_observed_metric(
+        self,
+        committed: list,
+    ) -> None:
+        """Maintain the trades-observed sliding-window metric (Batch 2 / A7).
+
+        Two Redis surfaces are kept in sync here:
+
+        * ``metrics:trades_observed:zset`` — a global zset where each
+          freshly-inserted trade is added with its ingestion timestamp as
+          the score. We trim entries older than 24h on every batch so
+          ``ZCARD`` is the canonical "observed_trades_24h" counter.
+        * ``metrics:trades_observed_24h`` — a derived integer counter
+          (``ZCARD`` of the zset) cached with a short TTL so the
+          /api/portfolio/pipeline_status read path stays a single GET.
+
+        Per-wallet sub-zsets (``metrics:trades_observed:wallet:<addr>:zset``)
+        are also maintained so downstream features (telegram /leaders,
+        wallet activity widget) can answer "how many trades from wallet X
+        in the last 24h" without scanning the global structure.
+
+        Best-effort: redis failures are swallowed so a redis hiccup
+        never corrupts the DB-write hot path.
+
+        TODO(backfill): on first deploy the zset starts empty so the
+        24h counter ramps up over a day. A one-shot
+        ``scripts/backfill_trades_metric.py`` can prime it from the DB.
+        """
+        if self._redis is None or not committed:
+            return
+        now_ts = time.time()
+        cutoff = now_ts - 86400
+        global_zset = "metrics:trades_observed:zset"
+        per_wallet: dict[str, dict[str, float]] = {}
+        global_members: dict[str, float] = {}
+        for entry in committed:
+            try:
+                rec, inserted_id, _market_row, _leader_row = entry
+            except Exception:
+                continue
+            if inserted_id is None:
+                continue
+            # Score = ingestion time (now), member = trade pk so the same
+            # row can never be counted twice (ZADD is set-semantics).
+            member = f"id:{inserted_id}"
+            global_members[member] = float(now_ts)
+            wallet = getattr(rec, "wallet_address", None)
+            if wallet:
+                per_wallet.setdefault(wallet, {})[member] = float(now_ts)
+
+        if not global_members:
+            return
+
+        try:
+            # ZADD takes mapping in redis-py 4+/5+.
+            await self._redis.zadd(global_zset, global_members)
+            await self._redis.zremrangebyscore(global_zset, 0, cutoff)
+            zcard = await self._redis.zcard(global_zset)
+            # The counter is the canonical read for pipeline_status — 90s
+            # TTL is generous since the producer runs every batch.
+            await self._redis.set(
+                "metrics:trades_observed_24h",
+                str(int(zcard)),
+                ex=90,
+            )
+            # Per-wallet zsets (sliding 24h). The TTL is set on the zset
+            # itself so dead wallets don't pile up forever; the prune
+            # inside the window keeps it correct.
+            for wallet, members in per_wallet.items():
+                key = f"metrics:trades_observed:wallet:{wallet}:zset"
+                await self._redis.zadd(key, members)
+                await self._redis.zremrangebyscore(key, 0, cutoff)
+                # 7d TTL = re-armed any time the wallet trades again.
+                await self._redis.expire(key, 7 * 86400)
+        except Exception as exc:
+            # Never break the ingest hot path on a redis stutter.
+            logger.debug(f"trades_observed metric update failed: {exc}")
 
     async def _insert_batch_atomic(
         self,
@@ -1276,27 +1365,36 @@ class TradeObserver:
             else:
                 wallet_status = "watching"
 
-        event = {
-            "time": rec.trade_time.isoformat(),
-            "market_id": rec.market_id,
-            "market_question": market_question,
-            "market_category": market_category,
-            "market_type": market_type,
-            "token_id": rec.token_id,
-            "wallet_address": rec.wallet_address,
-            "wallet_type": "leader" if rec.is_leader else "market_participant",
-            "wallet_status": wallet_status,
-            "wallet_strategy": classification.get("strategy"),
-            "wallet_horizon": classification.get("horizon"),
-            "wallet_influence": classification.get("influence"),
-            "side": rec.side,
-            "price": str(rec.price),
-            "size_usdc": str(rec.size_usdc),
-            "is_leader": rec.is_leader,
-            "source": rec.source,
-        }
+        # Typed event — see src/events/schemas.py. The pydantic model
+        # enforces the producer/consumer contract; any new field MUST be
+        # added to TradeObserved or the consumer side will reject it.
+        from src.events.schemas import TradeObserved
+
         try:
-            await self._redis.publish(REDIS_TRADES_CHANNEL, json.dumps(event))
+            event_model = TradeObserved(
+                time=rec.trade_time,
+                market_id=rec.market_id,
+                wallet_address=rec.wallet_address,
+                side=rec.side,  # validator uppercases legacy "buy"/"sell"
+                price=float(rec.price),
+                size_usdc=float(rec.size_usdc),
+                is_leader=rec.is_leader,
+                source=rec.source,
+                token_id=rec.token_id,
+                market_question=market_question,
+                market_category=market_category,
+                market_type=market_type,
+                wallet_type=(
+                    "leader" if rec.is_leader else "market_participant"
+                ),
+                wallet_status=wallet_status,
+                wallet_strategy=classification.get("strategy"),
+                wallet_horizon=classification.get("horizon"),
+                wallet_influence=classification.get("influence"),
+            )
+            await self._redis.publish(
+                REDIS_TRADES_CHANNEL, event_model.model_dump_json()
+            )
             redis_publishes_total.labels(
                 channel=REDIS_TRADES_CHANNEL, result="ok"
             ).inc()

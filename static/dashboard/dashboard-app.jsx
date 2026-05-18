@@ -2,7 +2,8 @@
 
 const { useState: useStateA, useEffect: useEffectA } = React;
 const {
-  C, S, useLiveStore, Badge, Dot, SectionLabel,
+  C, S, useLiveStore, useLiveStoreSlice, useConnectionState,
+  Badge, Dot, SectionLabel,
   fmtAge, fmtPnl, fmtMs, pnlColor,
 } = window;
 // PLAN-UIA-001 (2026-05-18): MarketScanner removed from nav + destructure
@@ -10,6 +11,77 @@ const {
 const { AlphaTerminal, LivePortfolio, DecisionEngine, RiskConfig, BotHealth, WalletGraph, MLProgression } = window;
 
 const { Inspector, LabGates } = window;
+
+// A12 — BootstrapBanner: surfaces the bot's learning-progress maturity
+// so the operator never has to wonder whether "0" / "—" everywhere
+// means bootstrap (algo learning, low trading expected) or bug (a
+// daemon crashed). Reads snapshot.bot.maturity via the systemStatus
+// slice. Auto-hides at overall_pct >= 70% (bot is "ready"). Sits
+// between the topbar and the tab container so it never gets masked by
+// the A11 keep-alive display:none toggle.
+const BootstrapBanner = () => {
+  const systemStatus = useLiveStoreSlice('systemStatus');
+  const maturity = systemStatus?.maturity;
+  if (!maturity || typeof maturity.overall_pct !== 'number') return null;
+  if (maturity.overall_pct >= 0.7) return null;
+
+  const tier = maturity.tier || 'bootstrap';
+  const label = tier === 'bootstrap'
+    ? 'BOOTSTRAP MODE · algo learning, low trading expected'
+    : 'RAMPING UP · profiles maturing';
+
+  // Color palette: amber for bootstrap (warn), cyan for ramping_up
+  // (informative). Both readable on the dark dashboard background.
+  const isBootstrap = tier === 'bootstrap';
+  const fg     = isBootstrap ? '#ffc800' : '#00c8ff';
+  const bg     = isBootstrap ? 'rgba(255,200,0,0.12)' : 'rgba(0,200,255,0.08)';
+  const border = isBootstrap ? 'rgba(255,200,0,0.4)' : 'rgba(0,200,255,0.3)';
+
+  const pct = Math.round((maturity.overall_pct || 0) * 100);
+  const fmtSig = v => Math.round(((v || 0) * 100)) + '%';
+
+  // Tooltip breakdown — surfaced on hover so the operator can see why
+  // the bot is still learning instead of guessing.
+  const counts = maturity.counts || {};
+  const targets = maturity.targets || {};
+  const tt = [
+    `Maturity composition (mean of 4 signals):`,
+    `• Profiles: ${fmtSig(maturity.profiles_pct)} (${(counts.positions_resolved || 0).toLocaleString()} / ${(targets.positions_resolved || 0).toLocaleString()} resolved positions)`,
+    `• Sample: ${fmtSig(maturity.sample_eff_pct)} (${counts.leaders_with_sample || 0} / ${targets.leaders_with_sample || 0} leaders with ≥20 trades)`,
+    `• Coverage: ${fmtSig(maturity.cat_coverage_pct)} (${counts.categories_covered || 0} / ${targets.categories_covered || 0} categories)`,
+    `• Decisions: ${fmtSig(maturity.decision_health_pct)} (24h decision log activity)`,
+    `Tier: ${tier} · auto-hides at ≥70%.`,
+  ].join('\n');
+
+  return (
+    <div
+      title={tt}
+      style={{
+        padding: '6px 16px',
+        background: bg,
+        borderBottom: `1px solid ${border}`,
+        fontSize: 11,
+        color: fg,
+        letterSpacing: '0.5px',
+        fontFamily: "'JetBrains Mono', monospace",
+        flexShrink: 0,
+        display: 'flex',
+        alignItems: 'center',
+        gap: 10,
+        cursor: 'help',
+      }}
+    >
+      <span style={{ fontWeight: 700 }}>⚠</span>
+      <span>{label}</span>
+      <span style={{ color: C.dim2, fontWeight: 400 }}>·</span>
+      <span style={{ color: fg, fontWeight: 700 }}>maturity {pct}%</span>
+      <span style={{ color: C.dim2, fontSize: 10, marginLeft: 'auto' }}>
+        P {fmtSig(maturity.profiles_pct)} · S {fmtSig(maturity.sample_eff_pct)} · C {fmtSig(maturity.cat_coverage_pct)} · D {fmtSig(maturity.decision_health_pct)}
+      </span>
+    </div>
+  );
+};
+window.BootstrapBanner = BootstrapBanner;
 
 // PLAN-UIA-001 — ModeChip: 3-state mode badge (paper/live/dual) with
 // reconciliation suffix so the operator can always tell whether the
@@ -52,40 +124,56 @@ const NAV = [
 ];
 
 // ── Sidebar ────────────────────────────────────────────────────────────────────
+// A9 migration: subscribes to slices instead of the full snapshot. Re-renders
+// only when systemStatus, paperPnL, or the connection state change — a
+// trade landing on the WS no longer reruns this tree.
 const Sidebar = ({ tab, setTab }) => {
   const [time, setTime] = useStateA(new Date().toLocaleTimeString('en-GB'));
-  const { snapshot, connectionState } = useLiveStore();
+  const systemStatus = useLiveStoreSlice('systemStatus');
+  const paperPnL = useLiveStoreSlice('paperPnL');
+  const connectionState = useConnectionState();
+
+  if (typeof window !== 'undefined' && window.__LIVESTORE_DEBUG__) {
+    console.log('[re-render] Sidebar', { systemStatus: !!systemStatus, paperPnL: !!paperPnL, connectionState });
+  }
 
   useEffectA(() => {
     const id = setInterval(() => setTime(new Date().toLocaleTimeString('en-GB')), 1000);
     return () => clearInterval(id);
   }, []);
 
-  const bot       = snapshot?.bot       || {};
-  const ingestion = snapshot?.ingestion || {};
-  const stats     = snapshot?.stats     || {};
-  // PLAN-UIA-001 — paper truth surface.
-  const recon     = snapshot?.reconciliation || { verdict: 'unknown', pnl_delta_abs: 0, age_s: null };
+  const ss = systemStatus || {};
+  const stats = paperPnL || {};
+  // PLAN-UIA-001 — paper truth surface. Reconciliation rides in systemStatus
+  // because the sidebar chip reads it alongside bot/ws status; the dedicated
+  // `reconciliation` slice exists for components that ONLY care about recon
+  // and don't want to rerun when bot uptime ticks.
+  const recon = ss.reconciliation || { verdict: 'unknown', pnl_delta_abs: 0, age_s: null };
   const reconVerdict = recon.verdict || 'unknown';
   const reconColor = { ok: C.green, warn: C.amber, critical: C.red, unknown: C.dim2 }[reconVerdict] || C.dim2;
-  const execMode = (bot.execution_mode || 'paper').toLowerCase();
+  const execMode = ss.execution_mode || 'paper';
 
   const connColor = { connected: C.green, reconnecting: C.amber, connecting: C.amber, disconnected: C.red }[connectionState] || C.dim2;
   const connLabel = { connected: 'LIVE', reconnecting: 'RECON…', connecting: 'CONN…', disconnected: 'OFFLINE' }[connectionState] || '—';
-  const botColor  = bot.status === 'running' ? C.green : bot.status === 'stopped' ? C.amber : C.red;
+  const botStatusUpper = (ss.bot_status || '—').toUpperCase();
+  const botColor = botStatusUpper === 'RUNNING' ? C.green : botStatusUpper === 'STOPPED' ? C.amber : C.red;
 
   const reconClickHandler = () => {
     if (window.PoybotNav?.setActiveTab) window.PoybotNav.setActiveTab('inspector');
     else if (typeof setTab === 'function') setTab('inspector');
   };
 
+  // Recon delta has two shapes depending on the path: HTTP snapshot uses
+  // `pnl_delta_abs`, the typed WS payload uses `delta_abs`. Accept both.
+  const reconDelta = recon.pnl_delta_abs ?? recon.delta_abs ?? 0;
+
   const sysRows = [
-    { label: 'BOT',       color: botColor,  value: (bot.status || '—').toUpperCase() },
+    { label: 'BOT',       color: botColor,  value: botStatusUpper },
     { label: 'WS',        color: connColor, value: connLabel },
     {
       label: 'INGESTION',
-      color: (ingestion.live_markets || 0) > 0 ? C.green : C.red,
-      value: ingestion.total_markets ? `${ingestion.live_markets || 0}/${ingestion.total_markets}` : '—',
+      color: (ss.live_markets || 0) > 0 ? C.green : C.red,
+      value: ss.total_markets ? `${ss.live_markets || 0}/${ss.total_markets}` : '—',
     },
     // PLAN-UIA-001 — always-rendered RECON chip per ADR-PMK-014.10.
     // "Silence implies trustable. Explicit UNKNOWN teaches operator the question exists."
@@ -94,14 +182,14 @@ const Sidebar = ({ tab, setTab }) => {
       color: reconColor,
       value: reconVerdict === 'unknown' ? 'UNKNOWN'
            : reconVerdict === 'ok'      ? 'OK'
-           : `Δ ${fmtPnl(recon.pnl_delta_abs)}`,
+           : `Δ ${fmtPnl(reconDelta)}`,
       onClick: reconClickHandler,
       title: 'Paper-trade reconciliation vs Gamma. Click to open Inspector.',
     },
     {
       label: 'EXEC',
-      color: bot.execution_enabled ? C.green : C.amber,
-      value: bot.execution_enabled ? 'LIVE' : 'DRY RUN',
+      color: ss.execution_enabled ? C.green : C.amber,
+      value: ss.execution_enabled ? 'LIVE' : 'DRY RUN',
     },
   ];
 
@@ -206,8 +294,8 @@ const Sidebar = ({ tab, setTab }) => {
         <div style={{ marginTop: 8, paddingTop: 8, borderTop: `1px solid ${C.border}`, display: 'flex', gap: 6, alignItems: 'center' }}>
           <ModeChip mode={execMode} reconVerdict={reconVerdict} size="xs" />
           <span style={{ fontSize: 9, color: C.dim2 }}>Poybot</span>
-          {bot.uptime_seconds != null && (
-            <span style={{ fontSize: 9, color: C.dim2, marginLeft: 'auto' }}>↑{fmtAge(bot.uptime_seconds)}</span>
+          {ss.uptime_seconds != null && (
+            <span style={{ fontSize: 9, color: C.dim2, marginLeft: 'auto' }}>↑{fmtAge(ss.uptime_seconds)}</span>
           )}
         </div>
       </div>
@@ -225,6 +313,19 @@ const App = () => {
   const bot = snapshot?.bot || {};
 
   useEffectA(() => { localStorage.setItem('pmi_tab', tab); }, [tab]);
+
+  // A11 — Tabs keep-alive. Each tab is mounted once on first visit and then
+  // hidden via display:none on subsequent switches. State (filters, scroll,
+  // pagination, intervals, fetched data) is preserved, switch is instant.
+  //
+  // Lazy-mount: a tab isn't rendered until the user activates it once. We
+  // compute the visited set DURING render (not in an effect) so the first
+  // render after a tab switch already includes the new tab — no flash of
+  // empty content. The Set is held as a ref so it survives rerenders and
+  // additions are O(1).
+  const visitedTabsRef = React.useRef(new Set([tab]));
+  if (!visitedTabsRef.current.has(tab)) visitedTabsRef.current.add(tab);
+  const visitedTabs = visitedTabsRef.current;
 
   // ── Cross-module navigation bus ──────────────────────────────────────────
   // Each tab is otherwise siloed; this bus lets one tab dispatch a request to
@@ -324,7 +425,6 @@ const App = () => {
     return () => clearInterval(id);
   }, []);
 
-  const ActiveTab = NAV.find(n => n.id === tab)?.component || AlphaTerminal;
   const isRunning = bot.status === 'running';
 
   return (
@@ -391,19 +491,34 @@ const App = () => {
           <span style={{ fontSize: 10, color: C.dim2, fontFamily: 'monospace' }}>UTC {utc}</span>
         </div>
 
-        {/* Active tab — absolutely-positioned inner container guarantees the
-            tab content fills the parent regardless of its own layout (flex,
-            grid, block). Using `flex: 1` alone would let some tabs shrink to
-            content width when they don't have a forcing grid template. */}
+        {/* A12 — Bootstrap banner. Sits OUTSIDE the tab keep-alive
+            container so it's visible on every tab. Auto-hides at
+            maturity ≥ 70%. Reads systemStatus slice — null-safe. */}
+        <BootstrapBanner />
+
+        {/* A11 — Keep-alive tab container. Every visited tab is mounted once
+            and then masked via display:none. The active tab gets the full
+            absolutely-positioned slot (flex/grid layouts inside it work as
+            before); inactive tabs are removed from the layout flow but
+            keep their internal state, polling intervals, and scroll
+            position. First-visit tabs render under their slot too — the
+            lazy-mount Set above guarantees we never instantiate a tab the
+            user hasn't selected. */}
         <div style={{ flex: 1, overflow: 'hidden', position: 'relative', minWidth: 0 }}>
-          <div style={{
-            position: 'absolute',
-            top: 0, left: 0, right: 0, bottom: 0,
-            display: 'flex',
-            flexDirection: 'column',
-          }}>
-            <ActiveTab />
-          </div>
+          {NAV.map(({ id, component: Component }) => {
+            if (!visitedTabs.has(id)) return null;
+            const active = id === tab;
+            return (
+              <div key={id} style={{
+                position: 'absolute',
+                top: 0, left: 0, right: 0, bottom: 0,
+                display: active ? 'flex' : 'none',
+                flexDirection: 'column',
+              }}>
+                <Component />
+              </div>
+            );
+          })}
         </div>
       </div>
 

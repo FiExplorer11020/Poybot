@@ -33,13 +33,16 @@ Failure modes:
 from __future__ import annotations
 
 import json
+import uuid
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from enum import Enum
 from typing import TYPE_CHECKING, Any, Optional
 
 from loguru import logger
 
 from src.config import settings
+from src.events.schemas import DecisionMade
 
 if TYPE_CHECKING:
     from src.engine.confidence_engine import Decision
@@ -133,7 +136,20 @@ class DecisionRouter:
 
         mode = await self._active_mode()
         payload = self._build_payload(decision)
-        encoded = json.dumps(payload)
+        # Validate the payload through the typed schema. The model keeps
+        # the legacy lower-case action vocabulary AND the new core fields
+        # (time, decision_id). On drift the build raises and we fall back
+        # to the raw dict — better to ship a slightly-malformed event
+        # than to silence a decision.
+        try:
+            event_model = DecisionMade.model_validate(payload)
+            encoded = event_model.model_dump_json()
+        except Exception as exc:  # pragma: no cover — defensive
+            logger.warning(
+                f"DecisionRouter: schema validation failed, "
+                f"falling back to raw payload: {exc}"
+            )
+            encoded = json.dumps(payload)
 
         routed_paper = False
         routed_live = False
@@ -249,7 +265,16 @@ class DecisionRouter:
             if ctx.get("market_price") is not None
             else ctx.get("price") or ctx.get("trade_price") or ctx.get("leader_price")
         )
+        # Canonical core fields required by src/events/schemas.py
+        # (time + decision_id). `decision_id` is a deterministic-ish UUID
+        # so consumers can dedup retransmissions; `time` is ISO-formatted
+        # so it survives the json.dumps → json.loads round-trip without
+        # needing custom encoders on the consumer side. The legacy keys
+        # below stay verbatim — PaperTrader/LiveTrader gates depend on
+        # `kelly_fraction`, lower-case `action`, etc.
         return {
+            "time": datetime.now(tz=timezone.utc).isoformat(),
+            "decision_id": str(uuid.uuid4()),
             "action": decision.action,
             "leader_wallet": decision.leader_wallet,
             "market_id": decision.market_id,
@@ -261,6 +286,7 @@ class DecisionRouter:
             "side": side,
             "price": price,
             "size_usdc": decision.size_usdc,
+            "kelly": decision.kelly_fraction,
             "kelly_fraction": decision.kelly_fraction,
             "confidence": decision.confidence,
             "thompson_follow": decision.thompson_follow,

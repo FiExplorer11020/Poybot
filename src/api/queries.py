@@ -6,6 +6,7 @@ No SQL lives outside this module.
 
 import asyncio
 import json
+import time as _time_module  # avoid shadowing `time` columns/locals
 from datetime import datetime, timezone
 from typing import Any
 
@@ -1413,7 +1414,23 @@ async def risk(conn) -> dict:
     }
 
 
-async def system_status(conn) -> dict:
+async def system_status(conn, redis_client=None) -> dict:
+    """Canonical system status block (Batch 2 fix #2).
+
+    The dashboard sidebar and the `/api/portfolio/pipeline_status`
+    endpoint used to compute `bot_status` / `ws_status` independently
+    from different source data, leading to "RUNNING / UNKNOWN"
+    discrepancies. The block returned here is the single source of
+    truth used by both `_build_bot_payload` (snapshot) and
+    `portfolio_pipeline_status` (pipeline endpoint).
+
+    Canonical fields added (besides the legacy leaders/graph/batch_steps):
+
+    * ``bot_status``  : "RUNNING" | "STOPPED" | "DEGRADED"
+    * ``ws_status``   : "LIVE" | "DEGRADED" | "DOWN"
+    * ``ingestion``   : { live_markets, ws_last_message_age_s, observed_trades_24h }
+    * ``reconciliation``: { verdict, delta_abs } (best-effort, recon_summary cached upstream)
+    """
     falcon_agents = await conn.fetch("""
         SELECT 'leaders_refresh' AS step, MAX(COALESCE(last_refresh, first_seen)) AS last_run
         FROM leaders
@@ -1467,6 +1484,132 @@ async def system_status(conn) -> dict:
         LIMIT 8
         """
     )
+    # ──────────────────────────────────────────────────────────────────
+    # Batch 2 fix #2 — canonical bot/ws status block. Both
+    # `_build_bot_payload` (terminal snapshot) and
+    # `portfolio_pipeline_status` now reuse this block so the dashboard
+    # never shows "RUNNING / UNKNOWN" again.
+    #
+    # We deliberately fetch the counters/ws keys via Redis here (with
+    # short timeouts + graceful fallback) so a single Redis hiccup
+    # degrades the field rather than blowing up the leaders/graph data
+    # the rest of the snapshot needs.
+    # ──────────────────────────────────────────────────────────────────
+    bot_status = "STOPPED"
+    ws_status = "DOWN"
+    ws_last_message_age_s: float | None = None
+    observed_trades_24h: int | None = None
+    exec_trades_24h: int | None = None
+
+    if redis_client is not None:
+        try:
+            ts = await asyncio.wait_for(
+                redis_client.get("ws:market:last_message_ts"), timeout=0.3
+            )
+            if ts is not None:
+                ws_last_message_age_s = max(
+                    0.0,
+                    float(datetime.now(timezone.utc).timestamp()) - float(ts),
+                )
+                if ws_last_message_age_s <= 30:
+                    ws_status = "LIVE"
+                elif ws_last_message_age_s <= 120:
+                    ws_status = "DEGRADED"
+                else:
+                    ws_status = "DOWN"
+        except Exception:
+            ws_last_message_age_s = None
+            ws_status = "DOWN"
+
+        try:
+            v = await asyncio.wait_for(
+                redis_client.get("metrics:trades_observed_24h"), timeout=0.3
+            )
+            if v is not None:
+                observed_trades_24h = int(v)
+        except Exception:
+            observed_trades_24h = None
+
+    # exec_trades_24h: paper_trades opened in the last 24h. Distinct
+    # from observed_trades_24h (the raw firehose, ingest-side).
+    try:
+        exec_trades_24h = await conn.fetchval(
+            f"""
+            SELECT COUNT(*)::int FROM paper_trades
+            WHERE opened_at >= NOW() - INTERVAL '24 hours'
+              AND {V1_PAPER_TRADE_SQL}
+            """
+        )
+    except Exception:
+        exec_trades_24h = None
+
+    # bot_status: RUNNING if any executor activity was emitted in the
+    # last hour AND ws is at least DEGRADED. The killswitch path is
+    # checked by the pipeline endpoint, not here, so we don't read it
+    # twice.
+    try:
+        last_exec = await conn.fetchval(
+            "SELECT MAX(opened_at) FROM paper_trades "
+            "WHERE opened_at >= NOW() - INTERVAL '7 days'"
+        )
+        engine_active = False
+        if last_exec is not None:
+            age = (datetime.now(timezone.utc) - last_exec).total_seconds()
+            engine_active = age < 3600
+        # Even without recent trades, RUNNING if WS is alive — the bot
+        # may just be in a low-conviction window.
+        if ws_status in ("LIVE", "DEGRADED") or engine_active:
+            bot_status = "RUNNING"
+        else:
+            bot_status = "STOPPED"
+    except Exception:
+        # Engine activity probe is best-effort. Default to RUNNING if WS
+        # is at least DEGRADED so we don't flap on a single SQL hiccup.
+        bot_status = "RUNNING" if ws_status in ("LIVE", "DEGRADED") else "STOPPED"
+
+    # A12 (2026-05-18) — bootstrap maturity signal. Aggregates four
+    # learning-progress signals into a single 0..1 score so the dashboard
+    # can tell the operator "the bot is still learning, low trading is
+    # expected" instead of letting them stare at zeros and assume a bug.
+    #
+    # Composition (each clamped to [0, 1]):
+    #   * profiles_pct       — resolved positions vs target (5000)
+    #   * sample_eff_pct     — leaders with >=20 observed trades vs total
+    #   * cat_coverage_pct   — distinct categories with >=3 leaders vs 6
+    #   * decision_health_pct— 1.0 if any decisions in last 24h else 0.0
+    #
+    # The overall_pct is the unweighted mean. Sub-30% = bootstrap, 30-70% =
+    # ramping up, 70%+ = ready. The tooltip surfaces the four signals so
+    # the operator understands *why* the bot is still learning.
+    try:
+        maturity = await _compute_maturity(conn, decisions_24h_hint=exec_trades_24h)
+    except Exception as exc:  # noqa: BLE001 — best-effort field
+        logger.debug(f"system_status maturity probe failed: {exc}")
+        maturity = {
+            "profiles_pct": 0.0,
+            "sample_eff_pct": 0.0,
+            "cat_coverage_pct": 0.0,
+            "decision_health_pct": 0.0,
+            "overall_pct": 0.0,
+            "tier": "bootstrap",
+            "error": "probe_failed",
+        }
+
+    # Batch 2 fix #8 — best-effort publish of SystemStatusChanged. The
+    # helper is fully isolated (failure swallowed) so it never breaks
+    # the canonical return below.
+    try:
+        await _maybe_publish_system_status_change(
+            redis_client,
+            bot_status,
+            ws_status,
+            observed_trades_24h,
+            exec_trades_24h,
+            ws_last_message_age_s,
+        )
+    except Exception:
+        pass
+
     return {
         "leaders": {
             "total": int(total_leaders or 0),
@@ -1495,6 +1638,230 @@ async def system_status(conn) -> dict:
             {"step": r["step"], "last_run": r["last_run"].isoformat() if r["last_run"] else None}
             for r in falcon_agents
         ],
+        # Batch 2 fix #2 — canonical status block (UPPERCASE for the
+        # SystemStatusChanged event contract; lowercase legacy aliases
+        # exist on the bot block of the snapshot too).
+        "bot_status": bot_status,
+        "ws_status": ws_status,
+        "ingestion": {
+            "ws_last_message_age_s": (
+                round(ws_last_message_age_s, 2)
+                if ws_last_message_age_s is not None
+                else None
+            ),
+            "observed_trades_24h": observed_trades_24h,
+            "exec_trades_24h": exec_trades_24h,
+        },
+        # A12 — bootstrap maturity (see helper docstring for composition).
+        # Surfaced on snapshot.bot.maturity by _build_bot_payload so the
+        # dashboard banner can render without reaching across blocks.
+        "maturity": maturity,
+    }
+
+
+async def _maybe_publish_system_status_change(
+    redis_client,
+    bot_status: str,
+    ws_status: str,
+    observed_trades_24h: int | None,
+    exec_trades_24h: int | None,
+    ws_last_message_age_s: float | None,
+) -> None:
+    """Publish a SystemStatusChanged event when the canonical
+    (bot_status, ws_status) pair transitions vs the last broadcast.
+
+    Best-effort, best-friend to A5: uses the schema + channel constants
+    declared in src/events/schemas.py so the consumer side enforces
+    pydantic-level validation. Failures are swallowed — this is purely
+    a fan-out hint for the WS bridge / telegram alert path. The
+    debounce is done via a Redis key (``system:status:last_emit``) so
+    the watchdog doesn't spam consumers on every cache miss.
+    """
+    if redis_client is None:
+        return
+    try:
+        from src.events.schemas import (
+            SystemStatusChanged,
+            CHANNEL_SYSTEM_STATUS,
+        )
+    except Exception:
+        return
+    debounce_key = "system:status:last_emit"
+    try:
+        last = await redis_client.get(debounce_key)
+        signature = f"{bot_status}|{ws_status}"
+        if isinstance(last, (bytes, bytearray)):
+            last = last.decode("utf-8")
+        if last == signature:
+            return  # no transition — don't spam consumers
+        # Note: killswitch is fetched at the pipeline endpoint; we
+        # default to False here because the canonical event surface
+        # treats killswitch as a separate broadcast. A producer with
+        # access to the killswitch state should overwrite this.
+        event = SystemStatusChanged(
+            time=datetime.now(timezone.utc),
+            bot=bot_status,
+            ws=ws_status,
+            ingest={
+                "ws_last_message_age_s": ws_last_message_age_s,
+                "observed_trades_24h": observed_trades_24h,
+                "exec_trades_24h": exec_trades_24h,
+            },
+            killswitch=False,
+        )
+        await redis_client.publish(
+            CHANNEL_SYSTEM_STATUS, event.model_dump_json()
+        )
+        # 30s debounce — long enough to collapse polling chatter, short
+        # enough that the dashboard still sees the next genuine flip.
+        await redis_client.set(debounce_key, signature, ex=30)
+    except Exception as exc:
+        logger.debug(f"system_status event publish skipped: {exc}")
+
+
+# A12 — Bootstrap maturity targets. Each is the "fully mature" point;
+# the corresponding percentage is min(actual / target, 1.0). Tuned to
+# Polymarket bot mission scale (28% → 70% win-rate roadmap):
+#   PROFILES — by the time we have 5k resolved positions across the
+#     watchlist, the per-leader error model has the data it needs to
+#     reach phase 3 (LightGBM) for the most active leaders.
+#   SAMPLE   — 200 leaders × ≥20 trades each is roughly the point where
+#     follow_min_trades (50) is hit for the median leader.
+#   COVERAGE — 6 distinct market categories with ≥3 leaders each is the
+#     point where category-conditional confidence (R8) has enough cells.
+_MATURITY_TARGET_POSITIONS_RESOLVED = 5_000
+_MATURITY_TARGET_LEADERS_WITH_TRADES = 200
+_MATURITY_MIN_TRADES_PER_LEADER = 20
+_MATURITY_TARGET_CATEGORIES = 6
+_MATURITY_MIN_LEADERS_PER_CAT = 3
+
+
+async def _compute_maturity(
+    conn, *, decisions_24h_hint: int | None = None
+) -> dict[str, Any]:
+    """Aggregate bootstrap-progress signals into a single 0..1 score.
+
+    Called inside ``system_status`` (cached upstream by ``api.main``'s
+    snapshot 1s TTL — no need to add another cache here). Each probe is
+    wrapped in its own try/except so a single missing table doesn't
+    zero-out the rest of the breakdown.
+    """
+    profiles_pct = 0.0
+    sample_eff_pct = 0.0
+    cat_coverage_pct = 0.0
+    decision_health_pct = 0.0
+
+    # 1. profiles_pct — total resolved positions vs target.
+    try:
+        n_resolved = await conn.fetchval(
+            "SELECT COUNT(*)::int FROM positions_reconstructed "
+            "WHERE close_time IS NOT NULL"
+        )
+        n_resolved = int(n_resolved or 0)
+        profiles_pct = min(n_resolved / _MATURITY_TARGET_POSITIONS_RESOLVED, 1.0)
+    except Exception:
+        n_resolved = 0
+
+    # 2. sample_eff_pct — leaders with enough trades to be profileable.
+    try:
+        n_with_sample = await conn.fetchval(
+            f"""
+            SELECT COUNT(*)::int FROM leader_profiles
+            WHERE trades_observed >= {_MATURITY_MIN_TRADES_PER_LEADER}
+            """
+        )
+        n_with_sample = int(n_with_sample or 0)
+        sample_eff_pct = min(n_with_sample / _MATURITY_TARGET_LEADERS_WITH_TRADES, 1.0)
+    except Exception:
+        n_with_sample = 0
+
+    # 3. cat_coverage_pct — distinct categories with ≥N leaders each.
+    # The category is stored in profile_json (Dirichlet posterior over
+    # preferred_categories); we approximate "covered" by counting
+    # distinct top-1 categories across profiles.
+    try:
+        n_categories = await conn.fetchval(
+            f"""
+            SELECT COUNT(*)::int FROM (
+                SELECT COALESCE(m.category, 'unknown') AS cat
+                FROM leader_profiles p
+                LEFT JOIN markets m
+                  ON m.market_id = (p.profile_json->'last_market'->>'market_id')
+                WHERE p.trades_observed >= {_MATURITY_MIN_TRADES_PER_LEADER}
+                GROUP BY cat
+                HAVING COUNT(*) >= {_MATURITY_MIN_LEADERS_PER_CAT}
+            ) sub
+            """
+        )
+        n_categories = int(n_categories or 0)
+        cat_coverage_pct = min(n_categories / _MATURITY_TARGET_CATEGORIES, 1.0)
+    except Exception:
+        n_categories = 0
+        # Fall back to a simpler probe: just distinct categories in markets
+        # that have at least one leader trade. Less accurate but never
+        # zero on a healthy DB.
+        try:
+            fallback = await conn.fetchval(
+                """
+                SELECT COUNT(DISTINCT m.category)::int
+                FROM markets m
+                JOIN trades_observed t ON t.market_id = m.market_id
+                WHERE t.time >= NOW() - INTERVAL '30 days'
+                  AND m.category IS NOT NULL
+                """
+            )
+            n_categories = int(fallback or 0)
+            cat_coverage_pct = min(n_categories / _MATURITY_TARGET_CATEGORIES, 1.0)
+        except Exception:
+            pass
+
+    # 4. decision_health_pct — binary: any actionable decision in 24h.
+    # If the caller already counted exec_trades_24h, reuse it as a hint
+    # before issuing a separate query (the decision_log COUNT below is
+    # the canonical source — exec_trades is just a fast bail-out).
+    if isinstance(decisions_24h_hint, int) and decisions_24h_hint > 0:
+        decision_health_pct = 1.0
+    else:
+        try:
+            n_decisions = await conn.fetchval(
+                "SELECT COUNT(*)::int FROM decision_log "
+                "WHERE time >= NOW() - INTERVAL '24 hours'"
+            )
+            decision_health_pct = 1.0 if int(n_decisions or 0) > 0 else 0.0
+        except Exception:
+            decision_health_pct = 0.0
+
+    overall_pct = (
+        profiles_pct + sample_eff_pct + cat_coverage_pct + decision_health_pct
+    ) / 4.0
+    overall_pct = max(0.0, min(overall_pct, 1.0))
+
+    if overall_pct < 0.3:
+        tier = "bootstrap"
+    elif overall_pct < 0.7:
+        tier = "ramping_up"
+    else:
+        tier = "ready"
+
+    return {
+        "profiles_pct": round(profiles_pct, 4),
+        "sample_eff_pct": round(sample_eff_pct, 4),
+        "cat_coverage_pct": round(cat_coverage_pct, 4),
+        "decision_health_pct": round(decision_health_pct, 4),
+        "overall_pct": round(overall_pct, 4),
+        "tier": tier,
+        # Raw counts so the dashboard tooltip can show "823 / 5000 resolved"
+        # instead of just "16%".
+        "counts": {
+            "positions_resolved": n_resolved,
+            "leaders_with_sample": n_with_sample,
+            "categories_covered": n_categories,
+        },
+        "targets": {
+            "positions_resolved": _MATURITY_TARGET_POSITIONS_RESOLVED,
+            "leaders_with_sample": _MATURITY_TARGET_LEADERS_WITH_TRADES,
+            "categories_covered": _MATURITY_TARGET_CATEGORIES,
+        },
     }
 
 
@@ -2787,9 +3154,40 @@ async def inspector_snapshot(conn, redis_client=None, limit: int = 80) -> dict:
             ts = await redis_client.get("ws:market:last_message_ts")
             if ts is not None:
                 pipeline["ws_last_message_age_s"] = max(0.0, now.timestamp() - float(ts))
-            rate = await redis_client.get("ws:market:msgs_per_min")
-            if rate is not None:
-                pipeline["ws_msgs_per_min"] = float(rate)
+            # KEY MISMATCH FIX (Batch 2 / A7): the producer in
+            # trade_observer._handle_ws_message writes per-minute buckets
+            # under `ws:msgs:minute:<bucket>`, while this consumer was
+            # reading the never-populated `ws:market:msgs_per_min`. The
+            # current minute may be partial (we're mid-bucket), so we
+            # SUM the previous minute + current minute; that gives a
+            # rolling 1-2 min window that the dashboard treats as
+            # "messages per minute" without divide-by-zero pitfalls.
+            now_bucket = int(_time_module.time() // 60)
+            try:
+                values = await redis_client.mget(
+                    f"ws:msgs:minute:{now_bucket - 1}",
+                    f"ws:msgs:minute:{now_bucket}",
+                )
+                total = 0
+                seen_any = False
+                for v in values or []:
+                    if v is None:
+                        continue
+                    seen_any = True
+                    try:
+                        total += int(v)
+                    except (TypeError, ValueError):
+                        # bytes from raw redis (no decode_responses) — try str path
+                        try:
+                            total += int(v.decode("utf-8")) if isinstance(v, (bytes, bytearray)) else 0
+                        except Exception:
+                            pass
+                if seen_any:
+                    pipeline["ws_msgs_per_min"] = float(total)
+            except Exception:
+                # Don't poison the rest of the pipeline payload on a
+                # single redis hiccup — leave the field as None.
+                pass
             # Channel pubsub channel stats (rough — pubsub doesn't have persistent backlog,
             # but we can read the count of sub-listeners as a sanity check).
             try:
@@ -3543,17 +3941,25 @@ async def ml_diagnostics(conn) -> dict:
     ]
 
     # 5. Decision flow last 24h: follow / fade / skip
+    # Batch 2 fix #4: accept BOTH legacy lowercase action values
+    # ('follow','fade','skip','volume_anticipation') and the canonical
+    # upper-case set ('OPEN','CLOSE','REDUCE','SKIP') so the counter
+    # converges with reconciliation regardless of which producer wrote
+    # the row. Without this the dashboard's "DECISIONS 24H" card
+    # showed 0 when the engine was emitting only legacy actions.
     dec_rows = await conn.fetch(
         """
-        SELECT action, COUNT(*)::int AS n
+        SELECT LOWER(action) AS action, COUNT(*)::int AS n
         FROM decision_log
         WHERE time > NOW() - INTERVAL '24 hours'
-        GROUP BY action
+          AND action IS NOT NULL
+        GROUP BY LOWER(action)
         """
     )
-    total_dec = sum(_to_int(_row_get(r, "n"), 0) for r in dec_rows) or 1
+    total_dec_raw = sum(_to_int(_row_get(r, "n"), 0) for r in dec_rows)
+    total_dec = total_dec_raw or 1  # guard against /0 in pct calc
     out["decisions_24h"] = {
-        "total": total_dec,
+        "total": total_dec_raw,
         "by_action": [
             {
                 "action": str(_row_get(r, "action")),
@@ -4462,15 +4868,45 @@ async def portfolio_pipeline_status(conn, redis_client=None) -> dict:
     else:
         bot_status = "healthy"
 
+    # Batch 2 fix #2 — also expose the canonical UPPERCASE form so the
+    # /api/portfolio/pipeline_status and /api/v1/live-summary endpoints
+    # converge on identical bot_status / ws_status values. The legacy
+    # lower-case keys above stay untouched for existing JSX consumers.
+    if bot_status == "healthy":
+        bot_status_canonical = "RUNNING"
+    elif bot_status == "paused":
+        bot_status_canonical = "STOPPED"
+    elif bot_status in ("down", "degraded"):
+        bot_status_canonical = "DEGRADED"
+    else:
+        bot_status_canonical = "RUNNING"
+
+    if ws_status == "connected":
+        ws_status_canonical = "LIVE"
+    elif ws_status == "stale":
+        ws_status_canonical = "DEGRADED"
+    elif ws_status in ("disconnected", "redis_unreachable", "no_data"):
+        ws_status_canonical = "DOWN"
+    else:
+        ws_status_canonical = "DOWN"
+
     return {
         "bot_status": bot_status,
         "ws_status": ws_status,
+        # Canonical UPPERCASE aliases — see Batch 2 fix #2 comment.
+        "bot_status_canonical": bot_status_canonical,
+        "ws_status_canonical": ws_status_canonical,
         "ws_last_message_age_s": (
             round(ws_last_message_age_s, 2) if ws_last_message_age_s is not None
             else None
         ),
         "ingestion_lag_s": round(ingestion_lag_s, 2) if ingestion_lag_s is not None else None,
         "ingestion_count_24h": ingestion_count_24h,
+        # Distinct counters (Batch 2 fix #3). The pipeline endpoint
+        # exposed only the observed count — now it returns both so the
+        # dashboard can stop reading the live-summary and the pipeline
+        # endpoint with different keys.
+        "observed_trades_24h": ingestion_count_24h,
         "exec_mode": exec_mode,
         "killswitch_active": killswitch_active,
         "paused_reason": paused_reason,
