@@ -31,3 +31,4 @@ static/dashboard/dist/
 # Playwright outputs
 test-results/
 playwright-report/
+docker-compose.override.yml

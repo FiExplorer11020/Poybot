@@ -409,7 +409,7 @@ services:
       - "--port"
       - "8080"
     ports:
-      - "8088:8080"
+      - "8080:8080"
     healthcheck:
       # API has its own /healthz endpoint — prefer that over the
       # generic Redis+DB probe.
