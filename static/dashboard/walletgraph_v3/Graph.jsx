@@ -15,7 +15,8 @@
   };
   const FOLLOWER_COLOR = { core: '#a78bfa', glow: 'rgba(167, 139, 250, ' };
   const EXCLUDED_COLOR = { core: '#475569', glow: 'rgba(71, 85, 105, ' };
-  const DEFAULT_TOP_N = 500;
+  const DEFAULT_TOP_N = 1500;
+  const SHOW_ALL_TOP_N = 3000;
 
   function getNodeColor(node) {
     if (node.exclude_reason) return EXCLUDED_COLOR;
@@ -23,73 +24,104 @@
     return PHASE_COLORS[node.phase] || PHASE_COLORS[1];
   }
 
+  // Power 0.55 (vs sqrt) + larger range [4, 24] amplifies whale vs small visual gap.
   function getNodeRadius(node) {
     const t24 = (node && node.trades_24h) || 1;
-    return Math.max(3, Math.min(15, Math.sqrt(t24) * 2));
+    return Math.max(4, Math.min(24, Math.pow(t24, 0.55) * 2.0));
   }
 
-  // Node painter: outer halo + inner glow + core + optional selected ring/halo.
+  // 4-layer node painter: outer-glow (r*6) + halo (r*3) + inner-glow (r*1.6) + core w/ stroke.
   function paintNode(node, ctx, globalScale, isSelected, isHovered) {
     if (typeof node.x !== 'number' || typeof node.y !== 'number') return;
     const { core, glow } = getNodeColor(node);
     const baseR = getNodeRadius(node);
-    const r = isHovered ? baseR * 1.3 : baseR;
+    const r = isHovered ? baseR * 1.4 : baseR;
     const x = node.x;
     const y = node.y;
 
-    // 1) Outer halo (rectangular gradient fill — covers a 6r square).
+    // 1) Outer glow (very subtle, very wide — r*6).
+    const outerR = r * 6;
+    const outerGrad = ctx.createRadialGradient(x, y, 0, x, y, outerR);
+    outerGrad.addColorStop(0, glow + '0.15)');
+    outerGrad.addColorStop(1, glow + '0)');
+    ctx.fillStyle = outerGrad;
+    ctx.fillRect(x - outerR, y - outerR, outerR * 2, outerR * 2);
+
+    // 2) Halo (medium — r*3, much more intense than before).
     const haloGrad = ctx.createRadialGradient(x, y, 0, x, y, r * 3);
-    haloGrad.addColorStop(0, glow + '0.4)');
+    haloGrad.addColorStop(0, glow + '0.55)');
     haloGrad.addColorStop(1, glow + '0)');
     ctx.fillStyle = haloGrad;
     ctx.fillRect(x - r * 3, y - r * 3, r * 6, r * 6);
 
-    // 2) Inner glow (soft circular).
-    const glowGrad = ctx.createRadialGradient(x, y, 0, x, y, r * 1.5);
-    glowGrad.addColorStop(0, glow + '0.8)');
-    glowGrad.addColorStop(1, glow + '0.4)');
+    // 3) Inner glow (tight, near-opaque core bleed).
+    const glowGrad = ctx.createRadialGradient(x, y, 0, x, y, r * 1.6);
+    glowGrad.addColorStop(0, glow + '0.85)');
+    glowGrad.addColorStop(1, glow + '0.5)');
     ctx.fillStyle = glowGrad;
     ctx.beginPath();
-    ctx.arc(x, y, r * 1.5, 0, Math.PI * 2);
+    ctx.arc(x, y, r * 1.6, 0, Math.PI * 2);
     ctx.fill();
 
-    // 3) Solid core.
+    // 4) Solid core + subtle 1px white outline (gives nodes physical edge).
     ctx.fillStyle = core;
     ctx.beginPath();
     ctx.arc(x, y, r, 0, Math.PI * 2);
     ctx.fill();
+    ctx.strokeStyle = 'rgba(255, 255, 255, 0.3)';
+    ctx.lineWidth = 1;
+    ctx.stroke();
 
-    // 4) Selected: bright ring + glow.
+    // 5) Selected: big aura (r*9) + thick white ring.
     if (isSelected) {
-      ctx.strokeStyle = 'rgba(255, 255, 255, 0.9)';
-      ctx.lineWidth = Math.max(1.5, 2 / Math.max(globalScale, 0.001));
+      const selR = r * 9;
+      const selGrad = ctx.createRadialGradient(x, y, 0, x, y, selR);
+      selGrad.addColorStop(0, glow + '0.4)');
+      selGrad.addColorStop(1, glow + '0)');
+      ctx.fillStyle = selGrad;
+      ctx.fillRect(x - selR, y - selR, selR * 2, selR * 2);
+      ctx.strokeStyle = 'rgba(255, 255, 255, 0.95)';
+      ctx.lineWidth = Math.max(2.5, 3 / Math.max(globalScale, 0.001));
       ctx.beginPath();
-      ctx.arc(x, y, r + 1, 0, Math.PI * 2);
+      ctx.arc(x, y, r + 1.5, 0, Math.PI * 2);
       ctx.stroke();
-      ctx.shadowBlur = 20;
+      ctx.shadowBlur = 24;
       ctx.shadowColor = '#ffffff';
       ctx.stroke();
       ctx.shadowBlur = 0;
     } else if (isHovered) {
-      // Subtle hover ring.
-      ctx.strokeStyle = 'rgba(255, 255, 255, 0.35)';
-      ctx.lineWidth = Math.max(1, 1 / Math.max(globalScale, 0.001));
+      // Hover ring — slightly brighter (visible against intense halo).
+      ctx.strokeStyle = 'rgba(255, 255, 255, 0.55)';
+      ctx.lineWidth = Math.max(1.5, 1.5 / Math.max(globalScale, 0.001));
       ctx.beginPath();
-      ctx.arc(x, y, r + 0.5, 0, Math.PI * 2);
+      ctx.arc(x, y, r + 1, 0, Math.PI * 2);
       ctx.stroke();
     }
   }
 
-  // Edge painter: opacity ~ p_follow, width ~ log(co_occurrences).
-  function paintEdge(edge, ctx) {
+  // Edge painter: 3x more opaque than before, 2x thicker; ambre tint when incident on selection.
+  function paintEdge(edge, ctx, selectedId) {
     const s = edge.source;
     const t = edge.target;
     if (!s || !t || typeof s.x !== 'number' || typeof t.x !== 'number') return;
     const p = typeof edge.p_follow === 'number' ? edge.p_follow : 0.5;
-    const alpha = 0.05 + p * 0.15;
     const co = edge.co_occurrences || 1;
-    const width = Math.max(0.5, Math.log(co + 1) * 0.4);
-    ctx.strokeStyle = 'rgba(255, 255, 255, ' + alpha.toFixed(3) + ')';
+    // Incident-on-selection edges get amber tint + much higher opacity + 1.5x width.
+    const sId = (s && s.id !== undefined) ? s.id : s;
+    const tId = (t && t.id !== undefined) ? t.id : t;
+    const incident = selectedId && (sId === selectedId || tId === selectedId);
+    let alpha;
+    let stroke;
+    let width = Math.max(1.0, Math.log(co + 1) * 0.8);
+    if (incident) {
+      alpha = 0.9;
+      stroke = 'rgba(245, 158, 11, ' + alpha.toFixed(3) + ')';
+      width *= 1.5;
+    } else {
+      alpha = 0.18 + p * 0.45;
+      stroke = 'rgba(255, 255, 255, ' + alpha.toFixed(3) + ')';
+    }
+    ctx.strokeStyle = stroke;
     ctx.lineWidth = width;
     ctx.beginPath();
     ctx.moveTo(s.x, s.y);
@@ -114,13 +146,36 @@
     const allNodes = Array.isArray(wg.nodes) ? wg.nodes : [];
     const allEdges = Array.isArray(wg.edges) ? wg.edges : [];
 
-    // Top-N nodes by trades_24h desc (default 500), or all if showAll.
+    // Step 1: pick top-N leaders by trades_24h (1500 default, 3000 on "show all").
+    // Step 2: add connected followers (nodes linked to leaders by any edge) — even if
+    // they didn't make the trades_24h cut. This is what makes clusters readable.
     const visibleNodes = React.useMemo(() => {
-      if (showAll) return allNodes;
-      if (allNodes.length <= DEFAULT_TOP_N) return allNodes;
-      const sorted = allNodes.slice().sort((a, b) => (b.trades_24h || 0) - (a.trades_24h || 0));
-      return sorted.slice(0, DEFAULT_TOP_N);
-    }, [allNodes, showAll]);
+      if (!allNodes.length) return [];
+      const cap = showAll ? SHOW_ALL_TOP_N : DEFAULT_TOP_N;
+      const sortedByActivity = allNodes.slice().sort((a, b) => (b.trades_24h || 0) - (a.trades_24h || 0));
+      const leaders = sortedByActivity.slice(0, cap);
+      const leaderSet = new Set(leaders.map((n) => n.id));
+      // Walk edges once: collect IDs of followers connected to any leader.
+      const connectedFollowers = new Set();
+      for (let i = 0; i < allEdges.length; i++) {
+        const e = allEdges[i];
+        const hasS = leaderSet.has(e.source);
+        const hasT = leaderSet.has(e.target);
+        if (hasS && !hasT) connectedFollowers.add(e.target);
+        else if (hasT && !hasS) connectedFollowers.add(e.source);
+      }
+      if (!connectedFollowers.size) return leaders;
+      const visibleSet = new Set(leaderSet);
+      const extras = [];
+      for (let i = 0; i < allNodes.length; i++) {
+        const n = allNodes[i];
+        if (!visibleSet.has(n.id) && connectedFollowers.has(n.id)) {
+          extras.push(n);
+          visibleSet.add(n.id);
+        }
+      }
+      return leaders.concat(extras);
+    }, [allNodes, allEdges, showAll]);
 
     const visibleNodeIds = React.useMemo(() => {
       const s = new Set();
@@ -161,10 +216,18 @@
       };
     }, []);
 
-    // Fit view once data has settled.
+    // Tune d3-force on first data settle: more repulsion + more friction = tighter, distinct clusters.
     React.useEffect(() => {
       const fg = fgRef.current;
       if (!fg || !graphData.nodes.length) return;
+      try {
+        const chargeForce = fg.d3Force && fg.d3Force('charge');
+        if (chargeForce && typeof chargeForce.strength === 'function') chargeForce.strength(-120);
+        const linkForce = fg.d3Force && fg.d3Force('link');
+        if (linkForce && typeof linkForce.distance === 'function') linkForce.distance(40);
+        const centerForce = fg.d3Force && fg.d3Force('center');
+        if (centerForce && typeof centerForce.strength === 'function') centerForce.strength(0.06);
+      } catch (_e) { /* ignore — fg API may not be ready yet */ }
       const t = setTimeout(() => {
         try { fg.zoomToFit(400, 80); } catch (_e) { /* ignore */ }
       }, 800);
@@ -235,9 +298,22 @@
               borderRadius: 4,
             },
           },
-          'Show all ' + totalNodes + ' nodes →'
+          'Show top ' + Math.min(SHOW_ALL_TOP_N, totalNodes) + ' →'
         )
       : null;
+
+    // Legend swatch — small color dot + label.
+    const swatch = (color, label) => React.createElement(
+      'span',
+      { style: { display: 'inline-flex', alignItems: 'center', gap: 4, marginRight: 8 } },
+      React.createElement('span', {
+        style: {
+          width: 7, height: 7, borderRadius: '50%',
+          background: color, boxShadow: '0 0 6px ' + color,
+        },
+      }),
+      React.createElement('span', { style: { color: '#c4ccd8' } }, label)
+    );
 
     const statsHud = React.createElement(
       'div',
@@ -245,7 +321,7 @@
         style: {
           position: 'absolute', top: 12, left: 12, zIndex: 5,
           padding: '6px 10px',
-          background: 'rgba(10,14,26,0.6)',
+          background: 'rgba(10,14,26,0.7)',
           border: '1px solid rgba(255,255,255,0.08)',
           color: '#94a8d6',
           fontFamily: 'JetBrains Mono, monospace',
@@ -255,9 +331,21 @@
           backdropFilter: 'blur(6px)',
           WebkitBackdropFilter: 'blur(6px)',
           borderRadius: 3,
+          display: 'flex',
+          flexDirection: 'column',
+          gap: 4,
         },
       },
-      'nodes ' + visibleNodes.length + (showAll ? '' : '/' + totalNodes) + ' · edges ' + visibleEdges.length
+      React.createElement('div', null,
+        'nodes ' + visibleNodes.length + (showAll ? '' : '/' + totalNodes) +
+        ' · edges ' + visibleEdges.length
+      ),
+      React.createElement('div', { style: { display: 'flex', flexWrap: 'wrap' } },
+        swatch('#3b82f6', 'P1'),
+        swatch('#f59e0b', 'P2'),
+        swatch('#10b981', 'P3'),
+        swatch('#a78bfa', 'Follower')
+      )
     );
 
     return React.createElement(
@@ -278,7 +366,7 @@
             hoverNode && node.id === hoverNode.id
           ),
         nodeCanvasObjectMode: () => 'replace',
-        linkCanvasObject: (edge, ctx) => paintEdge(edge, ctx),
+        linkCanvasObject: (edge, ctx) => paintEdge(edge, ctx, selectedId),
         linkCanvasObjectMode: () => 'replace',
         nodePointerAreaPaint: (node, color, ctx) => {
           const r = getNodeRadius(node) + 5;
@@ -290,9 +378,11 @@
         onNodeClick: handleNodeClick,
         onNodeHover: handleNodeHover,
         backgroundColor: 'rgba(0,0,0,0)',
-        cooldownTicks: 100,
-        d3AlphaDecay: 0.02,
-        d3VelocityDecay: 0.3,
+        // Tighter clustering: more friction + longer cooldown lets clusters form properly.
+        cooldownTicks: 300,
+        d3AlphaDecay: 0.0228,
+        d3VelocityDecay: 0.55,
+        nodeRelSize: 6,
         enableNodeDrag: false,
         warmupTicks: 20,
       }),

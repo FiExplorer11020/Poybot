@@ -106,16 +106,17 @@
           maxHeight: 'calc(100% - 32px)',
           overflowY: 'auto',
           overflowX: 'hidden',
-          background: 'rgba(10, 14, 26, 0.85)',
+          background: 'rgba(10, 14, 26, 0.92)',
           backdropFilter: 'blur(8px)',
           WebkitBackdropFilter: 'blur(8px)',
           border: '1px solid rgba(255, 255, 255, 0.12)',
-          borderLeft: '2px solid ' + phaseColor,
+          borderLeft: '4px solid ' + phaseColor,
           borderRadius: 2,
           padding: 14,
           zIndex: 10,
           fontFamily: 'JetBrains Mono, monospace',
-          boxShadow: '0 8px 32px rgba(0, 0, 0, 0.4)',
+          // 0 0 24px phase-tinted glow gives the panel its own ambient halo.
+          boxShadow: '0 8px 32px rgba(0, 0, 0, 0.4), 0 0 24px ' + phaseColor + '66',
           transform: mounted ? 'translateX(0)' : 'translateX(-20px)',
           opacity: mounted ? 1 : 0,
           transition: 'transform 300ms ease-out, opacity 200ms ease-out',
@@ -247,7 +248,7 @@
             e.currentTarget.style.boxShadow = 'none';
           }}
         >
-          ▶ Show transfers
+          ▶ Inspect wallet
         </button>
       </div>
     );

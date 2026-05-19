@@ -3,8 +3,8 @@
 // Ambient stars + nebula. Pure canvas, no deps. Respects reduced-motion.
 
 (function() {
-  const NUM_STARS = 150;
-  const NUM_PLANETS = 6;
+  const NUM_STARS = 250;
+  const NUM_PLANETS = 10;
 
   function generateStars(width, height) {
     const stars = [];
@@ -89,11 +89,18 @@
         ctx.fillStyle = grad;
         ctx.fillRect(0, 0, w, h);
 
-        // 1b. Nebula subtle bottom-right (violet glow)
+        // 1b. Nebula bottom-right (violet glow, much more visible than before)
         const nebula = ctx.createRadialGradient(w * 0.85, h * 0.85, 0, w * 0.85, h * 0.85, Math.max(w, h) * 0.5);
-        nebula.addColorStop(0, 'rgba(167, 139, 250, 0.05)');
+        nebula.addColorStop(0, 'rgba(167, 139, 250, 0.12)');
         nebula.addColorStop(1, 'rgba(167, 139, 250, 0)');
         ctx.fillStyle = nebula;
+        ctx.fillRect(0, 0, w, h);
+
+        // 1c. Second nebula top-left (cyan, subtle — adds depth on the opposite corner)
+        const nebula2 = ctx.createRadialGradient(w * 0.15, h * 0.15, 0, w * 0.15, h * 0.15, Math.max(w, h) * 0.45);
+        nebula2.addColorStop(0, 'rgba(96, 165, 250, 0.06)');
+        nebula2.addColorStop(1, 'rgba(96, 165, 250, 0)');
+        ctx.fillStyle = nebula2;
         ctx.fillRect(0, 0, w, h);
 
         // 2. Planets (subtle radial gradients, decorative)
