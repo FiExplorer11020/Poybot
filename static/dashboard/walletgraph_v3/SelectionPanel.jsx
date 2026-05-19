@@ -184,8 +184,13 @@
         {cats && cats.length > 0 && (
           <div style={{ marginBottom: 12 }}>
             <div style={{ ...labelStyle, marginBottom: 6 }}>Categories</div>
-            {cats.slice(0, 3).map(function(c) {
-              return <CategoryBar key={c.name} name={c.name} pct={c.pct || 0} color={phaseColor} />;
+            {cats.slice(0, 3).map(function(c, i) {
+              // Backend ships {category, trades, pct} (see queries.py top_cats_by_wallet
+              // + category_breakdown). Earlier code mis-read c.name → undefined keys
+              // collided across the 3 children → React warned. Use category + index
+              // to stay unique even if a category somehow repeats.
+              var catName = c.category || c.name || 'unknown';
+              return <CategoryBar key={catName + '-' + i} name={catName} pct={c.pct || 0} color={phaseColor} />;
             })}
           </div>
         )}
