@@ -1356,25 +1356,21 @@ async def api_overview():
 
     # --- Bot block (light — no terminal snapshot needed) ---------------- #
     health = await _health_checks()
-    # Process uptime — B3 fix (2026-05-19): prefer the engine-boot
-    # timestamp persisted in Redis (`bot:engine:started_at`, set by
-    # `src/engine/main.py`) so the value survives API container restarts.
-    # The API container is short-lived (frequent rebuilds); the engine
-    # container is the source-of-truth for "bot has been running for X
-    # seconds". Fallback: API module-load time, then 0.
-    uptime_seconds = 0
+    # Process uptime — B3v2 fix (2026-05-19): routed through the shared
+    # `src.control.uptime.get_bot_uptime_seconds` helper so the live API
+    # path and the maintenance snapshot builder return the same value.
+    # The helper prefers `bot:engine:started_at` Redis (canonical, set by
+    # the engine container) and falls back to `_api_started_at` (API
+    # module load time) when Redis is unavailable.
     try:
-        if _redis is not None:
-            engine_ts_raw = await _redis.get("bot:engine:started_at")
-            if engine_ts_raw is not None:
-                uptime_seconds = max(0, int(time.time() - float(engine_ts_raw)))
+        from src.control.uptime import get_bot_uptime_seconds
+
+        uptime_seconds = await get_bot_uptime_seconds(
+            _redis, fallback_started_at=_api_started_at
+        )
     except Exception as exc:
-        logger.warning(f"uptime: failed to read bot:engine:started_at: {exc}")
-    if uptime_seconds == 0:
-        try:
-            uptime_seconds = int((datetime.now(timezone.utc) - _api_started_at).total_seconds())
-        except Exception:
-            uptime_seconds = 0
+        logger.warning(f"uptime: helper raised: {exc}")
+        uptime_seconds = 0
     # `_health_checks()` exposes booleans under keys 'db' + 'redis'
     # (not 'database'). Treat the bot as 'running' if both backends
     # respond AND the WS hasn't gone silent (last message < 60s ago).

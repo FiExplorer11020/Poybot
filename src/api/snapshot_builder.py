@@ -376,9 +376,20 @@ async def _build_locked(pool, redis_client) -> dict[str, Any]:
     # Runtime metadata — the maintenance container is the writer of
     # this snapshot, but the dashboard reads from the cached payload
     # so the timestamp here reflects when *this build* happened.
+    # B3v2 fix (2026-05-19): use the shared `get_bot_uptime_seconds`
+    # helper so the maintenance-built snapshot exposes the same engine
+    # uptime as the live API path (was hardcoded to 0 here, producing
+    # "Uptime: 0s" flashes whenever the cached snapshot was served).
+    try:
+        from src.control.uptime import get_bot_uptime_seconds
+
+        uptime_seconds = await get_bot_uptime_seconds(redis_client)
+    except Exception as exc:
+        logger.warning(f"snapshot_builder: uptime helper failed: {exc}")
+        uptime_seconds = 0
     runtime = {
         "started_at": datetime.now(timezone.utc).isoformat(),
-        "uptime_seconds": 0,
+        "uptime_seconds": uptime_seconds,
         "cycle_latency_ms": 0.0,
         "last_command_at": None,
         "control_available": True,

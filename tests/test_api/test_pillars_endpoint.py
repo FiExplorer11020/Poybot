@@ -46,6 +46,8 @@ def test_age_seconds_naive_aware_datetime():
 @pytest.mark.asyncio
 async def test_oracle_ok_with_recent_quotes():
     conn = MagicMock()
+    # B-OracleFP: closed_paper_24h > 0 → normal path (not warming up)
+    conn.fetchval = AsyncMock(return_value=12)
     conn.fetchrow = AsyncMock(return_value={
         "quotes_24h": 42,
         "last_quote_at": datetime.now(timezone.utc) - timedelta(seconds=60),
@@ -59,6 +61,9 @@ async def test_oracle_ok_with_recent_quotes():
 @pytest.mark.asyncio
 async def test_oracle_not_ok_when_no_quotes_24h():
     conn = MagicMock()
+    # closed_paper_24h > 0 (paper closes happened) but oracle produced
+    # 0 quotes → real DEGRADED, not warming up.
+    conn.fetchval = AsyncMock(return_value=5)
     conn.fetchrow = AsyncMock(return_value={"quotes_24h": 0, "last_quote_at": None})
     result = await pq._check_oracle(conn)
     assert result["ok"] is False
@@ -68,10 +73,25 @@ async def test_oracle_not_ok_when_no_quotes_24h():
 @pytest.mark.asyncio
 async def test_oracle_handles_missing_table_gracefully():
     conn = MagicMock()
+    conn.fetchval = AsyncMock(return_value=1)  # at least one close attempted
     conn.fetchrow = AsyncMock(side_effect=Exception("relation does not exist"))
     result = await pq._check_oracle(conn)
     assert result["ok"] is False
     assert "table missing" in result["detail"]
+
+
+@pytest.mark.asyncio
+async def test_oracle_warming_up_when_no_paper_closes():
+    """B-OracleFP: when paper_trader hasn't closed anything in 24h, the
+    oracle's 0 quotes is expected — surface as warming-up (ok=True)
+    rather than red-flagging the operator with a phantom failure."""
+    conn = MagicMock()
+    conn.fetchval = AsyncMock(return_value=0)  # no paper closes in 24h
+    conn.fetchrow = AsyncMock(return_value={"quotes_24h": 0, "last_quote_at": None})
+    result = await pq._check_oracle(conn)
+    assert result["ok"] is True
+    assert "WARMING UP" in result["detail"]
+    assert result["quotes_24h"] == 0
 
 
 @pytest.mark.asyncio
@@ -198,7 +218,9 @@ async def test_pillars_status_all_pillars_present():
         {"rows_24h": 10, "fallback_24h": 0, "fail_24h": 0},
     ])
     conn.fetchval = AsyncMock(side_effect=[
-        datetime.now(timezone.utc) - timedelta(seconds=300),  # last_run_at
+        # B-OracleFP: oracle now calls fetchval first (closed_paper_24h)
+        8,   # closed_paper_24h (for oracle warming-up branch)
+        datetime.now(timezone.utc) - timedelta(seconds=300),  # last_run_at (recon)
         2,   # divergences_24h
         8,   # closed_paper_24h (for recon)
         8,   # closed_paper_24h (for audit_log)
@@ -216,7 +238,7 @@ async def test_pillars_status_all_pillars_present():
 async def test_pillars_status_overall_ok_is_and_of_individual():
     """Toggling any single pillar to fail flips overall_ok to False."""
     conn = MagicMock()
-    # oracle FAILS (no quotes)
+    # oracle FAILS (no quotes BUT closes happened → real DEGRADED)
     conn.fetchrow = AsyncMock(side_effect=[
         {"quotes_24h": 0, "last_quote_at": None},     # oracle FAIL
         {"resolved": 100, "pending": 2},               # backfill OK
@@ -224,7 +246,9 @@ async def test_pillars_status_overall_ok_is_and_of_individual():
         {"rows_24h": 10, "fallback_24h": 0, "fail_24h": 0},  # audit OK
     ])
     conn.fetchval = AsyncMock(side_effect=[
-        datetime.now(timezone.utc) - timedelta(seconds=300),
+        # B-OracleFP: closed_paper_24h > 0 forces the normal (non-warming) path
+        5,                                                     # oracle closed_paper_24h
+        datetime.now(timezone.utc) - timedelta(seconds=300),   # last_run_at (recon)
         2, 8, 8,
     ])
     result = await pq.pillars_status(conn)
