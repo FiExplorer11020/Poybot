@@ -5,10 +5,12 @@
 // Composes window.WG_V3.BackgroundAmbient (WG-A3) when available.
 // Click on node fires onSelect(nodeData) prop (wired by WG-A6 to SelectionPanel).
 //
-// WG-BUBBLE: BubbleMaps-style layout. Top supernodes pinned in a circle around
-// the viewport center, followers pulled toward their leader via a custom force,
-// no quadrant clustering (the previous phaseCluster + tight collide combo collapsed
-// everything into a concentric disc). Density gated by a 4-step "Top N" cycle.
+// WG-DISCOVERY: BubbleMaps-style 3-mode visualizer.
+//   - discovery: leaders only (top-100 default), edges leader↔leader only,
+//                p_follow ≥ 0.7. Tighter forces (no leaderPull needed).
+//   - network:   top-200 leaders + top-3 followers each, edges p_follow ≥ 0.6.
+//   - full:      top-N leaders + ALL connected followers, no edge filter.
+// 6 supernodes pinned in a hexagon at radius 500; top-30 leaders labeled.
 
 (function () {
   'use strict';
@@ -21,11 +23,40 @@
   const FOLLOWER_COLOR = { core: '#a78bfa', glow: 'rgba(167, 139, 250, ' };
   const EXCLUDED_COLOR = { core: '#475569', glow: 'rgba(71, 85, 105, ' };
 
-  // 4-step density cycle: 50 → 200 → 500 → 3000 → 50 …
-  const TOP_N_CYCLE = [50, 200, 500, 3000];
-  const DEFAULT_TOP_N_INDEX = 1; // start at 200 leaders by default
-  const SUPER_COUNT = 10;        // top-K supernodes pinned in a circle
-  const SUPER_RADIUS = 350;      // px radius for the pinned circle
+  // WG-DISCOVERY: 3-mode toggle with per-mode density cycles.
+  const VIEW_MODES = ['discovery', 'network', 'full'];
+  const DEFAULT_MODE = 'discovery';
+  const DENSITY_CYCLES = {
+    discovery: [50, 100, 200],
+    network:   [100, 200, 500],
+    full:      [200, 500, 3000],
+  };
+  const DEFAULT_DENSITY_INDEX = {
+    discovery: 1,  // 100
+    network:   1,  // 200
+    full:      1,  // 500
+  };
+  const MODE_BADGE = {
+    discovery: { icon: '◐', label: 'Discovery', color: '#3b82f6' },
+    network:   { icon: '◑', label: 'Network',   color: '#f59e0b' },
+    full:      { icon: '◉', label: 'Full',      color: '#10b981' },
+  };
+
+  // Top-6 supernodes pinned in a hexagon at radius 500 (was 10 @ 350).
+  const SUPER_COUNT = 6;
+  const SUPER_RADIUS = 500;
+  const LABEL_TOP_N = 30; // label the top-30 leaders, not just supernodes
+
+  // Per-mode force tuning. Discovery has no followers so we can tighten
+  // charge + link distance; network/full keep the leaderPull custom force.
+  const FORCES_BY_MODE = {
+    discovery: { charge: -400, linkDist: 120, linkStrength: 0.5,  useLeaderPull: false },
+    network:   { charge: -250, linkDist: 70,  linkStrength: 0.55, useLeaderPull: true  },
+    full:      { charge: -200, linkDist: 50,  linkStrength: 0.6,  useLeaderPull: true  },
+  };
+
+  // Edge filter thresholds per mode (p_follow floor).
+  const MIN_PFOLLOW_BY_MODE = { discovery: 0.7, network: 0.6, full: 0 };
 
   function getNodeColor(node) {
     if (node.exclude_reason) return EXCLUDED_COLOR;
@@ -33,13 +64,15 @@
     return PHASE_COLORS[node.phase] || PHASE_COLORS[1];
   }
 
-  // Power 0.55 (vs sqrt) + larger range [4, 24] amplifies whale vs small visual gap.
+  // Supernodes get 2× size for prominence (vs siblings on the hexagon).
   function getNodeRadius(node) {
     const t24 = (node && node.trades_24h) || 1;
-    return Math.max(4, Math.min(24, Math.pow(t24, 0.55) * 2.0));
+    const base = Math.max(4, Math.min(24, Math.pow(t24, 0.55) * 2.0));
+    return (node && node._isSupernode) ? base * 2.0 : base;
   }
 
-  // 4-layer node painter: outer-glow (r*6) + halo (r*3) + inner-glow (r*1.6) + core w/ stroke.
+  // 4-layer node painter: outer-glow + halo + inner-glow + core.
+  // Supernodes also get a permanent white ring (r+2).
   function paintNode(node, ctx, globalScale, isSelected, isHovered) {
     if (typeof node.x !== 'number' || typeof node.y !== 'number') return;
     const { core, glow } = getNodeColor(node);
@@ -56,14 +89,14 @@
     ctx.fillStyle = outerGrad;
     ctx.fillRect(x - outerR, y - outerR, outerR * 2, outerR * 2);
 
-    // 2) Halo (medium — r*3, much more intense than before).
+    // 2) Halo (medium — r*3).
     const haloGrad = ctx.createRadialGradient(x, y, 0, x, y, r * 3);
     haloGrad.addColorStop(0, glow + '0.55)');
     haloGrad.addColorStop(1, glow + '0)');
     ctx.fillStyle = haloGrad;
     ctx.fillRect(x - r * 3, y - r * 3, r * 6, r * 6);
 
-    // 3) Inner glow (tight, near-opaque core bleed).
+    // 3) Inner glow.
     const glowGrad = ctx.createRadialGradient(x, y, 0, x, y, r * 1.6);
     glowGrad.addColorStop(0, glow + '0.85)');
     glowGrad.addColorStop(1, glow + '0.5)');
@@ -72,7 +105,7 @@
     ctx.arc(x, y, r * 1.6, 0, Math.PI * 2);
     ctx.fill();
 
-    // 4) Solid core + subtle 1px white outline (gives nodes physical edge).
+    // 4) Solid core + 1px white outline.
     ctx.fillStyle = core;
     ctx.beginPath();
     ctx.arc(x, y, r, 0, Math.PI * 2);
@@ -81,7 +114,16 @@
     ctx.lineWidth = 1;
     ctx.stroke();
 
-    // 5) Selected: big aura (r*9) + thick white ring.
+    // 4b) Supernode ring — permanent, sits just outside the core.
+    if (node._isSupernode) {
+      ctx.strokeStyle = 'rgba(255, 255, 255, 0.65)';
+      ctx.lineWidth = 2 / Math.max(globalScale, 0.001);
+      ctx.beginPath();
+      ctx.arc(x, y, r + 2 / Math.max(globalScale, 0.001), 0, Math.PI * 2);
+      ctx.stroke();
+    }
+
+    // 5) Selected: big aura + thick white ring.
     if (isSelected) {
       const selR = r * 9;
       const selGrad = ctx.createRadialGradient(x, y, 0, x, y, selR);
@@ -99,7 +141,6 @@
       ctx.stroke();
       ctx.shadowBlur = 0;
     } else if (isHovered) {
-      // Hover ring — slightly brighter (visible against intense halo).
       ctx.strokeStyle = 'rgba(255, 255, 255, 0.55)';
       ctx.lineWidth = Math.max(1.5, 1.5 / Math.max(globalScale, 0.001));
       ctx.beginPath();
@@ -107,8 +148,8 @@
       ctx.stroke();
     }
 
-    // 6) Supernode label (top-10 by degree only — keeps the canvas readable).
-    if (node._isSupernode) {
+    // 6) Label — supernodes always, top-30 leaders also when _labeled is set.
+    if (node._isSupernode || node._labeled) {
       const label = node.label || (typeof node.id === 'string'
         ? (node.id.slice(0, 6) + '…' + node.id.slice(-4))
         : String(node.id));
@@ -117,7 +158,6 @@
       ctx.font = fontPx + 'px JetBrains Mono, monospace';
       ctx.textAlign = 'center';
       ctx.textBaseline = 'top';
-      // Subtle shadow so labels read on dark + bright glow.
       ctx.shadowBlur = 6;
       ctx.shadowColor = 'rgba(0, 0, 0, 0.7)';
       ctx.fillText(label, x, y + r + 6 / Math.max(globalScale, 0.001));
@@ -125,14 +165,13 @@
     }
   }
 
-  // Edge painter: amped opacity (we display far fewer edges now), ambre on selection.
+  // Edge painter: amped opacity, amber on selection.
   function paintEdge(edge, ctx, selectedId) {
     const s = edge.source;
     const t = edge.target;
     if (!s || !t || typeof s.x !== 'number' || typeof t.x !== 'number') return;
     const p = typeof edge.p_follow === 'number' ? edge.p_follow : 0.5;
     const co = edge.co_occurrences || 1;
-    // Incident-on-selection edges get amber tint + much higher opacity + 1.5x width.
     const sId = (s && s.id !== undefined) ? s.id : s;
     const tId = (t && t.id !== undefined) ? t.id : t;
     const incident = selectedId && (sId === selectedId || tId === selectedId);
@@ -144,7 +183,6 @@
       stroke = 'rgba(245, 158, 11, ' + alpha.toFixed(3) + ')';
       width *= 1.5;
     } else {
-      // WG-BUBBLE: bumped to 0.28..0.88 — fewer edges visible means each one must read.
       alpha = 0.28 + p * 0.6;
       stroke = 'rgba(255, 255, 255, ' + alpha.toFixed(3) + ')';
     }
@@ -167,16 +205,33 @@
     const [size, setSize] = React.useState({ w: 800, h: 600 });
     const [hoverNode, setHoverNode] = React.useState(null);
     const [selectedId, setSelectedId] = React.useState(null);
-    // Density cycle index (0..3 → 50, 200, 500, 3000 leaders). Defaults to 200.
-    const [topNIndex, setTopNIndex] = React.useState(DEFAULT_TOP_N_INDEX);
-    const currentTopN = TOP_N_CYCLE[topNIndex];
+
+    // WG-DISCOVERY: viewing mode + per-mode density index.
+    const [mode, setMode] = React.useState(DEFAULT_MODE);
+    const [densityIndex, setDensityIndex] = React.useState(
+      DEFAULT_DENSITY_INDEX[DEFAULT_MODE]
+    );
+
+    // When mode flips, reset density to the per-mode default.
+    React.useEffect(() => {
+      setDensityIndex(DEFAULT_DENSITY_INDEX[mode]);
+    }, [mode]);
+
+    const currentDensityCycle = DENSITY_CYCLES[mode];
+    const densityN = currentDensityCycle[densityIndex % currentDensityCycle.length];
 
     const wg = (snapshot && snapshot.wallet_graph) || {};
     const allNodes = Array.isArray(wg.nodes) ? wg.nodes : [];
     const allEdges = Array.isArray(wg.edges) ? wg.edges : [];
 
-    // Degree = number of edges where the node is the SOURCE (leader → follower
-    // edges in this graph). Used to rank leaders + pick supernodes.
+    // Build an id → node lookup for O(1) role checks during edge filtering.
+    const allNodesById = React.useMemo(() => {
+      const m = new Map();
+      for (let i = 0; i < allNodes.length; i++) m.set(allNodes[i].id, allNodes[i]);
+      return m;
+    }, [allNodes]);
+
+    // Degree by leader id — used to rank supernodes and visible leaders.
     const degreeByLeader = React.useMemo(() => {
       const map = new Map();
       for (let i = 0; i < allEdges.length; i++) {
@@ -188,92 +243,133 @@
       return map;
     }, [allEdges]);
 
-    // Visible scope: top-N leaders by degree (followers count) + their connected
-    // followers. Followers without a visible leader are dropped.
-    const visibleNodes = React.useMemo(() => {
+    // Pre-rank all leaders by degree (then trades_24h tiebreak).
+    const rankedLeaders = React.useMemo(() => {
       if (!allNodes.length) return [];
-      // Leaders = nodes that appear as a source in any edge.
       const leaderPool = allNodes.filter((n) => degreeByLeader.has(n.id));
-      // Fallback: if degree map is empty (edges don't reference ids yet),
-      // fall back to all nodes ranked by trades_24h to avoid a black canvas.
-      const ranked = (leaderPool.length ? leaderPool : allNodes.slice()).sort((a, b) => {
+      const pool = leaderPool.length ? leaderPool : allNodes.slice();
+      return pool.sort((a, b) => {
         const da = degreeByLeader.get(a.id) || 0;
         const db = degreeByLeader.get(b.id) || 0;
         if (db !== da) return db - da;
         return (b.trades_24h || 0) - (a.trades_24h || 0);
       });
-      const leaders = ranked.slice(0, currentTopN);
-      const leaderSet = new Set(leaders.map((n) => n.id));
+    }, [allNodes, degreeByLeader]);
 
-      // Add followers connected to any visible leader.
-      const connectedFollowers = new Set();
+    // WG-DISCOVERY: mode-aware visible node selection.
+    //   discovery → top-N leaders, no followers
+    //   network   → top-N leaders + each leader's top-3 followers (by p_follow)
+    //   full      → top-N leaders + ALL connected followers
+    const visibleScope = React.useMemo(() => {
+      if (!rankedLeaders.length) return { ids: new Set(), leaders: [] };
+      const leaders = rankedLeaders.slice(0, densityN);
+      const leaderIds = new Set(leaders.map((n) => n.id));
+
+      if (mode === 'discovery') {
+        return { ids: leaderIds, leaders: leaders };
+      }
+
+      if (mode === 'network') {
+        // Per leader, pick top-3 edges by p_follow → collect those follower ids.
+        const followers = new Set();
+        const edgesByLeader = new Map();
+        for (let i = 0; i < allEdges.length; i++) {
+          const e = allEdges[i];
+          const sid = (e.source && e.source.id !== undefined) ? e.source.id : e.source;
+          const tid = (e.target && e.target.id !== undefined) ? e.target.id : e.target;
+          if (!leaderIds.has(sid)) continue;
+          if (leaderIds.has(tid)) continue; // leader→leader handled in edge step
+          let arr = edgesByLeader.get(sid);
+          if (!arr) { arr = []; edgesByLeader.set(sid, arr); }
+          arr.push({ tid: tid, p: e.p_follow || 0 });
+        }
+        edgesByLeader.forEach(function (arr) {
+          arr.sort(function (a, b) { return b.p - a.p; });
+          for (let j = 0; j < Math.min(3, arr.length); j++) {
+            followers.add(arr[j].tid);
+          }
+        });
+        const ids = new Set(leaderIds);
+        followers.forEach(function (fid) { ids.add(fid); });
+        return { ids: ids, leaders: leaders };
+      }
+
+      // full mode → all connected followers.
+      const followers = new Set();
       for (let i = 0; i < allEdges.length; i++) {
         const e = allEdges[i];
         const sid = (e.source && e.source.id !== undefined) ? e.source.id : e.source;
         const tid = (e.target && e.target.id !== undefined) ? e.target.id : e.target;
-        if (leaderSet.has(sid) && !leaderSet.has(tid)) connectedFollowers.add(tid);
-        else if (leaderSet.has(tid) && !leaderSet.has(sid)) connectedFollowers.add(sid);
+        if (leaderIds.has(sid) && !leaderIds.has(tid)) followers.add(tid);
+        else if (leaderIds.has(tid) && !leaderIds.has(sid)) followers.add(sid);
       }
-      if (!connectedFollowers.size) return leaders;
-      const visibleSet = new Set(leaderSet);
+      const ids = new Set(leaderIds);
+      followers.forEach(function (fid) { ids.add(fid); });
+      return { ids: ids, leaders: leaders };
+    }, [rankedLeaders, allEdges, mode, densityN]);
+
+    // Materialize the visible node list (leaders first, then followers).
+    const visibleNodes = React.useMemo(() => {
+      if (!visibleScope.ids.size) return [];
+      const leaderIdSet = new Set(visibleScope.leaders.map((n) => n.id));
       const extras = [];
       for (let i = 0; i < allNodes.length; i++) {
         const n = allNodes[i];
-        if (!visibleSet.has(n.id) && connectedFollowers.has(n.id)) {
-          extras.push(n);
-          visibleSet.add(n.id);
-        }
+        if (visibleScope.ids.has(n.id) && !leaderIdSet.has(n.id)) extras.push(n);
       }
-      return leaders.concat(extras);
-    }, [allNodes, allEdges, degreeByLeader, currentTopN]);
+      return visibleScope.leaders.concat(extras);
+    }, [allNodes, visibleScope]);
 
-    const visibleNodeIds = React.useMemo(() => {
-      const s = new Set();
-      for (let i = 0; i < visibleNodes.length; i++) s.add(visibleNodes[i].id);
-      return s;
-    }, [visibleNodes]);
-
+    // Edge filter: mode-specific p_follow floor + leader↔leader-only in discovery.
     const visibleEdges = React.useMemo(() => {
       if (!allEdges.length) return [];
+      const minP = MIN_PFOLLOW_BY_MODE[mode];
       return allEdges.filter((e) => {
         const sid = (e.source && e.source.id !== undefined) ? e.source.id : e.source;
         const tid = (e.target && e.target.id !== undefined) ? e.target.id : e.target;
-        return visibleNodeIds.has(sid) && visibleNodeIds.has(tid);
+        if (!visibleScope.ids.has(sid) || !visibleScope.ids.has(tid)) return false;
+        if (mode === 'discovery') {
+          // Only leader↔leader edges. Followers were excluded from scope.ids
+          // already, but defensively check the role too.
+          const sNode = allNodesById.get(sid);
+          const tNode = allNodesById.get(tid);
+          if ((sNode && sNode.role === 'follower') ||
+              (tNode && tNode.role === 'follower')) return false;
+        }
+        return (e.p_follow || 0) >= minP;
       });
-    }, [allEdges, visibleNodeIds]);
+    }, [allEdges, visibleScope, mode, allNodesById]);
 
     // ForceGraph2D mutates link.source/target into objects; spread to avoid touching upstream.
-    // We also stamp the top supernodes here so the painter can label them, and we
-    // pre-pin their fx/fy on the circle so the simulation respects the bubble layout.
+    // We stamp the top-6 supernodes (hexagon @ radius 500) and mark the top-30
+    // leaders for labeling. Non-supernodes get any stale fx/fy wiped.
     const graphData = React.useMemo(() => {
       const supernodeIds = new Set();
-      // Identify the top supernodes (highest degree first) among the visible
-      // leaders. We rebuild a ranking from the visible set so the choice is
-      // stable across density toggles.
       const visibleByDegree = visibleNodes
         .filter((n) => degreeByLeader.has(n.id))
         .sort((a, b) => (degreeByLeader.get(b.id) || 0) - (degreeByLeader.get(a.id) || 0));
-      const topK = visibleByDegree.slice(0, SUPER_COUNT);
+      const topSupers = visibleByDegree.slice(0, SUPER_COUNT);
+      const topLabeled = visibleByDegree.slice(0, LABEL_TOP_N);
+      const labeledIds = new Set(topLabeled.map((n) => n.id));
 
-      // Clone nodes (don't mutate snapshot data) and tag/pin supernodes.
       const nodes = visibleNodes.map((n) => {
         const copy = Object.assign({}, n);
-        // Wipe any stale pin so non-supernodes are free in subsequent renders.
         if (copy.fx !== undefined) delete copy.fx;
         if (copy.fy !== undefined) delete copy.fy;
         copy._isSupernode = false;
+        copy._labeled = labeledIds.has(n.id);
         return copy;
       });
       const byId = new Map(nodes.map((n) => [n.id, n]));
-      topK.forEach((node, i) => {
+      topSupers.forEach((node, i) => {
         const target = byId.get(node.id);
         if (!target) return;
         supernodeIds.add(node.id);
         target._isSupernode = true;
-        const angle = (i / Math.max(topK.length, 1)) * 2 * Math.PI - Math.PI / 2;
+        // Hexagon (6 vertices) at radius 500, starting at top (−π/2).
+        const angle = (i / Math.max(topSupers.length, 1)) * 2 * Math.PI - Math.PI / 2;
         target.fx = SUPER_RADIUS * Math.cos(angle);
         target.fy = SUPER_RADIUS * Math.sin(angle);
-        // Seed initial x/y too so the first paint already shows the ring.
         target.x = target.fx;
         target.y = target.fy;
       });
@@ -307,24 +403,16 @@
       };
     }, []);
 
-    // WG-BUBBLE: forces tuned for "supernodes-pinned + followers attracted to
-    // their leader". The previous setup (phaseCluster + strong collide) was
-    // collapsing every node into a concentric ring because the 4 cluster
-    // targets are aligned and the collide radius forced uniform spacing.
-    //
-    // New recipe:
-    //   - charge -200 (was -350): a bit less global repulsion since pins anchor the layout
-    //   - link distance 50, strength 0.6: short + tight so followers stick to their leader
-    //   - center 0.005: near-zero (pins do the work)
-    //   - collide: removed entirely (let the simulation breathe)
-    //   - phaseCluster: removed (it caused the disc)
-    //   - leaderPull: NEW custom force, every follower yanked toward its leader
+    // WG-DISCOVERY: forces re-tuned per mode.
+    //   discovery → tight (charge -400, link 120, no leaderPull)
+    //   network   → medium (charge -250, link 70, leaderPull active)
+    //   full      → loose (charge -200, link 50, leaderPull active)
     React.useEffect(() => {
       const fg = fgRef.current;
       if (!fg || !graphData.nodes.length) return;
+      const f = FORCES_BY_MODE[mode];
 
-      // Precompute leader → [follower ids] for the custom force. We use raw ids
-      // (not node refs) so the map stays valid even if d3 re-mutates link objects.
+      // Precompute leader → [follower ids] for the custom leaderPull force.
       const followersOfLeader = new Map();
       for (let i = 0; i < graphData.links.length; i++) {
         const e = graphData.links[i];
@@ -339,51 +427,52 @@
       try {
         const chargeForce = fg.d3Force && fg.d3Force('charge');
         if (chargeForce) {
-          if (typeof chargeForce.strength === 'function') chargeForce.strength(-200);
+          if (typeof chargeForce.strength === 'function') chargeForce.strength(f.charge);
           if (typeof chargeForce.distanceMax === 'function') chargeForce.distanceMax(800);
         }
         const linkForce = fg.d3Force && fg.d3Force('link');
         if (linkForce) {
-          if (typeof linkForce.distance === 'function') linkForce.distance(50);
-          if (typeof linkForce.strength === 'function') linkForce.strength(0.6);
+          if (typeof linkForce.distance === 'function') linkForce.distance(f.linkDist);
+          if (typeof linkForce.strength === 'function') linkForce.strength(f.linkStrength);
         }
         const centerForce = fg.d3Force && fg.d3Force('center');
         if (centerForce && typeof centerForce.strength === 'function') centerForce.strength(0.005);
 
-        // Kill the legacy forces from the previous polish pass.
+        // Always clear legacy forces.
         try { fg.d3Force('collide', null); } catch (_) { /* ignore */ }
         try { fg.d3Force('phaseCluster', null); } catch (_) { /* ignore */ }
 
-        // Custom force: pull each follower toward its leader's current position.
-        // Strong-ish k (0.18 * alpha) because we removed collide & cluster — this
-        // is now the main shape driver alongside the link force.
-        fg.d3Force('leaderPull', function (alpha) {
-          if (alpha < 0.05) return;
-          const k = 0.18 * alpha;
-          const nodes = (fg.graphData && fg.graphData().nodes) || [];
-          const byId = new Map();
-          for (let i = 0; i < nodes.length; i++) byId.set(nodes[i].id, nodes[i]);
-          followersOfLeader.forEach(function (followerIds, leaderId) {
-            const leader = byId.get(leaderId);
-            if (!leader || typeof leader.x !== 'number') return;
-            for (let j = 0; j < followerIds.length; j++) {
-              const f = byId.get(followerIds[j]);
-              if (!f || typeof f.x !== 'number') continue;
-              // Skip pinned supernodes — fx/fy already lock them in place.
-              if (f.fx !== undefined && f.fx !== null) continue;
-              f.vx = (f.vx || 0) + (leader.x - f.x) * k;
-              f.vy = (f.vy || 0) + (leader.y - f.y) * k;
-            }
+        if (f.useLeaderPull) {
+          fg.d3Force('leaderPull', function (alpha) {
+            if (alpha < 0.05) return;
+            const k = 0.18 * alpha;
+            const nodes = (fg.graphData && fg.graphData().nodes) || [];
+            const byId = new Map();
+            for (let i = 0; i < nodes.length; i++) byId.set(nodes[i].id, nodes[i]);
+            followersOfLeader.forEach(function (followerIds, leaderId) {
+              const leader = byId.get(leaderId);
+              if (!leader || typeof leader.x !== 'number') return;
+              for (let j = 0; j < followerIds.length; j++) {
+                const ff = byId.get(followerIds[j]);
+                if (!ff || typeof ff.x !== 'number') continue;
+                if (ff.fx !== undefined && ff.fx !== null) continue;
+                ff.vx = (ff.vx || 0) + (leader.x - ff.x) * k;
+                ff.vy = (ff.vy || 0) + (leader.y - ff.y) * k;
+              }
+            });
           });
-        });
+        } else {
+          // Discovery has no followers to pull — disable the custom force.
+          try { fg.d3Force('leaderPull', null); } catch (_) { /* ignore */ }
+        }
       } catch (_e) { /* fg API may not be ready yet */ }
 
-      // Quicker auto-fit: supernodes are pinned so the layout settles fast.
+      // Auto-fit after the simulation has had a chance to settle.
       const t = setTimeout(function () {
         try { fg.zoomToFit(500, 80); } catch (_e) { /* ignore */ }
       }, 1800);
       return function () { clearTimeout(t); };
-    }, [graphData]);
+    }, [graphData, mode]);
 
     const handleNodeClick = React.useCallback((node) => {
       if (!node) return;
@@ -429,9 +518,9 @@
     }
 
     const totalNodes = allNodes.length;
+    const badge = MODE_BADGE[mode];
 
-    // Manual recenter — useful after the user pans/zooms or when clusters
-    // drift off-screen. Placed left of the "Top N" cycle button.
+    // Manual recenter — left of the Top N button (unchanged behavior).
     const recenterBtn = React.createElement(
       'button',
       {
@@ -439,7 +528,7 @@
           try { fgRef.current && fgRef.current.zoomToFit(500, 80); } catch (_e) { /* ignore */ }
         },
         style: {
-          position: 'absolute', bottom: 16, right: 200, zIndex: 5,
+          position: 'absolute', bottom: 16, right: 340, zIndex: 5,
           padding: '8px 14px',
           background: 'rgba(10,14,26,0.85)',
           border: '1px solid rgba(255,255,255,0.12)',
@@ -456,13 +545,37 @@
       '◯ Recenter'
     );
 
-    // Density cycle button: 50 → 200 → 500 → 3000 → 50 …
-    // Always rendered (even if totalNodes < currentTopN) so the operator can
-    // dial densities up and down freely.
+    // WG-DISCOVERY: Mode toggle — cycles discovery → network → full → discovery.
+    const modeBtn = React.createElement(
+      'button',
+      {
+        onClick: () => {
+          setMode((m) => VIEW_MODES[(VIEW_MODES.indexOf(m) + 1) % VIEW_MODES.length]);
+        },
+        style: {
+          position: 'absolute', bottom: 16, right: 170, zIndex: 5,
+          padding: '8px 16px',
+          background: 'rgba(10,14,26,0.85)',
+          border: '1px solid ' + badge.color + '55',
+          color: badge.color,
+          fontFamily: 'JetBrains Mono, monospace',
+          fontSize: 11,
+          letterSpacing: 0.4,
+          cursor: 'pointer',
+          backdropFilter: 'blur(8px)',
+          WebkitBackdropFilter: 'blur(8px)',
+          borderRadius: 4,
+          fontWeight: 600,
+        },
+      },
+      badge.icon + ' ' + badge.label
+    );
+
+    // Density cycle button — values depend on the active mode.
     const topNBtn = React.createElement(
       'button',
       {
-        onClick: () => setTopNIndex((idx) => (idx + 1) % TOP_N_CYCLE.length),
+        onClick: () => setDensityIndex((idx) => (idx + 1) % currentDensityCycle.length),
         style: {
           position: 'absolute', bottom: 16, right: 16, zIndex: 5,
           padding: '8px 16px',
@@ -478,10 +591,10 @@
           borderRadius: 4,
         },
       },
-      '▣ Top ' + currentTopN
+      '▣ Top ' + densityN
     );
 
-    // Legend swatch — small color dot + label.
+    // Legend swatch.
     const swatch = (color, label) => React.createElement(
       'span',
       { style: { display: 'inline-flex', alignItems: 'center', gap: 4, marginRight: 8 } },
@@ -494,6 +607,7 @@
       React.createElement('span', { style: { color: '#c4ccd8' } }, label)
     );
 
+    // HUD now leads with the active mode badge in its accent color.
     const statsHud = React.createElement(
       'div',
       {
@@ -515,9 +629,18 @@
           gap: 4,
         },
       },
-      React.createElement('div', null,
-        'nodes ' + visibleNodes.length + '/' + totalNodes +
-        ' · edges ' + visibleEdges.length
+      React.createElement(
+        'div',
+        { style: { display: 'flex', alignItems: 'center', gap: 6 } },
+        React.createElement(
+          'span',
+          { style: { color: badge.color, fontWeight: 600 } },
+          badge.icon + ' ' + badge.label + ' mode'
+        ),
+        React.createElement('span', null,
+          ' · nodes ' + visibleNodes.length + '/' + totalNodes +
+          ' · edges ' + visibleEdges.length
+        )
       ),
       React.createElement('div', { style: { display: 'flex', flexWrap: 'wrap' } },
         swatch('#3b82f6', 'P1'),
@@ -557,7 +680,6 @@
         onNodeClick: handleNodeClick,
         onNodeHover: handleNodeHover,
         backgroundColor: 'rgba(0,0,0,0)',
-        // Shorter cooldown: supernodes are pinned so the simulation converges fast.
         cooldownTicks: 400,
         d3AlphaDecay: 0.0228,
         d3VelocityDecay: 0.4,
@@ -565,17 +687,16 @@
         enableNodeDrag: false,
         warmupTicks: 20,
         onEngineStop: () => {
-          // Auto-refit once the simulation stabilizes (BubbleMaps-style framing).
           try { fgRef.current && fgRef.current.zoomToFit(500, 80); } catch (_e) { /* ignore */ }
         },
       }),
       statsHud,
       recenterBtn,
+      modeBtn,
       topNBtn
     );
   }
 
-  // Public export on window.WG_V3 namespace.
   if (typeof window !== 'undefined') {
     window.WG_V3 = window.WG_V3 || {};
     window.WG_V3.WalletGraphV3 = WalletGraphV3;
