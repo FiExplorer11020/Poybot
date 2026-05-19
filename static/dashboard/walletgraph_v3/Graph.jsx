@@ -216,21 +216,64 @@
       };
     }, []);
 
-    // Tune d3-force on first data settle: more repulsion + more friction = tighter, distinct clusters.
+    // Tune d3-force on data settle: strong repulsion + loose center + custom
+    // phase-cluster force + (optional) collide = clearly separated BubbleMaps-style
+    // zones instead of one dense blob in the middle.
     React.useEffect(() => {
       const fg = fgRef.current;
       if (!fg || !graphData.nodes.length) return;
       try {
         const chargeForce = fg.d3Force && fg.d3Force('charge');
-        if (chargeForce && typeof chargeForce.strength === 'function') chargeForce.strength(-120);
+        if (chargeForce) {
+          if (typeof chargeForce.strength === 'function') chargeForce.strength(-350);
+          if (typeof chargeForce.distanceMax === 'function') chargeForce.distanceMax(800);
+        }
         const linkForce = fg.d3Force && fg.d3Force('link');
-        if (linkForce && typeof linkForce.distance === 'function') linkForce.distance(40);
+        if (linkForce) {
+          if (typeof linkForce.distance === 'function') linkForce.distance(100);
+          if (typeof linkForce.strength === 'function') linkForce.strength(0.35);
+        }
         const centerForce = fg.d3Force && fg.d3Force('center');
-        if (centerForce && typeof centerForce.strength === 'function') centerForce.strength(0.06);
+        if (centerForce && typeof centerForce.strength === 'function') centerForce.strength(0.015);
+
+        // Collide force — anti-overlap. d3-force is bundled inside react-force-graph-2d
+        // but not always exposed on window. Try a few common surfaces; fall back silently.
+        const d3 = window.d3
+          || (window.ForceGraph2D && window.ForceGraph2D.d3)
+          || (fg && fg.d3);
+        if (d3 && typeof d3.forceCollide === 'function') {
+          fg.d3Force(
+            'collide',
+            d3.forceCollide().radius((node) => getNodeRadius(node) * 2.5).strength(0.7)
+          );
+        } // else: TODO: collide force - requires d3-force on window.
+
+        // Custom phase-cluster force: pull each node toward its quadrant target.
+        // 4 zones — P1 top-left, P2 top-right, P3 bottom-left, followers bottom-right.
+        const CLUSTER_TARGETS = {
+          1: { x: -400, y: -300 },
+          2: { x:  400, y: -300 },
+          3: { x: -400, y:  300 },
+          follower: { x: 400, y: 300 },
+        };
+        fg.d3Force('phaseCluster', (alpha) => {
+          // d3 custom force: called every tick. Stops drifting once stabilized.
+          if (alpha < 0.05) return;
+          const k = 0.04 * alpha;
+          const nodes = (fg.graphData && fg.graphData().nodes) || [];
+          for (let i = 0; i < nodes.length; i++) {
+            const n = nodes[i];
+            const phaseKey = n.role === 'follower' ? 'follower' : (n.phase || 1);
+            const target = CLUSTER_TARGETS[phaseKey] || CLUSTER_TARGETS[1];
+            n.vx = (n.vx || 0) + (target.x - (n.x || 0)) * k;
+            n.vy = (n.vy || 0) + (target.y - (n.y || 0)) * k;
+          }
+        });
       } catch (_e) { /* ignore — fg API may not be ready yet */ }
+      // Longer settle time to let new forces stabilize before auto-fitting.
       const t = setTimeout(() => {
-        try { fg.zoomToFit(400, 80); } catch (_e) { /* ignore */ }
-      }, 800);
+        try { fg.zoomToFit(400, 60); } catch (_e) { /* ignore */ }
+      }, 3500);
       return () => clearTimeout(t);
     }, [graphData]);
 
@@ -278,6 +321,33 @@
     }
 
     const totalNodes = allNodes.length;
+
+    // Manual recenter — useful after the user pans/zooms or when clusters
+    // drift off-screen. Placed left of the "Show top N" button.
+    const recenterBtn = React.createElement(
+      'button',
+      {
+        onClick: () => {
+          try { fgRef.current && fgRef.current.zoomToFit(500, 60); } catch (_e) { /* ignore */ }
+        },
+        style: {
+          position: 'absolute', bottom: 16, right: 200, zIndex: 5,
+          padding: '8px 14px',
+          background: 'rgba(10,14,26,0.85)',
+          border: '1px solid rgba(255,255,255,0.12)',
+          color: '#94a8d6',
+          fontFamily: 'JetBrains Mono, monospace',
+          fontSize: 11,
+          letterSpacing: 0.4,
+          cursor: 'pointer',
+          backdropFilter: 'blur(8px)',
+          WebkitBackdropFilter: 'blur(8px)',
+          borderRadius: 4,
+        },
+      },
+      '◯ Recenter'
+    );
+
     const showAllBtn = !showAll && totalNodes > DEFAULT_TOP_N
       ? React.createElement(
           'button',
@@ -378,15 +448,21 @@
         onNodeClick: handleNodeClick,
         onNodeHover: handleNodeHover,
         backgroundColor: 'rgba(0,0,0,0)',
-        // Tighter clustering: more friction + longer cooldown lets clusters form properly.
-        cooldownTicks: 300,
+        // Longer cooldown + slightly less friction = forces have time to spread clusters
+        // into distinct zones before the simulation halts.
+        cooldownTicks: 600,
         d3AlphaDecay: 0.0228,
-        d3VelocityDecay: 0.55,
+        d3VelocityDecay: 0.5,
         nodeRelSize: 6,
         enableNodeDrag: false,
         warmupTicks: 20,
+        onEngineStop: () => {
+          // Auto-refit once the simulation stabilizes (BubbleMaps-style framing).
+          try { fgRef.current && fgRef.current.zoomToFit(500, 60); } catch (_e) { /* ignore */ }
+        },
       }),
       statsHud,
+      recenterBtn,
       showAllBtn
     );
   }
